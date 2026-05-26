@@ -176,6 +176,8 @@ enum Commands {
     Restore(WorkspaceRestoreArgs),
     /// Fetch a version and missing objects from a remote ADS server into a local store.
     Fetch(FetchArgs),
+    /// Sync remote assets and missing objects into a local store.
+    Sync(SyncArgs),
     /// Deprecated alias for `pull` / `restore`.
     #[command(hide = true)]
     Materialize {
@@ -350,6 +352,46 @@ struct FetchArgs {
     #[arg(long)]
     materialize: bool,
     /// Replace a different existing workspace version folder when materializing.
+    #[arg(long)]
+    force: bool,
+}
+
+#[derive(Args, Debug)]
+struct SyncArgs {
+    /// Remote ADS server base URL, for example http://ads-server:8787.
+    #[arg(long)]
+    server: String,
+    /// Bearer token for the remote ADS server. Can also be ADS_WEB_TOKEN.
+    #[arg(long = "auth-token", env = "ADS_WEB_TOKEN")]
+    auth_token: String,
+    /// Remote profile name.
+    #[arg(long, default_value = "main")]
+    profile: String,
+    /// Local store root. It is initialized if missing.
+    #[arg(long)]
+    store: PathBuf,
+    /// Workspace root for optional materialization.
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+    /// Optional category filter.
+    #[arg(long)]
+    category: Option<String>,
+    /// Optional asset-code filter.
+    #[arg(long = "asset-code")]
+    asset_code: Option<String>,
+    /// Optional department filter.
+    #[arg(long)]
+    department: Option<String>,
+    /// Sync remote latest versions instead of current versions.
+    #[arg(long)]
+    latest: bool,
+    /// Sync every remote version matching the filters.
+    #[arg(long = "all-versions")]
+    all_versions: bool,
+    /// Restore synced current/latest versions into the local workspace.
+    #[arg(long)]
+    materialize: bool,
+    /// Replace different existing workspace version folders when materializing.
     #[arg(long)]
     force: bool,
 }
@@ -1099,27 +1141,15 @@ where
                 args.version
                     .map_or(VersionSelector::Current, VersionSelector::Version)
             };
-            let version_info = remote.fetch_version_info(
+            let (version_info, stats) = fetch_remote_version(
+                &store,
+                &remote,
                 &args.profile,
                 &args.category,
                 &args.asset_code,
                 &args.department,
                 selector,
             )?;
-            let mut objects_downloaded = 0u64;
-            let mut objects_reused = 0u64;
-            let mut bytes_downloaded = 0u64;
-            for entry in &version_info.manifest.entries {
-                if store.object_is_valid(&entry.sha256, entry.size)? {
-                    objects_reused += 1;
-                    continue;
-                }
-                let bytes = remote.fetch_object(&args.profile, &entry.sha256)?;
-                bytes_downloaded += bytes.len() as u64;
-                store.write_object_bytes(&entry.sha256, &bytes)?;
-                objects_downloaded += 1;
-            }
-            store.import_version_info(&version_info)?;
             let materialized = if args.materialize {
                 let workspace = workspace_root(args.workspace)?;
                 Some(store.materialize(
@@ -1131,15 +1161,24 @@ where
             } else {
                 None
             };
+            if selector == VersionSelector::Current {
+                let status = remote.fetch_current_status(
+                    &args.profile,
+                    &args.category,
+                    &args.asset_code,
+                    &args.department,
+                )?;
+                apply_remote_current_status(&store, &status)?;
+            }
             println!(
                 "fetched {} {}/{}/{} objects_downloaded={} objects_reused={} bytes_downloaded={}",
                 version_info.version.version,
                 version_info.version.department_key.asset_key.category,
                 version_info.version.department_key.asset_key.asset_code,
                 version_info.version.department_key.department,
-                objects_downloaded,
-                objects_reused,
-                bytes_downloaded
+                stats.objects_downloaded,
+                stats.objects_reused,
+                stats.bytes_downloaded
             );
             if let Some(materialized) = materialized {
                 println!(
@@ -1148,6 +1187,117 @@ where
                     materialized.path.display()
                 );
             }
+        }
+        Commands::Sync(args) => {
+            if args.latest && args.all_versions {
+                bail!("--latest and --all-versions cannot be used together");
+            }
+            if args.materialize && args.all_versions {
+                bail!("--materialize cannot be combined with --all-versions");
+            }
+            if args.materialize && args.workspace.is_none() {
+                bail!("--workspace is required with --materialize");
+            }
+            if let Some(category) = &args.category {
+                validate_category(category)?;
+            }
+            if let Some(asset_code) = &args.asset_code {
+                validate_asset_code(asset_code)?;
+            }
+            if let Some(department) = &args.department {
+                validate_department(department)?;
+            }
+
+            let store = Store::open_or_init(&args.store)?;
+            let remote = RemoteClient::new(&args.server, &args.auth_token)?;
+            let assets = remote.fetch_assets(
+                &args.profile,
+                args.category.as_deref(),
+                args.asset_code.as_deref(),
+                args.department.as_deref(),
+            )?;
+            let workspace = if args.materialize {
+                Some(workspace_root(args.workspace.clone())?)
+            } else {
+                None
+            };
+            let mut stats = SyncStats {
+                assets_seen: assets.assets.len() as u64,
+                ..SyncStats::default()
+            };
+            for asset in assets.assets {
+                if args.all_versions {
+                    let versions = remote.fetch_versions(
+                        &args.profile,
+                        &asset.category,
+                        &asset.asset_code,
+                        &asset.department,
+                    )?;
+                    let current_status = versions.current_status.clone();
+                    for record in versions.versions {
+                        let (_info, fetched) = fetch_remote_version(
+                            &store,
+                            &remote,
+                            &args.profile,
+                            &asset.category,
+                            &asset.asset_code,
+                            &asset.department,
+                            VersionSelector::Version(record.version),
+                        )?;
+                        stats.add_fetch(fetched);
+                        stats.versions_synced += 1;
+                    }
+                    apply_remote_current_status(&store, &current_status)?;
+                    continue;
+                }
+
+                let version = if args.latest {
+                    asset.latest
+                } else {
+                    asset.current
+                };
+                let Some(version) = version else {
+                    continue;
+                };
+                let (info, fetched) = fetch_remote_version(
+                    &store,
+                    &remote,
+                    &args.profile,
+                    &asset.category,
+                    &asset.asset_code,
+                    &asset.department,
+                    VersionSelector::Version(version),
+                )?;
+                stats.add_fetch(fetched);
+                stats.versions_synced += 1;
+                if !args.latest {
+                    let current_status = CurrentStatus {
+                        department_key: info.version.department_key.clone(),
+                        current: asset.current,
+                        latest: asset.latest,
+                        explicit: asset.explicit_current,
+                    };
+                    apply_remote_current_status(&store, &current_status)?;
+                }
+                if let Some(workspace) = &workspace {
+                    store.materialize(
+                        workspace,
+                        &info.version.department_key,
+                        VersionSelector::Version(info.version.version),
+                        args.force,
+                    )?;
+                    stats.materialized += 1;
+                }
+            }
+            println!(
+                "synced assets={} versions={} objects_downloaded={} objects_reused={} bytes_downloaded={} materialized={}",
+                stats.assets_seen,
+                stats.versions_synced,
+                stats.objects_downloaded,
+                stats.objects_reused,
+                stats.bytes_downloaded,
+                stats.materialized
+            );
         }
         Commands::Materialize {
             store,
@@ -1502,6 +1652,49 @@ fn print_workspace_restore_outcome(
     }
 }
 
+fn fetch_remote_version(
+    store: &Store,
+    remote: &RemoteClient,
+    profile: &str,
+    category: &str,
+    asset_code: &str,
+    department: &str,
+    selector: VersionSelector,
+) -> Result<(VersionInfo, FetchVersionStats)> {
+    let version_info =
+        remote.fetch_version_info(profile, category, asset_code, department, selector)?;
+    let mut stats = FetchVersionStats::default();
+    for entry in &version_info.manifest.entries {
+        if store.object_is_valid(&entry.sha256, entry.size)? {
+            stats.objects_reused += 1;
+            continue;
+        }
+        let bytes = remote.fetch_object(profile, &entry.sha256)?;
+        stats.bytes_downloaded += bytes.len() as u64;
+        store.write_object_bytes(&entry.sha256, &bytes)?;
+        stats.objects_downloaded += 1;
+    }
+    store.import_version_info(&version_info)?;
+    Ok((version_info, stats))
+}
+
+fn apply_remote_current_status(store: &Store, status: &CurrentStatus) -> Result<()> {
+    if status.explicit {
+        let version = status.current.ok_or_else(|| {
+            anyhow!(
+                "remote current status is explicit but has no current version: {}/{}/{}",
+                status.department_key.asset_key.category,
+                status.department_key.asset_key.asset_code,
+                status.department_key.department
+            )
+        })?;
+        store.set_current_version(&status.department_key, version)?;
+    } else {
+        store.reset_current_version(&status.department_key)?;
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 pub struct AssetKey {
     pub category: String,
@@ -1733,6 +1926,14 @@ pub struct Manifest {
     pub entries: Vec<ManifestEntry>,
 }
 
+impl SyncStats {
+    fn add_fetch(&mut self, stats: FetchVersionStats) {
+        self.objects_downloaded += stats.objects_downloaded;
+        self.objects_reused += stats.objects_reused;
+        self.bytes_downloaded += stats.bytes_downloaded;
+    }
+}
+
 impl Manifest {
     pub fn canonical_hash(&self) -> Result<String> {
         let bytes = serde_json::to_vec(self)?;
@@ -1803,7 +2004,7 @@ pub struct VersionInfo {
     pub manifest: Manifest,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CurrentStatus {
     pub department_key: DepartmentKey,
     pub current: Option<VersionId>,
@@ -1881,6 +2082,23 @@ struct WebProfile {
 struct RemoteClient {
     server: String,
     auth_token: String,
+}
+
+#[derive(Clone, Debug, Default)]
+struct FetchVersionStats {
+    objects_downloaded: u64,
+    objects_reused: u64,
+    bytes_downloaded: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SyncStats {
+    assets_seen: u64,
+    versions_synced: u64,
+    objects_downloaded: u64,
+    objects_reused: u64,
+    bytes_downloaded: u64,
+    materialized: u64,
 }
 
 #[derive(Debug)]
@@ -1988,7 +2206,7 @@ struct ProfilesResponse {
     profiles: Vec<ProfileDto>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct AssetCardDto {
     category: String,
     asset_code: String,
@@ -2003,7 +2221,7 @@ struct AssetCardDto {
     thumbnail_url: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct AssetsResponse {
     assets: Vec<AssetCardDto>,
 }
@@ -2015,7 +2233,7 @@ struct AssetDetailResponse {
     thumbnails: Vec<ThumbnailRecord>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct VersionsResponse {
     versions: Vec<VersionRecord>,
     current_status: CurrentStatus,
@@ -2222,10 +2440,8 @@ impl Store {
             validate_manifest_relative_path(&entry.relative_path)?;
         }
 
-        if let Some(existing) =
-            self.try_get_version(&info.version.department_key, info.version.version)?
-        {
-            if existing.manifest_hash != info.version.manifest_hash {
+        match self.try_get_version(&info.version.department_key, info.version.version)? {
+            Some(existing) if existing.manifest_hash != info.version.manifest_hash => {
                 bail!(
                     "local version already exists with different manifest: {}/{}/{} {}",
                     info.version.department_key.asset_key.category,
@@ -2234,6 +2450,7 @@ impl Store {
                     info.version.version
                 );
             }
+            _ => {}
         }
 
         let previous_asset = self.asset_record(&info.version.department_key.asset_key)?;
@@ -3665,6 +3882,73 @@ impl RemoteClient {
             VersionSelector::Version(version) => query.push(("version", version.to_string())),
         }
         self.get_json("/api/version", &query)
+    }
+
+    fn fetch_assets(
+        &self,
+        profile: &str,
+        category: Option<&str>,
+        asset_code: Option<&str>,
+        department: Option<&str>,
+    ) -> Result<AssetsResponse> {
+        let mut query = vec![("profile", profile.to_string())];
+        if let Some(category) = category {
+            query.push(("category", category.to_string()));
+        }
+        if let Some(asset_code) = asset_code {
+            query.push(("asset_code", asset_code.to_string()));
+        }
+        if let Some(department) = department {
+            query.push(("department", department.to_string()));
+        }
+        self.get_json("/api/assets", &query)
+    }
+
+    fn fetch_versions(
+        &self,
+        profile: &str,
+        category: &str,
+        asset_code: &str,
+        department: &str,
+    ) -> Result<VersionsResponse> {
+        let query = vec![
+            ("profile", profile.to_string()),
+            ("category", category.to_string()),
+            ("asset_code", asset_code.to_string()),
+            ("department", department.to_string()),
+        ];
+        self.get_json("/api/versions", &query)
+    }
+
+    fn fetch_current_status(
+        &self,
+        profile: &str,
+        category: &str,
+        asset_code: &str,
+        department: &str,
+    ) -> Result<CurrentStatus> {
+        let query = vec![
+            ("profile", profile.to_string()),
+            ("category", category.to_string()),
+            ("asset_code", asset_code.to_string()),
+            ("department", department.to_string()),
+        ];
+        let statuses: Vec<CurrentStatus> = self.get_json("/api/current/status", &query)?;
+        statuses
+            .into_iter()
+            .find(|status| {
+                status.department_key.asset_key.category == category
+                    && status.department_key.asset_key.asset_code == asset_code
+                    && status.department_key.department == department
+            })
+            .ok_or_else(|| {
+                anyhow!(
+                    "remote current status not found for {}/{}/{}",
+                    category,
+                    asset_code,
+                    department
+                )
+            })
     }
 
     fn fetch_object(&self, profile: &str, sha256: &str) -> Result<Vec<u8>> {

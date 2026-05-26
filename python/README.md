@@ -102,6 +102,20 @@ ads.fetch(
 )
 ```
 
+Sync multiple remote assets into a local store:
+
+```python
+ads.sync(
+    server="http://ads-server:8787",
+    auth_token="secret",
+    profile="main",
+    store=r"D:\local-cache",
+    category="char",
+    department="model",
+    all_versions=True,
+)
+```
+
 ## Remote API
 
 `AdsHttpClient` talks to `ads serve`.

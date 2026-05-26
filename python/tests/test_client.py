@@ -108,6 +108,31 @@ class AdsCliTests(unittest.TestCase):
         self.assertIn("--materialize", args)
         self.assertIn("--force", args)
 
+    def test_sync_builds_expected_command(self):
+        completed = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="synced assets=1 versions=1 objects_downloaded=1 objects_reused=0 bytes_downloaded=10 materialized=0\n",
+            stderr="",
+        )
+        with patch("ads.client.subprocess.run", return_value=completed) as run:
+            text = AdsCli("ads.exe").sync(
+                server="http://ads-server:8787",
+                auth_token="secret",
+                profile="main",
+                store="D:\\cache",
+                category="char",
+                asset_code="hero",
+                department="model",
+                all_versions=True,
+            )
+
+        self.assertIn("synced assets=1", text)
+        args = run.call_args.args[0]
+        self.assertEqual(args[:2], ["ads.exe", "sync"])
+        self.assertIn("--all-versions", args)
+        self.assertEqual(args[args.index("--category") + 1], "char")
+
     def test_nonzero_cli_exit_raises(self):
         completed = subprocess.CompletedProcess(
             args=[],

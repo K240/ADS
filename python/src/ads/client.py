@@ -328,6 +328,51 @@ class AdsCli:
             args.append("--force")
         return self.run_text(args)
 
+    def sync(
+        self,
+        *,
+        server: str,
+        auth_token: str,
+        store: str | os.PathLike[str],
+        profile: str = "main",
+        category: str | None = None,
+        asset_code: str | None = None,
+        department: str | None = None,
+        latest: bool = False,
+        all_versions: bool = False,
+        workspace: str | os.PathLike[str] | None = None,
+        materialize: bool = False,
+        force: bool = False,
+    ) -> str:
+        args = [
+            "sync",
+            "--server",
+            server,
+            "--auth-token",
+            auth_token,
+            "--profile",
+            profile,
+            "--store",
+            _path(store),
+        ]
+        if category:
+            args += ["--category", category]
+        if asset_code:
+            args += ["--asset-code", asset_code]
+        if department:
+            args += ["--department", department]
+        if latest:
+            args.append("--latest")
+        if all_versions:
+            args.append("--all-versions")
+        if workspace is not None:
+            args += ["--workspace", _path(workspace)]
+        if materialize:
+            args.append("--materialize")
+        if force:
+            args.append("--force")
+        return self.run_text(args)
+
     def checkout(
         self,
         *,

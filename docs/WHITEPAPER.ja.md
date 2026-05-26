@@ -793,6 +793,7 @@ Status: in progress. The first remote read API is described in `docs/PHASE3_REMO
 
 - remote object direct read用 `ArAsset` の設計
 - `ads fetch` によるremote version metadata/object取得
+- `ads sync` によるfilter指定remote store同期
 - remote store onlyを標準client modeとして実装
 - `--server <url>` によるcentral API接続
 - metadata/objectのremote lookupとworkspace pull
