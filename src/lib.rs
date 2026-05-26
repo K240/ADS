@@ -29,6 +29,12 @@ const SCHEMA_VERSION: &str = "7";
 const DB_DIR: &str = "db";
 const OBJECTS_DIR: &str = "objects";
 const SHA256_DIR: &str = "sha256";
+const CACHE_DIR: &str = ".ads-cache";
+const TEXTURE_DEPARTMENTS: &[&str] = &["texture", "textures", "tex"];
+const TEXTURE_EXTENSIONS: &[&str] = &[
+    "tx", "rat", "exr", "tif", "tiff", "png", "jpg", "jpeg", "tga", "bmp", "hdr", "pic", "tex",
+];
+const USD_EXTENSIONS: &[&str] = &["usd", "usda", "usdc", "usdz"];
 
 #[derive(Parser, Debug)]
 #[command(
@@ -1350,7 +1356,15 @@ impl VersionSelector {
 #[serde(rename_all = "lowercase")]
 pub enum ResolveSource {
     Local,
+    Cache,
     Remote,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AssetFileKind {
+    Usd,
+    Texture,
+    Generic,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -2100,9 +2114,22 @@ impl Store {
             &version_folder(workspace, &asset_path.department_key, version),
             &asset_path.relative_path,
         )?;
+        let asset_file_kind = asset_file_kind(
+            &asset_path.department_key.department,
+            &asset_path.relative_path,
+        );
 
         match mode {
             ResolveMode::Local => {
+                if asset_file_kind == AssetFileKind::Texture {
+                    let cache_path = self.ensure_cache_object(workspace, entry)?;
+                    return Ok(ResolveOutcome {
+                        location: cache_path.display().to_string(),
+                        source: ResolveSource::Cache,
+                        version,
+                        sha256: entry.sha256.clone(),
+                    });
+                }
                 if !local_path.exists() {
                     bail!("local asset path does not exist: {}", local_path.display());
                 }
@@ -2120,6 +2147,15 @@ impl Store {
                 sha256: entry.sha256.clone(),
             }),
             ResolveMode::Auto => {
+                if asset_file_kind == AssetFileKind::Texture {
+                    let cache_path = self.ensure_cache_object(workspace, entry)?;
+                    return Ok(ResolveOutcome {
+                        location: cache_path.display().to_string(),
+                        source: ResolveSource::Cache,
+                        version,
+                        sha256: entry.sha256.clone(),
+                    });
+                }
                 if local_path.exists() {
                     Ok(ResolveOutcome {
                         location: local_path.display().to_string(),
@@ -2318,6 +2354,63 @@ impl Store {
     ) -> Result<String> {
         let record = self.thumbnail_info(department_key, selector)?;
         self.resolve_remote_sha256_url(&record.sha256, remote_base_url_override)
+    }
+
+    fn ensure_cache_object(&self, workspace: &Path, entry: &ManifestEntry) -> Result<PathBuf> {
+        let object_path = object_path(&self.root, &entry.sha256);
+        if !object_path.exists() {
+            bail!(
+                "object is missing for {}: {}",
+                entry.relative_path,
+                object_path.display()
+            );
+        }
+
+        let cache_path = cache_object_path(workspace, entry);
+        if cache_path.exists() {
+            let metadata = fs::metadata(&cache_path)
+                .with_context(|| format!("failed to stat {}", cache_path.display()))?;
+            if metadata.is_file() && metadata.len() == entry.size {
+                return Ok(cache_path);
+            }
+            if metadata.is_dir() {
+                bail!(
+                    "cache path exists and is a directory: {}",
+                    cache_path.display()
+                );
+            }
+            fs::remove_file(&cache_path).with_context(|| {
+                format!("failed to remove stale cache {}", cache_path.display())
+            })?;
+        }
+
+        let parent = cache_path
+            .parent()
+            .ok_or_else(|| anyhow!("invalid cache path: {}", cache_path.display()))?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create cache directory {}", parent.display()))?;
+        let temp_path = cache_path.with_extension(format!("tmp.{}", std::process::id()));
+        fs::copy(&object_path, &temp_path).with_context(|| {
+            format!(
+                "failed to copy object {} to cache {}",
+                object_path.display(),
+                temp_path.display()
+            )
+        })?;
+        match fs::rename(&temp_path, &cache_path) {
+            Ok(()) => Ok(cache_path),
+            Err(_) if cache_path.exists() => {
+                let _ = fs::remove_file(&temp_path);
+                Ok(cache_path)
+            }
+            Err(error) => Err(error).with_context(|| {
+                format!(
+                    "failed to move temporary cache {} to {}",
+                    temp_path.display(),
+                    cache_path.display()
+                )
+            }),
+        }
     }
 
     pub fn remove_thumbnail(
@@ -4377,7 +4470,7 @@ fn is_default_ignored(rel_path: &Path, is_dir: bool) -> bool {
     if rel_path.components().any(|component| {
         matches!(
             component,
-            Component::Normal(value) if value == ".git" || value == ".svn" || value == ".hg"
+            Component::Normal(value) if value == ".git" || value == ".svn" || value == ".hg" || value == CACHE_DIR
         )
     }) {
         return true;
@@ -4494,6 +4587,45 @@ fn normalize_remote_base_url(remote_base_url: &str) -> Result<String> {
 fn remote_object_url(remote_base_url: &str, sha256: &str) -> String {
     let prefix = sha256.get(0..2).unwrap_or("00");
     format!("{remote_base_url}/{prefix}/{sha256}")
+}
+
+fn asset_file_kind(department: &str, relative_path: &str) -> AssetFileKind {
+    if let Some(extension) = normalized_extension(relative_path) {
+        if USD_EXTENSIONS.contains(&extension.as_str()) {
+            return AssetFileKind::Usd;
+        }
+        if TEXTURE_EXTENSIONS.contains(&extension.as_str()) {
+            return AssetFileKind::Texture;
+        }
+    }
+    if TEXTURE_DEPARTMENTS
+        .iter()
+        .any(|candidate| department.eq_ignore_ascii_case(candidate))
+    {
+        return AssetFileKind::Texture;
+    }
+    AssetFileKind::Generic
+}
+
+fn normalized_extension(path: &str) -> Option<String> {
+    Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+}
+
+fn cache_object_path(workspace: &Path, entry: &ManifestEntry) -> PathBuf {
+    let prefix = entry.sha256.get(0..2).unwrap_or("00");
+    let mut file_name = entry.sha256.clone();
+    if let Some(extension) = normalized_extension(&entry.relative_path) {
+        file_name.push('.');
+        file_name.push_str(&extension);
+    }
+    workspace
+        .join(CACHE_DIR)
+        .join(SHA256_DIR)
+        .join(prefix)
+        .join(file_name)
 }
 
 fn inspect_thumbnail_image(path: &Path) -> Result<ThumbnailImageInfo> {
@@ -4883,6 +5015,46 @@ mod tests {
     }
 
     #[test]
+    fn asset_file_kind_classifies_usd_and_textures() {
+        assert_eq!(asset_file_kind("model", "hero.usd"), AssetFileKind::Usd);
+        assert_eq!(
+            asset_file_kind("model", "body_diffuse.1001.tx"),
+            AssetFileKind::Texture
+        );
+        assert_eq!(
+            asset_file_kind("texture", "source/custom.bin"),
+            AssetFileKind::Texture
+        );
+        assert_eq!(
+            asset_file_kind("texture", "source/readme"),
+            AssetFileKind::Texture
+        );
+        assert_eq!(
+            asset_file_kind("model", "cache/custom.bin"),
+            AssetFileKind::Generic
+        );
+    }
+
+    #[test]
+    fn cache_object_path_uses_sha256_prefix_and_source_extension() {
+        let entry = ManifestEntry {
+            relative_path: "maps/body_diffuse.1001.TX".to_string(),
+            sha256: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_string(),
+            size: 10,
+            mode: 0o666,
+        };
+        let path = cache_object_path(Path::new("workspace"), &entry);
+        assert_eq!(
+            path,
+            Path::new("workspace")
+                .join(".ads-cache")
+                .join("sha256")
+                .join("ab")
+                .join("abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789.tx")
+        );
+    }
+
+    #[test]
     fn adsignore_matches_root_and_nested_files() {
         let rules = IgnoreRules {
             rules: vec![
@@ -4898,6 +5070,11 @@ mod tests {
         assert!(!rules.is_ignored(Path::new("cache/file.txt"), false));
         assert!(rules.is_ignored(Path::new("nested/generated.dat"), false));
         assert!(!rules.is_ignored(Path::new("nested/kept.dat"), false));
+        assert!(is_default_ignored(Path::new(".ads-cache"), true));
+        assert!(is_default_ignored(
+            Path::new(".ads-cache/sha256/ab/object.tx"),
+            false
+        ));
     }
 
     #[test]

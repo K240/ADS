@@ -6,6 +6,9 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = []
 
+[project.scripts]
+ads-deps = "ads.usd_deps:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 

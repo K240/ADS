@@ -1,0 +1,19 @@
+{
+  "Plugins": [
+    {
+      "Info": {
+        "Types": {
+          "AdsResolver": {
+            "bases": ["ArResolver"],
+            "uriSchemes": ["ads"]
+          }
+        }
+      },
+      "LibraryPath": "AdsResolver.dll",
+      "Name": "adsResolver",
+      "ResourcePath": "resources",
+      "Root": "..",
+      "Type": "library"
+    }
+  ]
+}

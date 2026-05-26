@@ -450,6 +450,10 @@ ads resolve `
 
 mode:
 
+Texture系ファイルは、USD layerとは異なる解決ポリシーを使います。`.tx`, `.rat`, `.exr`, `.tif`, `.png`, `.jpg` などの予約拡張子、または `texture` / `textures` / `tex` department配下の非USDファイルはtextureとして扱います。`local` / `auto` resolveではworkspace上の論理パスではなく、DB上のmanifest entryからSHA-256を引き、`<workspace>/.ads-cache/sha256/<prefix>/<hash>.<ext>` へlocal cache化したパスを返します。USD layerである `.usd`, `.usda`, `.usdc`, `.usdz` は従来通りversion folder上の指定パスへ解決します。
+
+同じ論理ファイル名のtextureを更新した場合も、versionごとにmanifest上のSHA-256が変わるため、cache上では別のhashファイルとして共存します。USD内の `ads://.../body_diffuse.1001.tx` 参照は安定したまま、`current` / `latest` / `?v=v001` の選択によって返るcache fileだけが変わります。`.ads-cache` は登録対象から除外されます。
+
 - `local`: workspace上の実体ファイルへ解決
 - `remote`: object URLへ解決
 - `auto`: workspace上の実体ファイル、local store/cache、remote object URLの順に解決
@@ -590,6 +594,95 @@ client.pull(
 
 このAPIは、Houdini shelf tool、Python Panel、USD Resolver補助処理、社内publish toolからADSを呼び出すための最小レイヤーです。将来的にnative bindingやResolver pluginを追加する場合も、まずこのPython APIを運用上の契約として使えます。
 
+### USD Dependency Preflight
+
+USD stageはroot layerから多数のreferences、payloads、sublayersを辿ります。ユーザーが明示的に開くファイルはrootだけですが、実際には多くの依存ファイルが必要です。
+
+ADSでは、Resolverに副作用としてpullを実行させるのではなく、open前に依存関係を解析するpreflight utilityを使います。
+
+```powershell
+uv run ads-deps D:\shots\shot010\shot.usda `
+  --store D:\store `
+  --workspace D:\workspace
+```
+
+`ads-deps` はOpenUSD Pythonが利用できる場合は `UsdUtils.ComputeAllDependencies` を使い、root USDから全依存を収集します。その中の `ads://` URIだけをpull/restore対象として抽出します。
+
+```powershell
+uv run ads-deps D:\shots\shot010\shot.usda `
+  --store D:\store `
+  --workspace D:\workspace `
+  --execute
+```
+
+この運用により、Houdiniでstageを開く前に必要なADS version folderをworkspaceへ揃えられます。Resolverはその後、既に存在するlocal fileへ高速に解決するだけです。
+
+## C++ USD Resolver
+
+Phase 2では、`ads://` URIをUSD composition arcから直接扱うためのC++ `ArResolver` pluginを提供します。
+
+初期実装はread-only resolverです。Resolverは `ads://...` を受け取り、`ads resolve` CLIへ委譲してworkspace上のローカルファイルパスへ解決します。その後、USDの `ArFilesystemAsset` で実ファイルを開きます。
+
+```text
+USD / Houdini
+  -> ArResolver receives ads://hero/model/hero.usd
+  -> ads resolve --mode local ...
+  -> D:/workspace/char/hero/model/v002/hero.usd
+  -> ArFilesystemAsset opens the local file
+```
+
+必要な環境変数:
+
+```powershell
+$env:ADS_RESOLVER_EXECUTABLE = "D:\tools\ads.exe"
+$env:ADS_RESOLVER_STORE = "D:\store"
+$env:ADS_RESOLVER_WORKSPACE = "D:\workspace"
+$env:ADS_RESOLVER_MODE = "local"
+$env:PXR_PLUGINPATH_NAME = "D:\path\to\ads\resolver\build\houdini\resources"
+```
+
+`ADS_RESOLVER_MODE` のdefaultは `local` です。これは、初期版Resolverが直接remote objectを読む `ArAsset` をまだ持たないためです。workspaceに対象versionが存在しない場合は、事前に `ads pull` を実行します。
+
+buildはHoudini toolkitの `hcustom.exe -U` を使います。
+
+```powershell
+.\resolver\build_houdini.ps1 -HoudiniRoot "C:\Program Files\Side Effects Software\Houdini 21.0.700"
+```
+
+検証済みの範囲:
+
+- `Ar.GetResolver().Resolve("ads://...")`
+- `Sdf.Layer.FindOrOpen("ads://...")`
+- `ads://...` referenceを含むUSD stage open
+
+remote object URLを直接読むには、次段階でADS専用 `ArAsset` 実装が必要です。
+
+## Houdini USD ROP Publish
+
+SolarisではUSD ROPを使ってUSD layerを書き出します。ADSでは、USD ROPのOutput Processorとして `ADS Managed Publish` を提供します。
+
+```text
+Solaris LOP
+  -> USD ROP
+  -> ADS Managed Publish output processor
+  -> public root
+  -> version-pinned ads:// references
+```
+
+このOutput Processorは、`ADS_RESOLVER_WORKSPACE` 配下のsave pathを `ADS_OUTPUT_PUBLIC_ROOT` 配下へ写像できます。また、workspaceまたはpublic root配下の参照パスを `ads://category/asset_code/department/path?v=v###` へ変換します。
+
+例:
+
+```text
+D:/workspace/char/hero/model/v003/geo/body.usd
+  -> ads://char/hero/model/geo/body.usd?v=v003
+
+D:/public/char/hero/texture/v002/maps/body.1001.tx
+  -> ads://char/hero/texture/maps/body.1001.tx?v=v002
+```
+
+これにより、public出力先の物理パスが変わってもUSD内の参照はADS URIとして安定します。Resolverなしの外部納品ではなく、社内managed publishではこの方式をdefaultとします。
+
 ## セキュリティモデル
 
 ADS WebAppはLAN内運用を想定しています。初期版のセキュリティ方針はシンプルです。
@@ -646,7 +739,7 @@ storeをバックアップする場合は、RocksDBの `db/` と `objects/` の�
 - schema migrationは未実装。開発中storeは再作成前提。
 - WebAppからのasset作成、new-version、addは未実装。
 - multi-user lock、review、approval、publish gateは未実装。
-- Houdini AssetResolver pluginは未実装。
+- C++ USD Resolverはlocal file read-only prototype。remote objectを直接読む `ArAsset` は未実装。
 
 これらは意図的に初期スコープ外としています。まずはversion folder、dedup store、Resolver向けURI、Web browserを最小構成で成立させることを優先しています。
 
@@ -663,10 +756,11 @@ storeをバックアップする場合は、RocksDBの `db/` と `objects/` の�
 
 ### Phase 2: Resolver統合
 
-- USD AssetResolver prototype
-- Houdini環境向け導入手順
+- C++ USD AssetResolver prototype
+- Houdini環境向けbuild scriptとpackage例
 - `ads://` URIのproduction scene検証
 - local/remote/auto解決の詳細仕様確定
+- remote object direct read用 `ArAsset` の設計
 
 ### Phase 3: Remote Store / Sync
 

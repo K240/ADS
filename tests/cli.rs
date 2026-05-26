@@ -584,6 +584,110 @@ fn resolve_supports_local_remote_auto_and_latest_asset_paths() {
 }
 
 #[test]
+fn resolve_textures_to_hash_cache_path() {
+    let temp = TempDir::new().unwrap();
+    let store = temp.path().join("store");
+    let workspace = temp.path().join("workspace");
+    assert!(ads().arg("init").arg(&store).status().unwrap().success());
+
+    assert!(
+        new_version_department(&store, &workspace, "prop", "crate", "texture")
+            .status
+            .success()
+    );
+    let texture_v001 = department_version_folder(&workspace, "prop", "crate", "texture", "v001");
+    fs::create_dir(texture_v001.join("maps")).unwrap();
+    fs::write(
+        texture_v001.join("maps").join("body_diffuse.1001.tx"),
+        "texture payload",
+    )
+    .unwrap();
+    add_asset_department(&store, &workspace, "prop", "crate", "texture", "v001");
+    fs::remove_dir_all(&texture_v001).unwrap();
+
+    let resolved = resolve_asset(
+        &store,
+        &workspace,
+        "auto",
+        None,
+        "ads://prop/crate/texture/maps/body_diffuse.1001.tx",
+    );
+    assert!(resolved.status.success(), "{}", stderr(&resolved));
+    let texture_hash = sha256_hex(b"texture payload");
+    let expected = workspace
+        .join(".ads-cache")
+        .join("sha256")
+        .join(&texture_hash[0..2])
+        .join(format!("{texture_hash}.tx"));
+    assert_eq!(stdout(&resolved).trim(), expected.display().to_string());
+    assert_eq!(fs::read_to_string(expected).unwrap(), "texture payload");
+}
+
+#[test]
+fn resolving_updated_texture_name_uses_new_hash_cache_file() {
+    let temp = TempDir::new().unwrap();
+    let store = temp.path().join("store");
+    let workspace = temp.path().join("workspace");
+    assert!(ads().arg("init").arg(&store).status().unwrap().success());
+
+    assert!(
+        new_version_department(&store, &workspace, "prop", "crate", "texture")
+            .status
+            .success()
+    );
+    let v001 = department_version_folder(&workspace, "prop", "crate", "texture", "v001");
+    fs::write(v001.join("body_diffuse.1001.tx"), "texture v1").unwrap();
+    add_asset_department(&store, &workspace, "prop", "crate", "texture", "v001");
+
+    assert!(
+        new_version_department(&store, &workspace, "prop", "crate", "texture")
+            .status
+            .success()
+    );
+    let v002 = department_version_folder(&workspace, "prop", "crate", "texture", "v002");
+    fs::write(v002.join("body_diffuse.1001.tx"), "texture v2").unwrap();
+    add_asset_department(&store, &workspace, "prop", "crate", "texture", "v002");
+
+    fs::remove_dir_all(&v001).unwrap();
+    fs::remove_dir_all(&v002).unwrap();
+
+    let current = resolve_asset(
+        &store,
+        &workspace,
+        "auto",
+        None,
+        "ads://prop/crate/texture/body_diffuse.1001.tx",
+    );
+    assert!(current.status.success(), "{}", stderr(&current));
+    let v2_hash = sha256_hex(b"texture v2");
+    let v2_cache = workspace
+        .join(".ads-cache")
+        .join("sha256")
+        .join(&v2_hash[0..2])
+        .join(format!("{v2_hash}.tx"));
+    assert_eq!(stdout(&current).trim(), v2_cache.display().to_string());
+    assert_eq!(fs::read_to_string(&v2_cache).unwrap(), "texture v2");
+
+    let pinned = resolve_asset(
+        &store,
+        &workspace,
+        "auto",
+        None,
+        "ads://prop/crate/texture/body_diffuse.1001.tx?v=v001",
+    );
+    assert!(pinned.status.success(), "{}", stderr(&pinned));
+    let v1_hash = sha256_hex(b"texture v1");
+    let v1_cache = workspace
+        .join(".ads-cache")
+        .join("sha256")
+        .join(&v1_hash[0..2])
+        .join(format!("{v1_hash}.tx"));
+    assert_eq!(stdout(&pinned).trim(), v1_cache.display().to_string());
+    assert_eq!(fs::read_to_string(&v1_cache).unwrap(), "texture v1");
+    assert_ne!(v1_cache, v2_cache);
+}
+
+#[test]
 fn resolve_accepts_simplified_uri_current_and_query_version() {
     let temp = TempDir::new().unwrap();
     let store = temp.path().join("store");

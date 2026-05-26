@@ -1,0 +1,28 @@
+{
+  "env": [
+    {
+      "ADS_RESOLVER_EXECUTABLE": "D:/tools/ads.exe"
+    },
+    {
+      "ADS_RESOLVER_STORE": "D:/store"
+    },
+    {
+      "ADS_RESOLVER_WORKSPACE": "D:/workspace"
+    },
+    {
+      "ADS_RESOLVER_MODE": "local"
+    },
+    {
+      "PXR_PLUGINPATH_NAME": "D:/work/apps/ads/resolver/build/houdini/resources;&"
+    },
+    {
+      "PYTHONPATH": "D:/work/apps/ads/python/src;&"
+    },
+    {
+      "HOUDINI_PATH": "D:/work/apps/ads/houdini;&"
+    },
+    {
+      "ADS_OUTPUT_PUBLIC_ROOT": "D:/public"
+    }
+  ]
+}
