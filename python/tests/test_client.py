@@ -78,6 +78,36 @@ class AdsCliTests(unittest.TestCase):
         self.assertEqual(args[args.index("--public-root") + 1], "D:\\public")
         self.assertEqual(args[args.index("--version") + 1], "v003")
 
+    def test_fetch_builds_expected_command(self):
+        completed = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="fetched v003 char/hero/model objects_downloaded=1 objects_reused=0 bytes_downloaded=10\n",
+            stderr="",
+        )
+        with patch("ads.client.subprocess.run", return_value=completed) as run:
+            text = AdsCli("ads.exe").fetch(
+                server="http://ads-server:8787",
+                auth_token="secret",
+                profile="main",
+                store="D:\\cache",
+                workspace="D:\\workspace",
+                category="char",
+                asset_code="hero",
+                department="model",
+                version="v003",
+                materialize=True,
+                force=True,
+            )
+
+        self.assertIn("fetched v003", text)
+        args = run.call_args.args[0]
+        self.assertEqual(args[:2], ["ads.exe", "fetch"])
+        self.assertEqual(args[args.index("--server") + 1], "http://ads-server:8787")
+        self.assertEqual(args[args.index("--auth-token") + 1], "secret")
+        self.assertIn("--materialize", args)
+        self.assertIn("--force", args)
+
     def test_nonzero_cli_exit_raises(self):
         completed = subprocess.CompletedProcess(
             args=[],
@@ -100,6 +130,15 @@ class _Handler(BaseHTTPRequestHandler):
         self._record(b"")
         if self.path.startswith("/api/assets"):
             self._json({"assets": []})
+        elif self.path.startswith("/api/version"):
+            self._json(
+                {
+                    "version": {"version": "v002"},
+                    "manifest": {"entries": [{"relative_path": "crate.usd", "sha256": "a" * 64}]},
+                }
+            )
+        elif self.path.startswith("/api/object"):
+            self._bytes(b"object-bytes")
         elif self.path.startswith("/api/thumbnail-url"):
             self._json("https://assets.example.com/objects/sha256/ab/hash")
         else:
@@ -135,6 +174,13 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(raw)))
         self.end_headers()
         self.wfile.write(raw)
+
+    def _bytes(self, value):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(len(value)))
+        self.end_headers()
+        self.wfile.write(value)
 
     def log_message(self, *_args):
         return
@@ -182,6 +228,29 @@ class AdsHttpClientTests(unittest.TestCase):
         self.assertEqual(payload["asset_code"], "hero")
         self.assertEqual(payload["version"], "v002")
         self.assertTrue(payload["force"])
+
+    def test_version_info_gets_manifest(self):
+        response = self.client.version_info(
+            profile="main",
+            category="prop",
+            asset_code="crate",
+            department="model",
+            version="v002",
+        )
+
+        self.assertEqual(response["version"]["version"], "v002")
+        self.assertEqual(response["manifest"]["entries"][0]["relative_path"], "crate.usd")
+        request = _Handler.requests[-1]
+        self.assertIn("/api/version", request["path"])
+        self.assertIn("version=v002", request["path"])
+
+    def test_object_bytes_downloads_raw_bytes(self):
+        data = self.client.object_bytes("a" * 64, profile="main")
+
+        self.assertEqual(data, b"object-bytes")
+        request = _Handler.requests[-1]
+        self.assertIn("/api/object", request["path"])
+        self.assertIn("sha256=", request["path"])
 
     def test_thumbnail_url_accepts_json_string_response(self):
         url = self.client.thumbnail_url(

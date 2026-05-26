@@ -85,6 +85,23 @@ ads.publish_register(
 )
 ```
 
+Fetch a remote version into a local store:
+
+```python
+ads.fetch(
+    server="http://ads-server:8787",
+    auth_token="secret",
+    profile="main",
+    store=r"D:\local-cache",
+    workspace=r"D:\workspace",
+    category="char",
+    asset_code="hero",
+    department="model",
+    version="v003",
+    materialize=True,
+)
+```
+
 ## Remote API
 
 `AdsHttpClient` talks to `ads serve`.
@@ -108,6 +125,20 @@ client.pull(
     asset_code="hero",
     department="model",
 )
+```
+
+Remote store read helpers:
+
+```python
+info = client.version_info(
+    profile="main",
+    category="char",
+    asset_code="hero",
+    department="model",
+    version="v003",
+)
+
+data = client.object_bytes(info["manifest"]["entries"][0]["sha256"], profile="main")
 ```
 
 ## USD Dependency Utility

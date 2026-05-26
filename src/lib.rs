@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow, bail};
 use axum::extract::{DefaultBodyLimit, Multipart, Query, Request, State};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderName, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post, put};
@@ -174,6 +174,8 @@ enum Commands {
     Pull(WorkspacePullArgs),
     /// Restore a specific version into its standard workspace version folder.
     Restore(WorkspaceRestoreArgs),
+    /// Fetch a version and missing objects from a remote ADS server into a local store.
+    Fetch(FetchArgs),
     /// Deprecated alias for `pull` / `restore`.
     #[command(hide = true)]
     Materialize {
@@ -308,6 +310,46 @@ struct WorkspaceRestoreArgs {
     #[arg(long)]
     version: VersionId,
     /// Replace a different existing version folder.
+    #[arg(long)]
+    force: bool,
+}
+
+#[derive(Args, Debug)]
+struct FetchArgs {
+    /// Remote ADS server base URL, for example http://ads-server:8787.
+    #[arg(long)]
+    server: String,
+    /// Bearer token for the remote ADS server. Can also be ADS_WEB_TOKEN.
+    #[arg(long = "auth-token", env = "ADS_WEB_TOKEN")]
+    auth_token: String,
+    /// Remote profile name.
+    #[arg(long, default_value = "main")]
+    profile: String,
+    /// Local store root. It is initialized if missing.
+    #[arg(long)]
+    store: PathBuf,
+    /// Workspace root for optional materialization.
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+    /// Asset category.
+    #[arg(long)]
+    category: String,
+    /// Asset code.
+    #[arg(long = "asset-code")]
+    asset_code: String,
+    /// Work department such as model, rig, anim, fx, or lookdev.
+    #[arg(long)]
+    department: String,
+    /// Version to fetch. Defaults to the remote current version.
+    #[arg(long)]
+    version: Option<VersionId>,
+    /// Fetch the remote latest version instead of current.
+    #[arg(long)]
+    latest: bool,
+    /// Restore the fetched version into the local workspace.
+    #[arg(long)]
+    materialize: bool,
+    /// Replace a different existing workspace version folder when materializing.
     #[arg(long)]
     force: bool,
 }
@@ -1042,6 +1084,71 @@ where
                 WorkspaceRestoreWords::new("restored", "already restored"),
             )?;
         }
+        Commands::Fetch(args) => {
+            if args.latest && args.version.is_some() {
+                bail!("--latest and --version cannot be used together");
+            }
+            if args.materialize && args.workspace.is_none() {
+                bail!("--workspace is required with --materialize");
+            }
+            let store = Store::open_or_init(&args.store)?;
+            let remote = RemoteClient::new(&args.server, &args.auth_token)?;
+            let selector = if args.latest {
+                VersionSelector::Latest
+            } else {
+                args.version
+                    .map_or(VersionSelector::Current, VersionSelector::Version)
+            };
+            let version_info = remote.fetch_version_info(
+                &args.profile,
+                &args.category,
+                &args.asset_code,
+                &args.department,
+                selector,
+            )?;
+            let mut objects_downloaded = 0u64;
+            let mut objects_reused = 0u64;
+            let mut bytes_downloaded = 0u64;
+            for entry in &version_info.manifest.entries {
+                if store.object_is_valid(&entry.sha256, entry.size)? {
+                    objects_reused += 1;
+                    continue;
+                }
+                let bytes = remote.fetch_object(&args.profile, &entry.sha256)?;
+                bytes_downloaded += bytes.len() as u64;
+                store.write_object_bytes(&entry.sha256, &bytes)?;
+                objects_downloaded += 1;
+            }
+            store.import_version_info(&version_info)?;
+            let materialized = if args.materialize {
+                let workspace = workspace_root(args.workspace)?;
+                Some(store.materialize(
+                    &workspace,
+                    &version_info.version.department_key,
+                    VersionSelector::Version(version_info.version.version),
+                    args.force,
+                )?)
+            } else {
+                None
+            };
+            println!(
+                "fetched {} {}/{}/{} objects_downloaded={} objects_reused={} bytes_downloaded={}",
+                version_info.version.version,
+                version_info.version.department_key.asset_key.category,
+                version_info.version.department_key.asset_key.asset_code,
+                version_info.version.department_key.department,
+                objects_downloaded,
+                objects_reused,
+                bytes_downloaded
+            );
+            if let Some(materialized) = materialized {
+                println!(
+                    "materialized {} to {}",
+                    materialized.version,
+                    materialized.path.display()
+                );
+            }
+        }
         Commands::Materialize {
             store,
             workspace,
@@ -1690,7 +1797,7 @@ pub struct AssetInfo {
     pub versions: Vec<VersionRecord>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VersionInfo {
     pub version: VersionRecord,
     pub manifest: Manifest,
@@ -1770,6 +1877,12 @@ struct WebProfile {
     mutation_lock: Arc<Mutex<()>>,
 }
 
+#[derive(Clone, Debug)]
+struct RemoteClient {
+    server: String,
+    auth_token: String,
+}
+
 #[derive(Debug)]
 struct ApiError {
     status: StatusCode,
@@ -1798,6 +1911,22 @@ struct VersionsQuery {
     category: String,
     asset_code: String,
     department: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct VersionInfoQuery {
+    profile: String,
+    category: String,
+    asset_code: String,
+    department: String,
+    version: Option<VersionId>,
+    latest: Option<bool>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ObjectQuery {
+    profile: String,
+    sha256: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1925,6 +2054,14 @@ impl Store {
             root: path.to_path_buf(),
             db,
         })
+    }
+
+    pub fn open_or_init(path: &Path) -> Result<Self> {
+        if db_path(path).exists() {
+            Self::open(path)
+        } else {
+            Self::init(path)
+        }
     }
 
     pub fn open(path: &Path) -> Result<Self> {
@@ -2065,6 +2202,87 @@ impl Store {
             version,
             version_workspace_relative_path(department_key, version),
         )
+    }
+
+    pub fn import_version_info(&self, info: &VersionInfo) -> Result<()> {
+        let manifest_hash = info.manifest.canonical_hash()?;
+        if manifest_hash != info.version.manifest_hash {
+            bail!(
+                "remote manifest hash mismatch for {}/{}/{} {}: record={}, computed={}",
+                info.version.department_key.asset_key.category,
+                info.version.department_key.asset_key.asset_code,
+                info.version.department_key.department,
+                info.version.version,
+                info.version.manifest_hash,
+                manifest_hash
+            );
+        }
+        for entry in &info.manifest.entries {
+            validate_sha256(&entry.sha256)?;
+            validate_manifest_relative_path(&entry.relative_path)?;
+        }
+
+        if let Some(existing) =
+            self.try_get_version(&info.version.department_key, info.version.version)?
+        {
+            if existing.manifest_hash != info.version.manifest_hash {
+                bail!(
+                    "local version already exists with different manifest: {}/{}/{} {}",
+                    info.version.department_key.asset_key.category,
+                    info.version.department_key.asset_key.asset_code,
+                    info.version.department_key.department,
+                    info.version.version
+                );
+            }
+        }
+
+        let previous_asset = self.asset_record(&info.version.department_key.asset_key)?;
+        let mut latest_versions = previous_asset
+            .as_ref()
+            .map(|asset| asset.latest_versions.clone())
+            .unwrap_or_default();
+        let should_update_latest = latest_versions
+            .get(&info.version.department_key.department)
+            .is_none_or(|latest| *latest < info.version.version);
+        if should_update_latest {
+            latest_versions.insert(
+                info.version.department_key.department.clone(),
+                info.version.version,
+            );
+        }
+        let asset = AssetRecord {
+            asset_key: info.version.department_key.asset_key.clone(),
+            created_at: previous_asset
+                .map(|asset| asset.created_at)
+                .unwrap_or_else(|| info.version.created_at.clone()),
+            latest_versions,
+        };
+
+        let mut batch = WriteBatch::default();
+        batch.put(
+            key_manifest(&manifest_hash),
+            serde_json::to_vec(&info.manifest).context("failed to serialize manifest")?,
+        );
+        batch.put(
+            key_version(&info.version.department_key, info.version.version),
+            serde_json::to_vec(&info.version).context("failed to serialize version record")?,
+        );
+        batch.put(
+            key_asset(&info.version.department_key.asset_key),
+            serde_json::to_vec(&asset).context("failed to serialize asset record")?,
+        );
+        if should_update_latest {
+            batch.put(
+                key_latest(&info.version.department_key),
+                info.version.version.to_string().as_bytes(),
+            );
+        }
+        batch.put(
+            key_manifest_index(&info.version.department_key, &manifest_hash),
+            info.version.version.to_string().as_bytes(),
+        );
+        self.db.write(batch)?;
+        Ok(())
     }
 
     fn add_version_from_source(
@@ -3078,6 +3296,54 @@ impl Store {
         }
     }
 
+    fn object_is_valid(&self, sha256: &str, expected_size: u64) -> Result<bool> {
+        validate_sha256(sha256)?;
+        let path = object_path(&self.root, sha256);
+        if !path.exists() {
+            return Ok(false);
+        }
+        let metadata =
+            fs::metadata(&path).with_context(|| format!("failed to stat {}", path.display()))?;
+        if !metadata.is_file() || metadata.len() != expected_size {
+            return Ok(false);
+        }
+        let (computed, _) = hash_file(&path)?;
+        Ok(computed == sha256)
+    }
+
+    fn write_object_bytes(&self, sha256: &str, bytes: &[u8]) -> Result<()> {
+        validate_sha256(sha256)?;
+        let computed = sha256_bytes(bytes);
+        if computed != sha256 {
+            bail!("downloaded object hash mismatch: expected {sha256}, computed {computed}");
+        }
+        let path = object_path(&self.root, sha256);
+        if path.exists() {
+            let _ = fs::remove_file(&path);
+        }
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow!("invalid object path: {}", path.display()))?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create object directory {}", parent.display()))?;
+        let temp_path = path.with_extension(format!("tmp.{}", std::process::id()));
+        fs::write(&temp_path, bytes)
+            .with_context(|| format!("failed to write temporary object {}", temp_path.display()))?;
+        match fs::rename(&temp_path, &path) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let _ = fs::remove_file(&temp_path);
+                Err(error).with_context(|| {
+                    format!(
+                        "failed to move temporary object {} to {}",
+                        temp_path.display(),
+                        path.display()
+                    )
+                })
+            }
+        }
+    }
+
     fn prepare_checkout_dest(&self, dest: &Path, force: bool) -> Result<()> {
         ensure_checkout_dest_outside_store(&self.root, dest)?;
         if dest.exists() {
@@ -3363,6 +3629,114 @@ impl ServeProfile {
     }
 }
 
+impl RemoteClient {
+    fn new(server: &str, auth_token: &str) -> Result<Self> {
+        let server = server.trim().trim_end_matches('/').to_string();
+        if server.is_empty() {
+            bail!("--server must not be empty");
+        }
+        if !server.starts_with("http://") && !server.starts_with("https://") {
+            bail!("--server must start with http:// or https://");
+        }
+        let auth_token = auth_token.trim().to_string();
+        if auth_token.is_empty() {
+            bail!("--auth-token or ADS_WEB_TOKEN is required");
+        }
+        Ok(Self { server, auth_token })
+    }
+
+    fn fetch_version_info(
+        &self,
+        profile: &str,
+        category: &str,
+        asset_code: &str,
+        department: &str,
+        selector: VersionSelector,
+    ) -> Result<VersionInfo> {
+        let mut query = vec![
+            ("profile", profile.to_string()),
+            ("category", category.to_string()),
+            ("asset_code", asset_code.to_string()),
+            ("department", department.to_string()),
+        ];
+        match selector {
+            VersionSelector::Current => {}
+            VersionSelector::Latest => query.push(("latest", "true".to_string())),
+            VersionSelector::Version(version) => query.push(("version", version.to_string())),
+        }
+        self.get_json("/api/version", &query)
+    }
+
+    fn fetch_object(&self, profile: &str, sha256: &str) -> Result<Vec<u8>> {
+        validate_sha256(sha256)?;
+        let query = vec![
+            ("profile", profile.to_string()),
+            ("sha256", sha256.to_string()),
+        ];
+        self.get_bytes("/api/object", &query)
+    }
+
+    fn get_json<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        query: &[(&str, String)],
+    ) -> Result<T> {
+        let url = self.url(path, query);
+        let response = self.request(&url)?;
+        let status = response.status();
+        let text = response
+            .into_string()
+            .with_context(|| format!("failed to read response from {url}"))?;
+        if !(200..300).contains(&status) {
+            bail!("remote request failed {status} {url}: {text}");
+        }
+        serde_json::from_str(&text).with_context(|| format!("failed to decode JSON from {url}"))
+    }
+
+    fn get_bytes(&self, path: &str, query: &[(&str, String)]) -> Result<Vec<u8>> {
+        let url = self.url(path, query);
+        let response = self.request(&url)?;
+        let status = response.status();
+        if !(200..300).contains(&status) {
+            let text = response.into_string().unwrap_or_default();
+            bail!("remote request failed {status} {url}: {text}");
+        }
+        let mut reader = response.into_reader();
+        let mut bytes = Vec::new();
+        reader
+            .read_to_end(&mut bytes)
+            .with_context(|| format!("failed to read response from {url}"))?;
+        Ok(bytes)
+    }
+
+    fn request(&self, url: &str) -> Result<ureq::Response> {
+        match ureq::get(url)
+            .set("Authorization", &format!("Bearer {}", self.auth_token))
+            .call()
+        {
+            Ok(response) => Ok(response),
+            Err(ureq::Error::Status(_, response)) => Ok(response),
+            Err(error) => Err(error).with_context(|| format!("remote request failed: {url}")),
+        }
+    }
+
+    fn url(&self, path: &str, query: &[(&str, String)]) -> String {
+        let mut url = format!("{}/{}", self.server, path.trim_start_matches('/'));
+        if !query.is_empty() {
+            url.push('?');
+            for (index, (key, value)) in query.iter().enumerate() {
+                if index > 0 {
+                    url.push('&');
+                }
+                url.push_str(&url_encode_component(key));
+                url.push('=');
+                url.push_str(&url_encode_component(value));
+            }
+        }
+        url
+    }
+}
+
 impl From<ServeConfig> for WebState {
     fn from(config: ServeConfig) -> Self {
         let profiles = config
@@ -3450,6 +3824,8 @@ fn web_app(state: Arc<WebState>) -> Router {
         .route("/assets", get(api_assets))
         .route("/asset", get(api_asset))
         .route("/versions", get(api_versions))
+        .route("/version", get(api_version_info))
+        .route("/object", get(api_object))
         .route("/current/status", get(api_current_status))
         .route("/current", put(api_update_current))
         .route("/pull", post(api_pull))
@@ -3592,6 +3968,59 @@ async fn api_versions(
     })
     .await
     .map(Json)
+}
+
+async fn api_version_info(
+    State(state): State<Arc<WebState>>,
+    Query(query): Query<VersionInfoQuery>,
+) -> std::result::Result<Json<VersionInfo>, ApiError> {
+    let profile = profile_for(&state, &query.profile)?;
+    run_store_read(move || {
+        let store = Store::open(&profile.store)?;
+        let asset_key = AssetKey::new(query.category, query.asset_code)?;
+        let department_key = DepartmentKey::new(asset_key, query.department)?;
+        let selector = if query.latest.unwrap_or(false) {
+            VersionSelector::Latest
+        } else {
+            query
+                .version
+                .map_or(VersionSelector::Current, VersionSelector::Version)
+        };
+        store.version_info_by_selector(&department_key, selector)
+    })
+    .await
+    .map(Json)
+}
+
+async fn api_object(
+    State(state): State<Arc<WebState>>,
+    Query(query): Query<ObjectQuery>,
+) -> std::result::Result<Response, ApiError> {
+    let profile = profile_for(&state, &query.profile)?;
+    run_store_read(move || {
+        validate_sha256(&query.sha256)?;
+        let path = object_path(&profile.store, &query.sha256);
+        if !path.exists() {
+            bail!("object not found: {}", query.sha256);
+        }
+        let bytes =
+            fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
+        Ok((query.sha256, bytes))
+    })
+    .await
+    .map(|(sha256, bytes)| {
+        let mut response = bytes.into_response();
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/octet-stream"),
+        );
+        if let Ok(value) = HeaderValue::from_str(&sha256) {
+            response
+                .headers_mut()
+                .insert(HeaderName::from_static("x-ads-sha256"), value);
+        }
+        response
+    })
 }
 
 async fn api_current_status(
@@ -4798,6 +5227,13 @@ fn validate_department(value: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_sha256(value: &str) -> Result<()> {
+    if value.len() != 64 || !value.chars().all(|character| character.is_ascii_hexdigit()) {
+        bail!("sha256 must be 64 hexadecimal characters");
+    }
+    Ok(())
+}
+
 fn workspace_root(workspace: Option<PathBuf>) -> Result<PathBuf> {
     let workspace = workspace.unwrap_or(std::env::current_dir()?);
     if workspace.is_absolute() {
@@ -4851,6 +5287,19 @@ fn normalize_remote_base_url(remote_base_url: &str) -> Result<String> {
 fn remote_object_url(remote_base_url: &str, sha256: &str) -> String {
     let prefix = sha256.get(0..2).unwrap_or("00");
     format!("{remote_base_url}/{prefix}/{sha256}")
+}
+
+fn url_encode_component(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push('%');
+            encoded.push_str(&format!("{byte:02X}"));
+        }
+    }
+    encoded
 }
 
 fn asset_file_kind(department: &str, relative_path: &str) -> AssetFileKind {
@@ -5359,6 +5808,24 @@ mod tests {
     }
 
     #[test]
+    fn remote_client_url_encodes_nested_category() {
+        let client = RemoteClient::new("http://server:8787/", "secret").unwrap();
+        let url = client.url(
+            "/api/version",
+            &[
+                ("profile", "main".to_string()),
+                ("category", "assets/characters/main".to_string()),
+                ("asset_code", "hero".to_string()),
+            ],
+        );
+
+        assert_eq!(
+            url,
+            "http://server:8787/api/version?profile=main&category=assets%2Fcharacters%2Fmain&asset_code=hero"
+        );
+    }
+
+    #[test]
     fn adsignore_matches_root_and_nested_files() {
         let rules = IgnoreRules {
             rules: vec![
@@ -5567,6 +6034,42 @@ mod tests {
                 .starts_with("https://assets.example.com/objects/sha256/")
         );
 
+        let version_info = app
+            .clone()
+            .oneshot(api_request(
+                "GET",
+                "/api/version?profile=main&category=prop&asset_code=crate&department=model&version=v002",
+                "secret",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(version_info.status(), StatusCode::OK);
+        let version_info = response_json(version_info).await;
+        assert_eq!(version_info["version"]["version"], "v002");
+        assert_eq!(
+            version_info["manifest"]["entries"][0]["relative_path"],
+            "crate.usd"
+        );
+
+        let v2_hash = sha256_bytes(b"v2");
+        let object = app
+            .clone()
+            .oneshot(api_request(
+                "GET",
+                &format!("/api/object?profile=main&sha256={v2_hash}"),
+                "secret",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(object.status(), StatusCode::OK);
+        assert_eq!(
+            object.headers().get("x-ads-sha256").unwrap(),
+            v2_hash.as_str()
+        );
+        assert_eq!(response_bytes(object).await, b"v2");
+
         let set_current = app
             .clone()
             .oneshot(api_request(
@@ -5707,6 +6210,13 @@ mod tests {
     async fn response_text(response: Response) -> String {
         let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    async fn response_bytes(response: Response) -> Vec<u8> {
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec()
     }
 
     async fn response_json(response: Response) -> serde_json::Value {

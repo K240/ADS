@@ -283,6 +283,51 @@ class AdsCli:
             )
         )
 
+    def fetch(
+        self,
+        *,
+        server: str,
+        auth_token: str,
+        store: str | os.PathLike[str],
+        profile: str = "main",
+        category: str,
+        asset_code: str,
+        department: str,
+        version: str | None = None,
+        latest: bool = False,
+        workspace: str | os.PathLike[str] | None = None,
+        materialize: bool = False,
+        force: bool = False,
+    ) -> str:
+        args = [
+            "fetch",
+            "--server",
+            server,
+            "--auth-token",
+            auth_token,
+            "--profile",
+            profile,
+            "--store",
+            _path(store),
+            "--category",
+            category,
+            "--asset-code",
+            asset_code,
+            "--department",
+            department,
+        ]
+        if version:
+            args += ["--version", version]
+        if latest:
+            args.append("--latest")
+        if workspace is not None:
+            args += ["--workspace", _path(workspace)]
+        if materialize:
+            args.append("--materialize")
+        if force:
+            args.append("--force")
+        return self.run_text(args)
+
     def checkout(
         self,
         *,
@@ -540,6 +585,50 @@ class AdsHttpClient:
             },
         )
 
+    def version_info(
+        self,
+        *,
+        profile: str = "main",
+        category: str,
+        asset_code: str,
+        department: str,
+        version: str | None = None,
+        latest: bool = False,
+    ) -> JsonObject:
+        return self.get(
+            "/api/version",
+            {
+                "profile": profile,
+                "category": category,
+                "asset_code": asset_code,
+                "department": department,
+                "version": version,
+                "latest": latest if latest else None,
+            },
+        )
+
+    def object_bytes(self, sha256: str, *, profile: str = "main") -> bytes:
+        return self.request_bytes(
+            "GET",
+            _with_query("/api/object", {"profile": profile, "sha256": sha256}),
+        )
+
+    def download_object(
+        self,
+        sha256: str,
+        dest: str | os.PathLike[str],
+        *,
+        profile: str = "main",
+        force: bool = False,
+    ) -> Path:
+        path = Path(dest)
+        if path.exists() and not force:
+            raise FileExistsError(f"destination exists: {path}")
+        if path.parent:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(self.object_bytes(sha256, profile=profile))
+        return path
+
     def current_status(
         self,
         *,
@@ -744,6 +833,34 @@ class AdsHttpClient:
         if "application/json" not in content_type:
             return raw.decode("utf-8")
         return json.loads(raw.decode("utf-8"))
+
+    def request_bytes(
+        self,
+        method: str,
+        path: str,
+        *,
+        body: bytes | None = None,
+        headers: Mapping[str, str] | None = None,
+    ) -> bytes:
+        request_headers: MutableMapping[str, str] = {
+            "Authorization": f"Bearer {self.token}",
+        }
+        if headers:
+            request_headers.update(headers)
+        request = Request(
+            _join_url(self.base_url, path),
+            data=body,
+            headers=dict(request_headers),
+            method=method,
+        )
+        try:
+            with urlopen(request, timeout=self.timeout) as response:
+                return response.read()
+        except HTTPError as error:
+            raw = error.read()
+            raise AdsHttpError(error.code, raw.decode("utf-8", "replace"), raw) from error
+        except URLError as error:
+            raise AdsHttpError(0, str(error)) from error
 
 
 def _path(value: str | os.PathLike[str]) -> str:
