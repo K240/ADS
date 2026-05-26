@@ -755,8 +755,8 @@ storeをバックアップする場合は、RocksDBの `db/` と `objects/` の�
 
 - local filesystem専用。
 - S3互換backendへの直接書き込みは未実装。
-- `--server` 指定によるremote store only client modeは未実装。
-- local + remote storeのsync/fetch/pushは未実装。
+- `--server` 指定によるremote fetch/sync/pushは実装済みだが、全CLIを透過的にremote store onlyで扱うclient modeは未実装。
+- local + remote storeの基本fetch/sync/pushは実装済み。conflict解決、差分push、object pruningは未実装。
 - object garbage collectionは未実装。
 - schema migrationは未実装。開発中storeは再作成前提。
 - WebAppからのasset作成、new-version、addは未実装。
@@ -789,15 +789,16 @@ Status: complete for local USD/Houdini integration. See `docs/PHASE2_COMPLETION.
 
 ### Phase 3: Remote Store / Sync
 
-Status: in progress. The first remote read API is described in `docs/PHASE3_REMOTE_SYNC.ja.md`.
+Status: in progress. Remote read/fetch/sync/push MVP is described in `docs/PHASE3_REMOTE_SYNC.ja.md`.
 
 - remote object direct read用 `ArAsset` の設計
 - `ads fetch` によるremote version metadata/object取得
 - `ads sync` によるfilter指定remote store同期
+- `ads push` によるlocal version metadata/object送信
 - remote store onlyを標準client modeとして実装
 - `--server <url>` によるcentral API接続
 - metadata/objectのremote lookupとworkspace pull
-- local + remote store向けのsync/fetch/push設計
+- local + remote store向けのsync/fetch/push実装
 - local storeをcache/mirrorとして扱う運用
 - checksum検証付き転送
 

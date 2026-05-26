@@ -133,6 +133,32 @@ class AdsCliTests(unittest.TestCase):
         self.assertIn("--all-versions", args)
         self.assertEqual(args[args.index("--category") + 1], "char")
 
+    def test_push_builds_expected_command(self):
+        completed = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="pushed v003 char/hero/model objects_uploaded=1 objects_reused=0 bytes_uploaded=10\n",
+            stderr="",
+        )
+        with patch("ads.client.subprocess.run", return_value=completed) as run:
+            text = AdsCli("ads.exe").push(
+                server="http://ads-server:8787",
+                auth_token="secret",
+                profile="main",
+                store="D:\\cache",
+                category="char",
+                asset_code="hero",
+                department="model",
+                version="v003",
+                set_current=True,
+            )
+
+        self.assertIn("pushed v003", text)
+        args = run.call_args.args[0]
+        self.assertEqual(args[:2], ["ads.exe", "push"])
+        self.assertIn("--set-current", args)
+        self.assertEqual(args[args.index("--version") + 1], "v003")
+
     def test_nonzero_cli_exit_raises(self):
         completed = subprocess.CompletedProcess(
             args=[],
@@ -162,6 +188,8 @@ class _Handler(BaseHTTPRequestHandler):
                     "manifest": {"entries": [{"relative_path": "crate.usd", "sha256": "a" * 64}]},
                 }
             )
+        elif self.path.startswith("/api/object/status"):
+            self._json({"sha256": "a" * 64, "exists": True})
         elif self.path.startswith("/api/object"):
             self._bytes(b"object-bytes")
         elif self.path.startswith("/api/thumbnail-url"):
@@ -175,6 +203,20 @@ class _Handler(BaseHTTPRequestHandler):
         if self.path == "/api/pull":
             payload = json.loads(body.decode("utf-8"))
             self._json({"version": payload.get("version", "v001"), "unchanged": True})
+        else:
+            self.send_error(404)
+
+    def do_PUT(self):  # noqa: N802
+        body = self._body()
+        self._record(body)
+        if self.path.startswith("/api/object"):
+            self._json({"sha256": "a" * 64, "size": len(body), "reused": False})
+        elif self.path == "/api/version":
+            payload = json.loads(body.decode("utf-8"))
+            self._json(payload["version_info"]["version"])
+        elif self.path == "/api/current":
+            payload = json.loads(body.decode("utf-8"))
+            self._json({"current": payload.get("version"), "explicit": not payload.get("reset", False)})
         else:
             self.send_error(404)
 
@@ -276,6 +318,29 @@ class AdsHttpClientTests(unittest.TestCase):
         request = _Handler.requests[-1]
         self.assertIn("/api/object", request["path"])
         self.assertIn("sha256=", request["path"])
+
+    def test_object_status_upload_and_import_version(self):
+        status = self.client.object_status("a" * 64, profile="main", size=12)
+        self.assertTrue(status["exists"])
+        request = _Handler.requests[-1]
+        self.assertIn("/api/object/status", request["path"])
+        self.assertIn("size=12", request["path"])
+
+        upload = self.client.upload_object("a" * 64, b"new-object", profile="main")
+        self.assertFalse(upload["reused"])
+        request = _Handler.requests[-1]
+        self.assertEqual(request["content_type"], "application/octet-stream")
+        self.assertEqual(request["body"], b"new-object")
+
+        version = {
+            "version": {"version": "v001", "department_key": {"department": "model"}},
+            "manifest": {"entries": []},
+        }
+        imported = self.client.import_version_info(version, profile="main")
+        self.assertEqual(imported["version"], "v001")
+        request = _Handler.requests[-1]
+        payload = json.loads(request["body"].decode("utf-8"))
+        self.assertEqual(payload["profile"], "main")
 
     def test_thumbnail_url_accepts_json_string_response(self):
         url = self.client.thumbnail_url(

@@ -116,6 +116,22 @@ ads.sync(
 )
 ```
 
+Push a local version to a remote store:
+
+```python
+ads.push(
+    server="http://ads-server:8787",
+    auth_token="secret",
+    profile="main",
+    store=r"D:\local-cache",
+    category="char",
+    asset_code="hero",
+    department="model",
+    version="v003",
+    set_current=True,
+)
+```
+
 ## Remote API
 
 `AdsHttpClient` talks to `ads serve`.
@@ -153,6 +169,7 @@ info = client.version_info(
 )
 
 data = client.object_bytes(info["manifest"]["entries"][0]["sha256"], profile="main")
+status = client.object_status(info["manifest"]["entries"][0]["sha256"], profile="main")
 ```
 
 ## USD Dependency Utility

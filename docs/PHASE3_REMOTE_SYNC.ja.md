@@ -14,7 +14,7 @@ GET /api/object?profile=main&sha256=<64-hex>
 `/api/version` は `VersionRecord` と `Manifest` を含む `VersionInfo` を返す。
 `/api/object` は `objects/sha256/<prefix>/<hash>` から raw object bytes を返す。
 
-これらの endpoint は意図的に read-only とする。後続の `fetch` / `sync` client の土台になる。
+MVP-D 以前ではこれらの endpoint は read-only として扱った。`fetch` / `sync` client の土台になる。
 
 ```text
 remote /api/version
@@ -100,3 +100,32 @@ ads sync `
 ```
 
 `--materialize` は current/latest sync と組み合わせて使う。metadata と object を取得した後、選択された version を workspace に復元する。
+
+## MVP-D: Remote Push
+
+`ads push` は local store の version を remote ADS server へ送信する。object は SHA-256 で事前確認し、remote に存在しないものだけ `PUT /api/object` で upload する。その後 `PUT /api/version` で `VersionInfo` を import する。
+
+追加した write API:
+
+```text
+GET /api/object/status?profile=main&sha256=<64-hex>&size=<bytes>
+PUT /api/object?profile=main&sha256=<64-hex>
+PUT /api/version
+```
+
+CLI 例:
+
+```powershell
+ads push `
+  --server http://ads-server:8787 `
+  --auth-token $env:ADS_WEB_TOKEN `
+  --profile main `
+  --store D:\local-cache `
+  --category char `
+  --asset-code hero `
+  --department model `
+  --version v003 `
+  --set-current
+```
+
+既定では local current version を push する。`--version` または `--latest` で対象 version を明示できる。既定の current push では local の explicit current pointer を remote に反映し、explicit でない場合は remote current を reset して latest fallback に戻す。`--set-current` を指定すると、明示 version/latest push でも remote current を push した version に設定する。

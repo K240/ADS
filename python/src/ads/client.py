@@ -373,6 +373,45 @@ class AdsCli:
             args.append("--force")
         return self.run_text(args)
 
+    def push(
+        self,
+        *,
+        server: str,
+        auth_token: str,
+        store: str | os.PathLike[str],
+        profile: str = "main",
+        category: str,
+        asset_code: str,
+        department: str,
+        version: str | None = None,
+        latest: bool = False,
+        set_current: bool = False,
+    ) -> str:
+        args = [
+            "push",
+            "--server",
+            server,
+            "--auth-token",
+            auth_token,
+            "--profile",
+            profile,
+            "--store",
+            _path(store),
+            "--category",
+            category,
+            "--asset-code",
+            asset_code,
+            "--department",
+            department,
+        ]
+        if version:
+            args += ["--version", version]
+        if latest:
+            args.append("--latest")
+        if set_current:
+            args.append("--set-current")
+        return self.run_text(args)
+
     def checkout(
         self,
         *,
@@ -656,6 +695,43 @@ class AdsHttpClient:
         return self.request_bytes(
             "GET",
             _with_query("/api/object", {"profile": profile, "sha256": sha256}),
+        )
+
+    def object_status(
+        self,
+        sha256: str,
+        *,
+        profile: str = "main",
+        size: int | None = None,
+    ) -> JsonObject:
+        return self.get(
+            "/api/object/status",
+            {"profile": profile, "sha256": sha256, "size": size},
+        )
+
+    def upload_object(
+        self,
+        sha256: str,
+        data: bytes,
+        *,
+        profile: str = "main",
+    ) -> JsonObject:
+        return self.request_json(
+            "PUT",
+            _with_query("/api/object", {"profile": profile, "sha256": sha256}),
+            body=data,
+            headers={"Content-Type": "application/octet-stream"},
+        )
+
+    def import_version_info(
+        self,
+        version_info: Mapping[str, Any],
+        *,
+        profile: str = "main",
+    ) -> JsonObject:
+        return self.put_json(
+            "/api/version",
+            {"profile": profile, "version_info": dict(version_info)},
         )
 
     def download_object(

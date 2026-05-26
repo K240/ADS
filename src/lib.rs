@@ -8,6 +8,7 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow, bail};
+use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Multipart, Query, Request, State};
 use axum::http::{HeaderName, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
@@ -178,6 +179,8 @@ enum Commands {
     Fetch(FetchArgs),
     /// Sync remote assets and missing objects into a local store.
     Sync(SyncArgs),
+    /// Push a local version and missing objects to a remote ADS server.
+    Push(PushArgs),
     /// Deprecated alias for `pull` / `restore`.
     #[command(hide = true)]
     Materialize {
@@ -252,6 +255,9 @@ enum Commands {
         /// Maximum thumbnail upload size in MiB.
         #[arg(long = "max-upload-mb", default_value_t = 10)]
         max_upload_mb: u64,
+        /// Maximum remote object upload size in MiB.
+        #[arg(long = "max-object-upload-mb", default_value_t = 1024)]
+        max_object_upload_mb: u64,
     },
     /// Public publish folder operations.
     Publish {
@@ -394,6 +400,40 @@ struct SyncArgs {
     /// Replace different existing workspace version folders when materializing.
     #[arg(long)]
     force: bool,
+}
+
+#[derive(Args, Debug)]
+struct PushArgs {
+    /// Remote ADS server base URL, for example http://ads-server:8787.
+    #[arg(long)]
+    server: String,
+    /// Bearer token for the remote ADS server. Can also be ADS_WEB_TOKEN.
+    #[arg(long = "auth-token", env = "ADS_WEB_TOKEN")]
+    auth_token: String,
+    /// Remote profile name.
+    #[arg(long, default_value = "main")]
+    profile: String,
+    /// Local store root.
+    #[arg(long)]
+    store: PathBuf,
+    /// Asset category.
+    #[arg(long)]
+    category: String,
+    /// Asset code.
+    #[arg(long = "asset-code")]
+    asset_code: String,
+    /// Work department such as model, rig, anim, fx, or lookdev.
+    #[arg(long)]
+    department: String,
+    /// Version to push. Defaults to the local current version.
+    #[arg(long)]
+    version: Option<VersionId>,
+    /// Push the local latest version instead of current.
+    #[arg(long)]
+    latest: bool,
+    /// Set the remote current pointer to the pushed version.
+    #[arg(long = "set-current")]
+    set_current: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1299,6 +1339,43 @@ where
                 stats.materialized
             );
         }
+        Commands::Push(args) => {
+            if args.latest && args.version.is_some() {
+                bail!("--latest and --version cannot be used together");
+            }
+            let asset_key = AssetKey::new(args.category, args.asset_code)?;
+            let department_key = DepartmentKey::new(asset_key, args.department)?;
+            let selector = if args.latest {
+                VersionSelector::Latest
+            } else {
+                args.version
+                    .map_or(VersionSelector::Current, VersionSelector::Version)
+            };
+            let store = Store::open(&args.store)?;
+            let remote = RemoteClient::new(&args.server, &args.auth_token)?;
+            let (version_info, stats) =
+                push_remote_version(&store, &remote, &args.profile, &department_key, selector)?;
+            if args.set_current {
+                remote.set_current_version(
+                    &args.profile,
+                    &version_info.version.department_key,
+                    version_info.version.version,
+                )?;
+            } else if selector == VersionSelector::Current {
+                let status = store.current_status_for_department(&department_key)?;
+                remote.apply_current_status(&args.profile, &status)?;
+            }
+            println!(
+                "pushed {} {}/{}/{} objects_uploaded={} objects_reused={} bytes_uploaded={}",
+                version_info.version.version,
+                version_info.version.department_key.asset_key.category,
+                version_info.version.department_key.asset_key.asset_code,
+                version_info.version.department_key.department,
+                stats.objects_uploaded,
+                stats.objects_reused,
+                stats.bytes_uploaded
+            );
+        }
         Commands::Materialize {
             store,
             workspace,
@@ -1360,6 +1437,7 @@ where
             store,
             workspace,
             max_upload_mb,
+            max_object_upload_mb,
         } => {
             let config = ServeConfig::from_args(
                 bind,
@@ -1368,6 +1446,7 @@ where
                 store,
                 workspace,
                 max_upload_mb,
+                max_object_upload_mb,
             )?;
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -1693,6 +1772,43 @@ fn apply_remote_current_status(store: &Store, status: &CurrentStatus) -> Result<
         store.reset_current_version(&status.department_key)?;
     }
     Ok(())
+}
+
+fn push_remote_version(
+    store: &Store,
+    remote: &RemoteClient,
+    profile: &str,
+    department_key: &DepartmentKey,
+    selector: VersionSelector,
+) -> Result<(VersionInfo, PushVersionStats)> {
+    let version_info = store.version_info_by_selector(department_key, selector)?;
+    let mut stats = PushVersionStats::default();
+    for entry in &version_info.manifest.entries {
+        if !store.object_is_valid(&entry.sha256, entry.size)? {
+            bail!(
+                "local object missing or invalid for {}: {}",
+                entry.relative_path,
+                entry.sha256
+            );
+        }
+        if remote
+            .object_status(profile, &entry.sha256, entry.size)?
+            .exists
+        {
+            stats.objects_reused += 1;
+            continue;
+        }
+        let bytes = store.read_object_bytes(&entry.sha256, entry.size)?;
+        let upload = remote.upload_object(profile, &entry.sha256, &bytes)?;
+        if upload.reused {
+            stats.objects_reused += 1;
+        } else {
+            stats.objects_uploaded += 1;
+            stats.bytes_uploaded += upload.size;
+        }
+    }
+    remote.import_version_info(profile, &version_info)?;
+    Ok((version_info, stats))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
@@ -2054,6 +2170,7 @@ struct ServeConfig {
     auth_token: String,
     profiles: BTreeMap<String, ServeProfile>,
     max_upload_bytes: usize,
+    max_object_upload_bytes: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -2068,6 +2185,7 @@ struct WebState {
     auth_token: String,
     profiles: Arc<BTreeMap<String, WebProfile>>,
     max_upload_bytes: usize,
+    max_object_upload_bytes: usize,
 }
 
 #[derive(Clone)]
@@ -2099,6 +2217,13 @@ struct SyncStats {
     objects_reused: u64,
     bytes_downloaded: u64,
     materialized: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct PushVersionStats {
+    objects_uploaded: u64,
+    objects_reused: u64,
+    bytes_uploaded: u64,
 }
 
 #[derive(Debug)]
@@ -2148,6 +2273,13 @@ struct ObjectQuery {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+struct ObjectStatusQuery {
+    profile: String,
+    sha256: String,
+    size: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
 struct CurrentStatusQuery {
     profile: String,
     category: Option<String>,
@@ -2181,6 +2313,12 @@ struct CurrentUpdateRequest {
     department: String,
     version: Option<VersionId>,
     reset: Option<bool>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct VersionImportRequest {
+    profile: String,
+    version_info: VersionInfo,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -2238,6 +2376,19 @@ struct VersionsResponse {
     versions: Vec<VersionRecord>,
     current_status: CurrentStatus,
     thumbnails: Vec<ThumbnailRecord>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ObjectStatusResponse {
+    sha256: String,
+    exists: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ObjectUploadResponse {
+    sha256: String,
+    size: u64,
+    reused: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -3528,6 +3679,26 @@ impl Store {
         Ok(computed == sha256)
     }
 
+    fn read_object_bytes(&self, sha256: &str, expected_size: u64) -> Result<Vec<u8>> {
+        validate_sha256(sha256)?;
+        let path = object_path(&self.root, sha256);
+        let bytes =
+            fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
+        if bytes.len() as u64 != expected_size {
+            bail!(
+                "local object size mismatch: {} expected={} actual={}",
+                sha256,
+                expected_size,
+                bytes.len()
+            );
+        }
+        let computed = sha256_bytes(&bytes);
+        if computed != sha256 {
+            bail!("local object hash mismatch: expected {sha256}, computed {computed}");
+        }
+        Ok(bytes)
+    }
+
     fn write_object_bytes(&self, sha256: &str, bytes: &[u8]) -> Result<()> {
         validate_sha256(sha256)?;
         let computed = sha256_bytes(bytes);
@@ -3760,6 +3931,18 @@ impl Store {
     }
 }
 
+fn mib_to_bytes(value: u64, name: &str) -> Result<usize> {
+    let bytes = value
+        .checked_mul(1024)
+        .and_then(|value| value.checked_mul(1024))
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| anyhow!("{name} is too large"))?;
+    if bytes == 0 {
+        bail!("{name} must be greater than zero");
+    }
+    Ok(bytes)
+}
+
 impl ServeConfig {
     fn from_args(
         bind: SocketAddr,
@@ -3768,19 +3951,14 @@ impl ServeConfig {
         store: Option<PathBuf>,
         workspace: Option<PathBuf>,
         max_upload_mb: u64,
+        max_object_upload_mb: u64,
     ) -> Result<Self> {
         let auth_token = auth_token
             .map(|token| token.trim().to_string())
             .filter(|token| !token.is_empty())
             .ok_or_else(|| anyhow!("--auth-token or ADS_WEB_TOKEN is required for `ads serve`"))?;
-        let max_upload_bytes = max_upload_mb
-            .checked_mul(1024)
-            .and_then(|value| value.checked_mul(1024))
-            .and_then(|value| usize::try_from(value).ok())
-            .ok_or_else(|| anyhow!("--max-upload-mb is too large"))?;
-        if max_upload_bytes == 0 {
-            bail!("--max-upload-mb must be greater than zero");
-        }
+        let max_upload_bytes = mib_to_bytes(max_upload_mb, "--max-upload-mb")?;
+        let max_object_upload_bytes = mib_to_bytes(max_object_upload_mb, "--max-object-upload-mb")?;
 
         let profiles = if profiles.is_empty() {
             let store = store.ok_or_else(|| {
@@ -3814,6 +3992,7 @@ impl ServeConfig {
             auth_token,
             profiles,
             max_upload_bytes,
+            max_object_upload_bytes,
         })
     }
 }
@@ -3960,6 +4139,95 @@ impl RemoteClient {
         self.get_bytes("/api/object", &query)
     }
 
+    fn object_status(
+        &self,
+        profile: &str,
+        sha256: &str,
+        expected_size: u64,
+    ) -> Result<ObjectStatusResponse> {
+        validate_sha256(sha256)?;
+        let query = vec![
+            ("profile", profile.to_string()),
+            ("sha256", sha256.to_string()),
+            ("size", expected_size.to_string()),
+        ];
+        self.get_json("/api/object/status", &query)
+    }
+
+    fn upload_object(
+        &self,
+        profile: &str,
+        sha256: &str,
+        bytes: &[u8],
+    ) -> Result<ObjectUploadResponse> {
+        validate_sha256(sha256)?;
+        let query = vec![
+            ("profile", profile.to_string()),
+            ("sha256", sha256.to_string()),
+        ];
+        self.put_bytes_json("/api/object", &query, bytes)
+    }
+
+    fn import_version_info(
+        &self,
+        profile: &str,
+        version_info: &VersionInfo,
+    ) -> Result<VersionRecord> {
+        self.put_json(
+            "/api/version",
+            &[],
+            &VersionImportRequest {
+                profile: profile.to_string(),
+                version_info: version_info.clone(),
+            },
+        )
+    }
+
+    fn set_current_version(
+        &self,
+        profile: &str,
+        department_key: &DepartmentKey,
+        version: VersionId,
+    ) -> Result<CurrentStatus> {
+        self.put_json(
+            "/api/current",
+            &[],
+            &serde_json::json!({
+                "profile": profile,
+                "category": &department_key.asset_key.category,
+                "asset_code": &department_key.asset_key.asset_code,
+                "department": &department_key.department,
+                "version": version,
+            }),
+        )
+    }
+
+    fn apply_current_status(&self, profile: &str, status: &CurrentStatus) -> Result<CurrentStatus> {
+        if status.explicit {
+            let version = status.current.ok_or_else(|| {
+                anyhow!(
+                    "local current status is explicit but has no current version: {}/{}/{}",
+                    status.department_key.asset_key.category,
+                    status.department_key.asset_key.asset_code,
+                    status.department_key.department
+                )
+            })?;
+            self.set_current_version(profile, &status.department_key, version)
+        } else {
+            self.put_json(
+                "/api/current",
+                &[],
+                &serde_json::json!({
+                    "profile": profile,
+                    "category": &status.department_key.asset_key.category,
+                    "asset_code": &status.department_key.asset_key.asset_code,
+                    "department": &status.department_key.department,
+                    "reset": true,
+                }),
+            )
+        }
+    }
+
     fn get_json<T: serde::de::DeserializeOwned>(
         &self,
         path: &str,
@@ -3967,6 +4235,24 @@ impl RemoteClient {
     ) -> Result<T> {
         let url = self.url(path, query);
         let response = self.request(&url)?;
+        let status = response.status();
+        let text = response
+            .into_string()
+            .with_context(|| format!("failed to read response from {url}"))?;
+        if !(200..300).contains(&status) {
+            bail!("remote request failed {status} {url}: {text}");
+        }
+        serde_json::from_str(&text).with_context(|| format!("failed to decode JSON from {url}"))
+    }
+
+    fn put_json<T, B>(&self, path: &str, query: &[(&str, String)], body: &B) -> Result<T>
+    where
+        T: serde::de::DeserializeOwned,
+        B: Serialize,
+    {
+        let url = self.url(path, query);
+        let body = serde_json::to_vec(body).context("failed to encode JSON request")?;
+        let response = self.put_request(&url, "application/json", &body)?;
         let status = response.status();
         let text = response
             .into_string()
@@ -3993,10 +4279,38 @@ impl RemoteClient {
         Ok(bytes)
     }
 
+    fn put_bytes_json<T>(&self, path: &str, query: &[(&str, String)], body: &[u8]) -> Result<T>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        let url = self.url(path, query);
+        let response = self.put_request(&url, "application/octet-stream", body)?;
+        let status = response.status();
+        let text = response
+            .into_string()
+            .with_context(|| format!("failed to read response from {url}"))?;
+        if !(200..300).contains(&status) {
+            bail!("remote request failed {status} {url}: {text}");
+        }
+        serde_json::from_str(&text).with_context(|| format!("failed to decode JSON from {url}"))
+    }
+
     fn request(&self, url: &str) -> Result<ureq::Response> {
         match ureq::get(url)
             .set("Authorization", &format!("Bearer {}", self.auth_token))
             .call()
+        {
+            Ok(response) => Ok(response),
+            Err(ureq::Error::Status(_, response)) => Ok(response),
+            Err(error) => Err(error).with_context(|| format!("remote request failed: {url}")),
+        }
+    }
+
+    fn put_request(&self, url: &str, content_type: &str, body: &[u8]) -> Result<ureq::Response> {
+        match ureq::put(url)
+            .set("Authorization", &format!("Bearer {}", self.auth_token))
+            .set("Content-Type", content_type)
+            .send_bytes(body)
         {
             Ok(response) => Ok(response),
             Err(ureq::Error::Status(_, response)) => Ok(response),
@@ -4042,6 +4356,7 @@ impl From<ServeConfig> for WebState {
             auth_token: config.auth_token,
             profiles: Arc::new(profiles),
             max_upload_bytes: config.max_upload_bytes,
+            max_object_upload_bytes: config.max_object_upload_bytes,
         }
     }
 }
@@ -4103,19 +4418,29 @@ async fn serve_web(config: ServeConfig) -> Result<()> {
 
 fn web_app(state: Arc<WebState>) -> Router {
     let max_upload_bytes = state.max_upload_bytes;
+    let max_object_upload_bytes = state.max_object_upload_bytes;
     let api = Router::new()
         .route("/profiles", get(api_profiles))
         .route("/assets", get(api_assets))
         .route("/asset", get(api_asset))
         .route("/versions", get(api_versions))
-        .route("/version", get(api_version_info))
-        .route("/object", get(api_object))
+        .route("/version", get(api_version_info).put(api_import_version))
+        .route("/object/status", get(api_object_status))
+        .route(
+            "/object",
+            get(api_object)
+                .put(api_upload_object)
+                .layer(DefaultBodyLimit::max(max_object_upload_bytes)),
+        )
         .route("/current/status", get(api_current_status))
         .route("/current", put(api_update_current))
         .route("/pull", post(api_pull))
         .route("/restore", post(api_restore))
         .route("/materialize", post(api_materialize))
-        .route("/thumbnails", post(api_upload_thumbnail))
+        .route(
+            "/thumbnails",
+            post(api_upload_thumbnail).layer(DefaultBodyLimit::max(max_upload_bytes)),
+        )
         .route("/thumbnail-url", get(api_thumbnail_url))
         .route("/resolve", get(api_resolve))
         .route_layer(middleware::from_fn_with_state(
@@ -4129,7 +4454,6 @@ fn web_app(state: Arc<WebState>) -> Router {
         .route("/style.css", get(style_css))
         .nest("/api", api)
         .with_state(state)
-        .layer(DefaultBodyLimit::max(max_upload_bytes))
         .layer(CorsLayer::permissive())
 }
 
@@ -4276,6 +4600,52 @@ async fn api_version_info(
     .map(Json)
 }
 
+async fn api_import_version(
+    State(state): State<Arc<WebState>>,
+    Json(request): Json<VersionImportRequest>,
+) -> std::result::Result<Json<VersionRecord>, ApiError> {
+    let profile = profile_for(&state, &request.profile)?;
+    let lock = profile.mutation_lock.clone();
+    run_store_write(lock, move || {
+        let store = Store::open(&profile.store)?;
+        for entry in &request.version_info.manifest.entries {
+            if !store.object_is_valid(&entry.sha256, entry.size)? {
+                bail!(
+                    "object missing or invalid for {}: {}",
+                    entry.relative_path,
+                    entry.sha256
+                );
+            }
+        }
+        store.import_version_info(&request.version_info)?;
+        Ok(request.version_info.version)
+    })
+    .await
+    .map(Json)
+}
+
+async fn api_object_status(
+    State(state): State<Arc<WebState>>,
+    Query(query): Query<ObjectStatusQuery>,
+) -> std::result::Result<Json<ObjectStatusResponse>, ApiError> {
+    let profile = profile_for(&state, &query.profile)?;
+    run_store_read(move || {
+        validate_sha256(&query.sha256)?;
+        let exists = if let Some(size) = query.size {
+            let store = Store::open(&profile.store)?;
+            store.object_is_valid(&query.sha256, size)?
+        } else {
+            object_path(&profile.store, &query.sha256).exists()
+        };
+        Ok(ObjectStatusResponse {
+            sha256: query.sha256,
+            exists,
+        })
+    })
+    .await
+    .map(Json)
+}
+
 async fn api_object(
     State(state): State<Arc<WebState>>,
     Query(query): Query<ObjectQuery>,
@@ -4305,6 +4675,31 @@ async fn api_object(
         }
         response
     })
+}
+
+async fn api_upload_object(
+    State(state): State<Arc<WebState>>,
+    Query(query): Query<ObjectQuery>,
+    body: Bytes,
+) -> std::result::Result<Json<ObjectUploadResponse>, ApiError> {
+    let profile = profile_for(&state, &query.profile)?;
+    let lock = profile.mutation_lock.clone();
+    run_store_write(lock, move || {
+        validate_sha256(&query.sha256)?;
+        let store = Store::open(&profile.store)?;
+        let size = body.len() as u64;
+        let reused = store.object_is_valid(&query.sha256, size)?;
+        if !reused {
+            store.write_object_bytes(&query.sha256, &body)?;
+        }
+        Ok(ObjectUploadResponse {
+            sha256: query.sha256,
+            size,
+            reused,
+        })
+    })
+    .await
+    .map(Json)
 }
 
 async fn api_current_status(
@@ -6466,6 +6861,105 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn web_api_accepts_object_and_version_import() {
+        let temp = TempDir::new().unwrap();
+        let store_path = temp.path().join("store");
+        let workspace = temp.path().join("workspace");
+        Store::init(&store_path).unwrap();
+        let app = web_app(test_web_state(&store_path, &workspace));
+
+        let object_bytes = b"remote-v1";
+        let object_hash = sha256_bytes(object_bytes);
+        let status = app
+            .clone()
+            .oneshot(api_request(
+                "GET",
+                &format!(
+                    "/api/object/status?profile=main&sha256={object_hash}&size={}",
+                    object_bytes.len()
+                ),
+                "secret",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(status.status(), StatusCode::OK);
+        assert_eq!(response_json(status).await["exists"], false);
+
+        let upload = app
+            .clone()
+            .oneshot(api_request(
+                "PUT",
+                &format!("/api/object?profile=main&sha256={object_hash}"),
+                "secret",
+                Body::from(object_bytes.as_slice()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(upload.status(), StatusCode::OK);
+        let upload = response_json(upload).await;
+        assert_eq!(upload["sha256"], object_hash);
+        assert_eq!(upload["reused"], false);
+
+        let department_key = DepartmentKey::new(
+            AssetKey::new("prop".to_string(), "crate".to_string()).unwrap(),
+            "model".to_string(),
+        )
+        .unwrap();
+        let manifest = Manifest {
+            entries: vec![ManifestEntry {
+                relative_path: "crate.usd".to_string(),
+                sha256: object_hash.clone(),
+                size: object_bytes.len() as u64,
+                mode: 0o666,
+            }],
+        };
+        let version_info = VersionInfo {
+            version: VersionRecord {
+                department_key: department_key.clone(),
+                version: VersionId(1),
+                manifest_hash: manifest.canonical_hash().unwrap(),
+                created_at: "2026-05-27T00:00:00Z".to_string(),
+                source_path: "prop/crate/model/v001".to_string(),
+                file_count: 1,
+                total_bytes: object_bytes.len() as u64,
+            },
+            manifest,
+        };
+        let import = app
+            .clone()
+            .oneshot(api_request(
+                "PUT",
+                "/api/version",
+                "secret",
+                Body::from(
+                    serde_json::to_vec(&VersionImportRequest {
+                        profile: "main".to_string(),
+                        version_info,
+                    })
+                    .unwrap(),
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(import.status(), StatusCode::OK);
+        assert_eq!(response_json(import).await["version"], "v001");
+
+        let fetched = app
+            .oneshot(api_request(
+                "GET",
+                "/api/version?profile=main&category=prop&asset_code=crate&department=model&version=v001",
+                "secret",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(fetched.status(), StatusCode::OK);
+        let fetched = response_json(fetched).await;
+        assert_eq!(fetched["manifest"]["entries"][0]["sha256"], object_hash);
+    }
+
     fn test_web_state(store_path: &Path, workspace: &Path) -> Arc<WebState> {
         let profile = ServeProfile::new(
             "main".to_string(),
@@ -6478,6 +6972,7 @@ mod tests {
             auth_token: "secret".to_string(),
             profiles: BTreeMap::from([(profile.name.clone(), profile)]),
             max_upload_bytes: 10 * 1024 * 1024,
+            max_object_upload_bytes: 1024 * 1024 * 1024,
         }))
     }
 
