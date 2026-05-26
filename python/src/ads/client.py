@@ -734,6 +734,17 @@ class AdsHttpClient:
             {"profile": profile, "version_info": dict(version_info)},
         )
 
+    def import_thumbnail_info(
+        self,
+        thumbnail: Mapping[str, Any],
+        *,
+        profile: str = "main",
+    ) -> JsonObject:
+        return self.put_json(
+            "/api/thumbnail",
+            {"profile": profile, "thumbnail": dict(thumbnail)},
+        )
+
     def download_object(
         self,
         sha256: str,

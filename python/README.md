@@ -170,6 +170,7 @@ info = client.version_info(
 
 data = client.object_bytes(info["manifest"]["entries"][0]["sha256"], profile="main")
 status = client.object_status(info["manifest"]["entries"][0]["sha256"], profile="main")
+client.import_thumbnail_info(thumbnail_record, profile="main")
 ```
 
 ## USD Dependency Utility

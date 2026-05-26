@@ -104,6 +104,7 @@ ads sync `
 ## MVP-D: Remote Push
 
 `ads push` は local store の version を remote ADS server へ送信する。object は SHA-256 で事前確認し、remote に存在しないものだけ `PUT /api/object` で upload する。その後 `PUT /api/version` で `VersionInfo` を import する。
+対象 version に thumbnail metadata がある場合は、thumbnail object も同じ object upload 経路で dedup 送信し、`PUT /api/thumbnail` で metadata を import する。
 
 追加した write API:
 
@@ -111,6 +112,7 @@ ads sync `
 GET /api/object/status?profile=main&sha256=<64-hex>&size=<bytes>
 PUT /api/object?profile=main&sha256=<64-hex>
 PUT /api/version
+PUT /api/thumbnail
 ```
 
 CLI 例:

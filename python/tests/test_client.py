@@ -137,7 +137,7 @@ class AdsCliTests(unittest.TestCase):
         completed = subprocess.CompletedProcess(
             args=[],
             returncode=0,
-            stdout="pushed v003 char/hero/model objects_uploaded=1 objects_reused=0 bytes_uploaded=10\n",
+            stdout="pushed v003 char/hero/model objects_uploaded=1 objects_reused=0 bytes_uploaded=10 thumbnails_pushed=1\n",
             stderr="",
         )
         with patch("ads.client.subprocess.run", return_value=completed) as run:
@@ -214,6 +214,9 @@ class _Handler(BaseHTTPRequestHandler):
         elif self.path == "/api/version":
             payload = json.loads(body.decode("utf-8"))
             self._json(payload["version_info"]["version"])
+        elif self.path == "/api/thumbnail":
+            payload = json.loads(body.decode("utf-8"))
+            self._json(payload["thumbnail"])
         elif self.path == "/api/current":
             payload = json.loads(body.decode("utf-8"))
             self._json({"current": payload.get("version"), "explicit": not payload.get("reset", False)})
@@ -341,6 +344,13 @@ class AdsHttpClientTests(unittest.TestCase):
         request = _Handler.requests[-1]
         payload = json.loads(request["body"].decode("utf-8"))
         self.assertEqual(payload["profile"], "main")
+
+        thumbnail = {"version": "v001", "sha256": "a" * 64, "mime_type": "image/png"}
+        imported_thumbnail = self.client.import_thumbnail_info(thumbnail, profile="main")
+        self.assertEqual(imported_thumbnail["mime_type"], "image/png")
+        request = _Handler.requests[-1]
+        payload = json.loads(request["body"].decode("utf-8"))
+        self.assertEqual(payload["thumbnail"]["version"], "v001")
 
     def test_thumbnail_url_accepts_json_string_response(self):
         url = self.client.thumbnail_url(

@@ -1366,14 +1366,15 @@ where
                 remote.apply_current_status(&args.profile, &status)?;
             }
             println!(
-                "pushed {} {}/{}/{} objects_uploaded={} objects_reused={} bytes_uploaded={}",
+                "pushed {} {}/{}/{} objects_uploaded={} objects_reused={} bytes_uploaded={} thumbnails_pushed={}",
                 version_info.version.version,
                 version_info.version.department_key.asset_key.category,
                 version_info.version.department_key.asset_key.asset_code,
                 version_info.version.department_key.department,
                 stats.objects_uploaded,
                 stats.objects_reused,
-                stats.bytes_uploaded
+                stats.bytes_uploaded,
+                stats.thumbnails_pushed
             );
         }
         Commands::Materialize {
@@ -1808,6 +1809,37 @@ fn push_remote_version(
         }
     }
     remote.import_version_info(profile, &version_info)?;
+    if let Some(thumbnail) =
+        store.try_get_thumbnail(department_key, version_info.version.version)?
+    {
+        if !store.object_is_valid(&thumbnail.sha256, thumbnail.size)? {
+            bail!(
+                "local thumbnail object missing or invalid for {}/{}/{} {}: {}",
+                thumbnail.department_key.asset_key.category,
+                thumbnail.department_key.asset_key.asset_code,
+                thumbnail.department_key.department,
+                thumbnail.version,
+                thumbnail.sha256
+            );
+        }
+        if remote
+            .object_status(profile, &thumbnail.sha256, thumbnail.size)?
+            .exists
+        {
+            stats.objects_reused += 1;
+        } else {
+            let bytes = store.read_object_bytes(&thumbnail.sha256, thumbnail.size)?;
+            let upload = remote.upload_object(profile, &thumbnail.sha256, &bytes)?;
+            if upload.reused {
+                stats.objects_reused += 1;
+            } else {
+                stats.objects_uploaded += 1;
+                stats.bytes_uploaded += upload.size;
+            }
+        }
+        remote.import_thumbnail_info(profile, &thumbnail)?;
+        stats.thumbnails_pushed += 1;
+    }
     Ok((version_info, stats))
 }
 
@@ -2224,6 +2256,7 @@ struct PushVersionStats {
     objects_uploaded: u64,
     objects_reused: u64,
     bytes_uploaded: u64,
+    thumbnails_pushed: u64,
 }
 
 #[derive(Debug)]
@@ -2319,6 +2352,12 @@ struct CurrentUpdateRequest {
 struct VersionImportRequest {
     profile: String,
     version_info: VersionInfo,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ThumbnailImportRequest {
+    profile: String,
+    thumbnail: ThumbnailRecord,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -3110,6 +3149,26 @@ impl Store {
             serde_json::to_vec(&record).context("failed to serialize thumbnail record")?,
         )?;
         Ok(record)
+    }
+
+    pub fn import_thumbnail_info(&self, record: &ThumbnailRecord) -> Result<()> {
+        self.get_version(&record.department_key, record.version)?;
+        validate_sha256(&record.sha256)?;
+        if !self.object_is_valid(&record.sha256, record.size)? {
+            bail!(
+                "thumbnail object missing or invalid for {}/{}/{} {}: {}",
+                record.department_key.asset_key.category,
+                record.department_key.asset_key.asset_code,
+                record.department_key.department,
+                record.version,
+                record.sha256
+            );
+        }
+        self.db.put(
+            key_thumbnail(&record.department_key, record.version),
+            serde_json::to_vec(record).context("failed to serialize thumbnail record")?,
+        )?;
+        Ok(())
     }
 
     pub fn thumbnail_info(
@@ -3905,12 +3964,7 @@ impl Store {
         department_key: &DepartmentKey,
         version: VersionId,
     ) -> Result<ThumbnailRecord> {
-        self.db
-            .get(key_thumbnail(department_key, version))?
-            .map(|value| {
-                serde_json::from_slice(&value).context("failed to decode thumbnail record")
-            })
-            .transpose()?
+        self.try_get_thumbnail(department_key, version)?
             .ok_or_else(|| {
                 anyhow!(
                     "thumbnail not found: {}/{}/{} {}",
@@ -3920,6 +3974,19 @@ impl Store {
                     version
                 )
             })
+    }
+
+    fn try_get_thumbnail(
+        &self,
+        department_key: &DepartmentKey,
+        version: VersionId,
+    ) -> Result<Option<ThumbnailRecord>> {
+        self.db
+            .get(key_thumbnail(department_key, version))?
+            .map(|value| {
+                serde_json::from_slice(&value).context("failed to decode thumbnail record")
+            })
+            .transpose()
     }
 
     fn get_manifest(&self, manifest_hash: &str) -> Result<Manifest> {
@@ -4183,6 +4250,21 @@ impl RemoteClient {
         )
     }
 
+    fn import_thumbnail_info(
+        &self,
+        profile: &str,
+        thumbnail: &ThumbnailRecord,
+    ) -> Result<ThumbnailRecord> {
+        self.put_json(
+            "/api/thumbnail",
+            &[],
+            &ThumbnailImportRequest {
+                profile: profile.to_string(),
+                thumbnail: thumbnail.clone(),
+            },
+        )
+    }
+
     fn set_current_version(
         &self,
         profile: &str,
@@ -4441,6 +4523,7 @@ fn web_app(state: Arc<WebState>) -> Router {
             "/thumbnails",
             post(api_upload_thumbnail).layer(DefaultBodyLimit::max(max_upload_bytes)),
         )
+        .route("/thumbnail", put(api_import_thumbnail))
         .route("/thumbnail-url", get(api_thumbnail_url))
         .route("/resolve", get(api_resolve))
         .route_layer(middleware::from_fn_with_state(
@@ -4822,6 +4905,21 @@ async fn api_upload_thumbnail(
         })();
         let _ = fs::remove_file(&temp_path);
         result
+    })
+    .await
+    .map(Json)
+}
+
+async fn api_import_thumbnail(
+    State(state): State<Arc<WebState>>,
+    Json(request): Json<ThumbnailImportRequest>,
+) -> std::result::Result<Json<ThumbnailRecord>, ApiError> {
+    let profile = profile_for(&state, &request.profile)?;
+    let lock = profile.mutation_lock.clone();
+    run_store_write(lock, move || {
+        let store = Store::open(&profile.store)?;
+        store.import_thumbnail_info(&request.thumbnail)?;
+        Ok(request.thumbnail)
     })
     .await
     .map(Json)
@@ -6947,6 +7045,7 @@ mod tests {
         assert_eq!(response_json(import).await["version"], "v001");
 
         let fetched = app
+            .clone()
             .oneshot(api_request(
                 "GET",
                 "/api/version?profile=main&category=prop&asset_code=crate&department=model&version=v001",
@@ -6958,6 +7057,37 @@ mod tests {
         assert_eq!(fetched.status(), StatusCode::OK);
         let fetched = response_json(fetched).await;
         assert_eq!(fetched["manifest"]["entries"][0]["sha256"], object_hash);
+
+        let thumbnail = ThumbnailRecord {
+            department_key,
+            version: VersionId(1),
+            sha256: object_hash.clone(),
+            size: object_bytes.len() as u64,
+            mime_type: "image/png".to_string(),
+            width: Some(256),
+            height: Some(256),
+            created_at: "2026-05-27T00:00:00Z".to_string(),
+            source_path: "thumbnail.png".to_string(),
+        };
+        let import_thumbnail = app
+            .oneshot(api_request(
+                "PUT",
+                "/api/thumbnail",
+                "secret",
+                Body::from(
+                    serde_json::to_vec(&ThumbnailImportRequest {
+                        profile: "main".to_string(),
+                        thumbnail,
+                    })
+                    .unwrap(),
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(import_thumbnail.status(), StatusCode::OK);
+        let import_thumbnail = response_json(import_thumbnail).await;
+        assert_eq!(import_thumbnail["sha256"], object_hash);
+        assert_eq!(import_thumbnail["width"], 256);
     }
 
     fn test_web_state(store_path: &Path, workspace: &Path) -> Arc<WebState> {
