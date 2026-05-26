@@ -549,6 +549,47 @@ Authorization: Bearer <token>
 
 ブラウザから任意のローカルパスを指定することはできません。起動時に許可されたprofileのみを扱います。
 
+## Python API
+
+Phase 1では、Houdini Python環境で導入しやすいpure Python APIを提供します。Rust native extensionではなく、標準ライブラリのみで構成したthin APIです。
+
+Python APIは2つの入口を持ちます。
+
+- `AdsCli`: local `ads` executableをsubprocess経由で呼び出す。
+- `AdsHttpClient`: `ads serve` のHTTP APIをBearer token付きで呼び出す。
+
+`AdsCli` はlocal store運用やlocal + remote store運用の基礎になります。
+
+```python
+from ads import AdsCli
+
+ads = AdsCli(r"D:\tools\ads.exe")
+ads.pull(
+    store=r"D:\store",
+    workspace=r"D:\workspace",
+    category="char",
+    asset_code="hero",
+    department="model",
+)
+```
+
+`AdsHttpClient` はremote store only運用の基礎になります。
+
+```python
+from ads import AdsHttpClient
+
+client = AdsHttpClient("http://ads-server:8787", token="secret")
+assets = client.assets(profile="main", category="char", department="model")
+client.pull(
+    profile="main",
+    category="char",
+    asset_code="hero",
+    department="model",
+)
+```
+
+このAPIは、Houdini shelf tool、Python Panel、USD Resolver補助処理、社内publish toolからADSを呼び出すための最小レイヤーです。将来的にnative bindingやResolver pluginを追加する場合も、まずこのPython APIを運用上の契約として使えます。
+
 ## セキュリティモデル
 
 ADS WebAppはLAN内運用を想定しています。初期版のセキュリティ方針はシンプルです。
@@ -615,6 +656,7 @@ storeをバックアップする場合は、RocksDBの `db/` と `objects/` の�
 
 - README整備
 - GitHub ActionsによるWindows build、test、clippy
+- Python APIとHoudini向け導入手順
 - CLI helpとエラーメッセージ改善
 - 実制作データでのWindows/Houdini検証
 - WebAppの失敗理由表示改善
