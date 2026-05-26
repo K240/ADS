@@ -39,4 +39,28 @@ D:/public/char/hero/texture/v002/maps/body.1001.tx
   -> ads://char/hero/texture/maps/body.1001.tx?v=v002
 ```
 
-Use this processor on USD ROPs that publish ADS-managed layers. After saving, register the public version with `ads add` or a future `ads publish register` command.
+Use this processor on USD ROPs that publish ADS-managed layers. After saving, register the public version with `ads publish register`.
+
+## Register Public Output
+
+After a USD ROP save, validate and register the public version folder:
+
+```powershell
+ads publish validate `
+  --store D:\store `
+  --public-root D:\public `
+  --category char `
+  --asset-code hero `
+  --department model `
+  --version v003
+
+ads publish register `
+  --store D:\store `
+  --public-root D:\public `
+  --category char `
+  --asset-code hero `
+  --department model `
+  --version v003
+```
+
+`validate` checks text USD files for unmanaged `@...@` references before the folder is registered.

@@ -54,6 +54,30 @@ class AdsCliTests(unittest.TestCase):
 
         self.assertEqual(data["asset"]["asset_key"]["asset_code"], "hero")
 
+    def test_publish_register_builds_expected_command(self):
+        completed = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="registered v003 char/hero/model files=1 bytes=10 manifest=abc\n",
+            stderr="",
+        )
+        with patch("ads.client.subprocess.run", return_value=completed) as run:
+            text = AdsCli("ads.exe").publish_register(
+                store="D:\\store",
+                public_root="D:\\public",
+                category="char",
+                asset_code="hero",
+                department="model",
+                version="v003",
+            )
+
+        self.assertIn("registered v003", text)
+        args = run.call_args.args[0]
+        self.assertEqual(args[:2], ["ads.exe", "publish"])
+        self.assertIn("register", args)
+        self.assertEqual(args[args.index("--public-root") + 1], "D:\\public")
+        self.assertEqual(args[args.index("--version") + 1], "v003")
+
     def test_nonzero_cli_exit_raises(self):
         completed = subprocess.CompletedProcess(
             args=[],

@@ -683,6 +683,28 @@ D:/public/char/hero/texture/v002/maps/body.1001.tx
 
 これにより、public出力先の物理パスが変わってもUSD内の参照はADS URIとして安定します。Resolverなしの外部納品ではなく、社内managed publishではこの方式をdefaultとします。
 
+USD ROPで書き出したpublic version folderは、CLIから検証・登録できます。
+
+```powershell
+ads publish validate `
+  --store D:\store `
+  --public-root D:\public `
+  --category char `
+  --asset-code hero `
+  --department model `
+  --version v003
+
+ads publish register `
+  --store D:\store `
+  --public-root D:\public `
+  --category char `
+  --asset-code hero `
+  --department model `
+  --version v003
+```
+
+`validate` はtext USD内の `@...@` asset pathを検査し、`ads://` ではない相対パス、絶対パス、`file://` 参照が残っていれば失敗します。binary USDの完全検査はHoudini/OpenUSD側のpreflightに委ね、CLIでは警告として扱います。
+
 ## セキュリティモデル
 
 ADS WebAppはLAN内運用を想定しています。初期版のセキュリティ方針はシンプルです。
@@ -756,14 +778,18 @@ storeをバックアップする場合は、RocksDBの `db/` と `objects/` の�
 
 ### Phase 2: Resolver統合
 
+Status: complete for local USD/Houdini integration. See `docs/PHASE2_COMPLETION.ja.md`.
+
 - C++ USD AssetResolver prototype
 - Houdini環境向けbuild scriptとpackage例
 - `ads://` URIのproduction scene検証
 - local/remote/auto解決の詳細仕様確定
-- remote object direct read用 `ArAsset` の設計
+- Houdini USD ROP output processor
+- public publish validate/register
 
 ### Phase 3: Remote Store / Sync
 
+- remote object direct read用 `ArAsset` の設計
 - remote store onlyを標準client modeとして実装
 - `--server <url>` によるcentral API接続
 - metadata/objectのremote lookupとworkspace pull

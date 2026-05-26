@@ -239,6 +239,50 @@ class AdsCli:
             args.append("--force")
         return self.run_text(args)
 
+    def publish_register(
+        self,
+        *,
+        store: str | os.PathLike[str],
+        public_root: str | os.PathLike[str],
+        category: str,
+        asset_code: str,
+        department: str,
+        version: str,
+    ) -> str:
+        return self.run_text(
+            _publish_args(
+                "register",
+                store,
+                public_root,
+                category,
+                asset_code,
+                department,
+                version,
+            )
+        )
+
+    def publish_validate(
+        self,
+        *,
+        store: str | os.PathLike[str],
+        public_root: str | os.PathLike[str],
+        category: str,
+        asset_code: str,
+        department: str,
+        version: str,
+    ) -> str:
+        return self.run_text(
+            _publish_args(
+                "validate",
+                store,
+                public_root,
+                category,
+                asset_code,
+                department,
+                version,
+            )
+        )
+
     def checkout(
         self,
         *,
@@ -730,6 +774,33 @@ def _current_args(
         asset_code,
         "--department",
         department,
+    ]
+
+
+def _publish_args(
+    action: str,
+    store: str | os.PathLike[str],
+    public_root: str | os.PathLike[str],
+    category: str,
+    asset_code: str,
+    department: str,
+    version: str,
+) -> list[str]:
+    return [
+        "publish",
+        action,
+        "--store",
+        _path(store),
+        "--public-root",
+        _path(public_root),
+        "--category",
+        category,
+        "--asset-code",
+        asset_code,
+        "--department",
+        department,
+        "--version",
+        version,
     ]
 
 

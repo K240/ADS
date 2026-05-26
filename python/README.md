@@ -64,6 +64,27 @@ ads.pull(
 )
 ```
 
+Register a public USD ROP output folder:
+
+```python
+ads.publish_validate(
+    store=r"D:\store",
+    public_root=r"D:\public",
+    category="char",
+    asset_code="hero",
+    department="model",
+    version="v003",
+)
+ads.publish_register(
+    store=r"D:\store",
+    public_root=r"D:\public",
+    category="char",
+    asset_code="hero",
+    department="model",
+    version="v003",
+)
+```
+
 ## Remote API
 
 `AdsHttpClient` talks to `ads serve`.

@@ -249,6 +249,11 @@ enum Commands {
         #[arg(long = "max-upload-mb", default_value_t = 10)]
         max_upload_mb: u64,
     },
+    /// Public publish folder operations.
+    Publish {
+        #[command(subcommand)]
+        command: PublishCommands,
+    },
     /// Verify metadata and object content.
     Verify {
         /// Store root path.
@@ -305,6 +310,36 @@ struct WorkspaceRestoreArgs {
     /// Replace a different existing version folder.
     #[arg(long)]
     force: bool,
+}
+
+#[derive(Subcommand, Debug)]
+enum PublishCommands {
+    /// Register a public version folder into the store.
+    Register(PublishVersionArgs),
+    /// Validate that a public version folder only uses managed references.
+    Validate(PublishVersionArgs),
+}
+
+#[derive(Args, Debug)]
+struct PublishVersionArgs {
+    /// Store root path.
+    #[arg(long)]
+    store: PathBuf,
+    /// Public root. The version folder is <public-root>/<category>/<asset-code>/<department>/<version>.
+    #[arg(long = "public-root")]
+    public_root: PathBuf,
+    /// Asset category.
+    #[arg(long)]
+    category: String,
+    /// Asset code.
+    #[arg(long = "asset-code")]
+    asset_code: String,
+    /// Work department such as model, rig, anim, fx, or lookdev.
+    #[arg(long)]
+    department: String,
+    /// Version folder to register or validate, for example v001.
+    #[arg(long)]
+    version: VersionId,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1083,6 +1118,63 @@ where
                 .context("failed to build Tokio runtime")?;
             runtime.block_on(serve_web(config))?;
         }
+        Commands::Publish { command } => match command {
+            PublishCommands::Register(args) => {
+                let asset_key = AssetKey::new(args.category, args.asset_code)?;
+                let department_key = DepartmentKey::new(asset_key, args.department)?;
+                let store = Store::open(&args.store)?;
+                let outcome = store.register_public_version(
+                    &args.public_root,
+                    &department_key,
+                    args.version,
+                )?;
+                let action = if outcome.created {
+                    "registered"
+                } else {
+                    "reused"
+                };
+                println!(
+                    "{action} {} {}/{}/{} files={} bytes={} manifest={}",
+                    outcome.version,
+                    department_key.asset_key.category,
+                    department_key.asset_key.asset_code,
+                    department_key.department,
+                    outcome.file_count,
+                    outcome.total_bytes,
+                    outcome.manifest_hash
+                );
+            }
+            PublishCommands::Validate(args) => {
+                let asset_key = AssetKey::new(args.category, args.asset_code)?;
+                let department_key = DepartmentKey::new(asset_key, args.department)?;
+                let report =
+                    validate_public_version(&args.public_root, &department_key, args.version)?;
+                if report.errors.is_empty() {
+                    println!(
+                        "ok files_scanned={} references_checked={} warnings={}",
+                        report.files_scanned,
+                        report.references_checked,
+                        report.warnings.len()
+                    );
+                    for warning in report.warnings {
+                        eprintln!("warning: {warning}");
+                    }
+                } else {
+                    for warning in &report.warnings {
+                        eprintln!("warning: {warning}");
+                    }
+                    for error in &report.errors {
+                        eprintln!("error: {error}");
+                    }
+                    bail!(
+                        "publish validation failed: {} error(s), files_scanned={}, references_checked={}",
+                        report.errors.len(),
+                        report.files_scanned,
+                        report.references_checked
+                    );
+                }
+            }
+        },
         Commands::Verify { store } => {
             let store = Store::open(&store)?;
             let report = store.verify()?;
@@ -1110,6 +1202,142 @@ where
         }
     }
     Ok(())
+}
+
+fn validate_public_version(
+    public_root: &Path,
+    department_key: &DepartmentKey,
+    version: VersionId,
+) -> Result<PublishValidateReport> {
+    let root = version_folder(public_root, department_key, version);
+    let root = root
+        .canonicalize()
+        .with_context(|| format!("public version folder does not exist: {}", root.display()))?;
+    if !root.is_dir() {
+        bail!("public version path is not a folder: {}", root.display());
+    }
+
+    let mut report = PublishValidateReport {
+        root: root.clone(),
+        files_scanned: 0,
+        references_checked: 0,
+        warnings: Vec::new(),
+        errors: Vec::new(),
+    };
+
+    for entry in WalkDir::new(&root).follow_links(false) {
+        let entry = entry.with_context(|| format!("failed to walk {}", root.display()))?;
+        if entry.path() == root {
+            continue;
+        }
+        if entry.file_type().is_dir() {
+            continue;
+        }
+        let rel_path = entry
+            .path()
+            .strip_prefix(&root)
+            .with_context(|| format!("failed to relativize {}", entry.path().display()))?;
+        let rel_path = normalize_relative_path(rel_path)?;
+        if entry.file_type().is_symlink() {
+            report.errors.push(format!(
+                "{rel_path} is a symlink; public publish does not allow symlinks"
+            ));
+            continue;
+        }
+        if !entry.file_type().is_file() || !is_usd_layer_path(entry.path()) {
+            continue;
+        }
+        report.files_scanned += 1;
+        let bytes = fs::read(entry.path())
+            .with_context(|| format!("failed to read {}", entry.path().display()))?;
+        let Ok(text) = String::from_utf8(bytes) else {
+            report.warnings.push(format!(
+                "{rel_path} is not UTF-8 text; binary USD reference validation was skipped"
+            ));
+            continue;
+        };
+        for reference in extract_usd_asset_references(&text) {
+            report.references_checked += 1;
+            validate_public_reference(&mut report, &rel_path, &reference);
+        }
+    }
+
+    Ok(report)
+}
+
+fn validate_public_reference(report: &mut PublishValidateReport, rel_path: &str, reference: &str) {
+    let reference = reference.trim();
+    if reference.is_empty() || reference.starts_with("ads://") {
+        return;
+    }
+    if looks_like_external_uri(reference) && !reference.starts_with("file://") {
+        report.warnings.push(format!(
+            "{rel_path} contains external URI reference `{reference}`"
+        ));
+        return;
+    }
+
+    let reference_kind = if reference.starts_with("file://") {
+        "file URI"
+    } else if is_absolute_asset_path(reference) {
+        "absolute path"
+    } else {
+        "relative path"
+    };
+    report.errors.push(format!(
+        "{rel_path} contains unmanaged {reference_kind} reference `{reference}`; expected ads://"
+    ));
+}
+
+fn extract_usd_asset_references(text: &str) -> Vec<String> {
+    let mut references = Vec::new();
+    let mut current = String::new();
+    let mut in_reference = false;
+
+    for character in text.chars() {
+        if character == '@' {
+            if in_reference {
+                references.push(current.clone());
+                current.clear();
+                in_reference = false;
+            } else {
+                in_reference = true;
+            }
+            continue;
+        }
+        if in_reference {
+            current.push(character);
+        }
+    }
+
+    references
+}
+
+fn is_usd_layer_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| USD_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
+fn looks_like_external_uri(value: &str) -> bool {
+    let Some((scheme, rest)) = value.split_once("://") else {
+        return false;
+    };
+    !scheme.is_empty()
+        && !rest.is_empty()
+        && scheme.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.')
+        })
+}
+
+fn is_absolute_asset_path(value: &str) -> bool {
+    value.starts_with('/')
+        || value.starts_with('\\')
+        || (value.len() >= 3
+            && value.as_bytes()[1] == b':'
+            && matches!(value.as_bytes()[2], b'/' | b'\\')
+            && value.as_bytes()[0].is_ascii_alphabetic())
 }
 
 #[derive(Clone, Copy)]
@@ -1444,6 +1672,15 @@ pub struct MaterializeOutcome {
     pub version: VersionId,
     pub path: PathBuf,
     pub unchanged: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PublishValidateReport {
+    pub root: PathBuf,
+    pub files_scanned: u64,
+    pub references_checked: u64,
+    pub warnings: Vec<String>,
+    pub errors: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1807,12 +2044,39 @@ impl Store {
         version: VersionId,
     ) -> Result<AddOutcome> {
         let source = version_folder(workspace, department_key, version);
-        let source = source.canonicalize().with_context(|| {
-            format!(
-                "version folder does not exist: {}; run `ads new-version` first",
-                source.display()
-            )
-        })?;
+        self.add_version_from_source(
+            &source,
+            department_key,
+            version,
+            version_workspace_relative_path(department_key, version),
+        )
+    }
+
+    pub fn register_public_version(
+        &self,
+        public_root: &Path,
+        department_key: &DepartmentKey,
+        version: VersionId,
+    ) -> Result<AddOutcome> {
+        let source = version_folder(public_root, department_key, version);
+        self.add_version_from_source(
+            &source,
+            department_key,
+            version,
+            version_workspace_relative_path(department_key, version),
+        )
+    }
+
+    fn add_version_from_source(
+        &self,
+        source: &Path,
+        department_key: &DepartmentKey,
+        version: VersionId,
+        source_path: String,
+    ) -> Result<AddOutcome> {
+        let source = source
+            .canonicalize()
+            .with_context(|| format!("version folder does not exist: {}", source.display()))?;
         if !source.is_dir() {
             bail!("version path is not a folder: {}", source.display());
         }
@@ -1869,7 +2133,7 @@ impl Store {
             version,
             manifest_hash: manifest_hash.clone(),
             created_at: now.clone(),
-            source_path: version_workspace_relative_path(department_key, version),
+            source_path,
             file_count: manifest.entries.len() as u64,
             total_bytes: manifest.total_bytes(),
         };
@@ -5052,6 +5316,46 @@ mod tests {
                 .join("ab")
                 .join("abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789.tx")
         );
+    }
+
+    #[test]
+    fn usd_asset_reference_scanner_extracts_at_paths() {
+        let references = extract_usd_asset_references(
+            r#"
+            def "Root" (
+                references = @ads://prop/crate/model/crate.usd?v=v001@
+                payload = @../texture/v001/body.1001.tx@
+            ) {}
+            "#,
+        );
+
+        assert_eq!(
+            references,
+            vec![
+                "ads://prop/crate/model/crate.usd?v=v001".to_string(),
+                "../texture/v001/body.1001.tx".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn publish_reference_validation_rejects_local_paths() {
+        let mut report = PublishValidateReport {
+            root: PathBuf::from("public"),
+            files_scanned: 1,
+            references_checked: 0,
+            warnings: Vec::new(),
+            errors: Vec::new(),
+        };
+
+        validate_public_reference(&mut report, "asset.usda", r"D:\workspace\asset.usd");
+        validate_public_reference(&mut report, "asset.usda", "file:///tmp/asset.usd");
+        validate_public_reference(&mut report, "asset.usda", "https://example.com/asset.usd");
+
+        assert_eq!(report.errors.len(), 2);
+        assert!(report.errors[0].contains("absolute path"));
+        assert!(report.errors[1].contains("file URI"));
+        assert_eq!(report.warnings.len(), 1);
     }
 
     #[test]

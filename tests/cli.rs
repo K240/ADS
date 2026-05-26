@@ -369,6 +369,72 @@ fn pull_restores_latest_and_requires_force_for_different_content() {
 }
 
 #[test]
+fn publish_register_adds_public_version_folder() {
+    let temp = TempDir::new().unwrap();
+    let store = temp.path().join("store");
+    let public = temp.path().join("public");
+    assert!(ads().arg("init").arg(&store).status().unwrap().success());
+
+    let v001 = department_version_folder(&public, "prop", "crate", "model", "v001");
+    fs::create_dir_all(v001.join("geo")).unwrap();
+    fs::write(
+        v001.join("crate.usda"),
+        r#"def "Crate" (references = @ads://prop/crate/model/geo/body.usd?v=v001@) {}"#,
+    )
+    .unwrap();
+    fs::write(v001.join("geo").join("body.usd"), "body").unwrap();
+
+    let validate = publish_validate(&store, &public, "prop", "crate", "model", "v001");
+    assert!(validate.status.success(), "{}", stderr(&validate));
+    assert!(stdout(&validate).contains("references_checked=1"));
+
+    let registered = publish_register(&store, &public, "prop", "crate", "model", "v001");
+    assert!(registered.status.success(), "{}", stderr(&registered));
+    assert!(stdout(&registered).contains("registered v001 prop/crate/model"));
+
+    let info = ads()
+        .arg("info")
+        .arg("--store")
+        .arg(&store)
+        .arg("--category")
+        .arg("prop")
+        .arg("--asset-code")
+        .arg("crate")
+        .arg("--department")
+        .arg("model")
+        .arg("--version")
+        .arg("v001")
+        .output()
+        .unwrap();
+    assert!(info.status.success(), "{}", stderr(&info));
+    let info_stdout = stdout(&info);
+    assert!(info_stdout.contains("crate.usda"));
+    assert!(info_stdout.contains("geo/body.usd"));
+}
+
+#[test]
+fn publish_validate_rejects_unmanaged_relative_references() {
+    let temp = TempDir::new().unwrap();
+    let store = temp.path().join("store");
+    let public = temp.path().join("public");
+    assert!(ads().arg("init").arg(&store).status().unwrap().success());
+
+    let v001 = department_version_folder(&public, "prop", "crate", "model", "v001");
+    fs::create_dir_all(&v001).unwrap();
+    fs::write(
+        v001.join("crate.usda"),
+        r#"def "Crate" (references = @../texture/v001/body.1001.tx@) {}"#,
+    )
+    .unwrap();
+
+    let validate = publish_validate(&store, &public, "prop", "crate", "model", "v001");
+    assert!(!validate.status.success());
+    let err = stderr(&validate);
+    assert!(err.contains("unmanaged relative path"));
+    assert!(err.contains("../texture/v001/body.1001.tx"));
+}
+
+#[test]
 fn current_pointer_defaults_to_latest_and_can_be_pinned() {
     let temp = TempDir::new().unwrap();
     let store = temp.path().join("store");
@@ -1347,6 +1413,72 @@ fn restore_version(store: &Path, workspace: &Path, version: &str, force: bool) -
         command.arg("--force");
     }
     command.output().unwrap()
+}
+
+fn publish_register(
+    store: &Path,
+    public_root: &Path,
+    category: &str,
+    asset_code: &str,
+    department: &str,
+    version: &str,
+) -> Output {
+    publish_command(
+        "register",
+        store,
+        public_root,
+        category,
+        asset_code,
+        department,
+        version,
+    )
+}
+
+fn publish_validate(
+    store: &Path,
+    public_root: &Path,
+    category: &str,
+    asset_code: &str,
+    department: &str,
+    version: &str,
+) -> Output {
+    publish_command(
+        "validate",
+        store,
+        public_root,
+        category,
+        asset_code,
+        department,
+        version,
+    )
+}
+
+fn publish_command(
+    subcommand: &str,
+    store: &Path,
+    public_root: &Path,
+    category: &str,
+    asset_code: &str,
+    department: &str,
+    version: &str,
+) -> Output {
+    ads()
+        .arg("publish")
+        .arg(subcommand)
+        .arg("--store")
+        .arg(store)
+        .arg("--public-root")
+        .arg(public_root)
+        .arg("--category")
+        .arg(category)
+        .arg("--asset-code")
+        .arg(asset_code)
+        .arg("--department")
+        .arg(department)
+        .arg("--version")
+        .arg(version)
+        .output()
+        .unwrap()
 }
 
 fn current_get(store: &Path, category: &str, asset_code: &str, department: &str) -> Output {
