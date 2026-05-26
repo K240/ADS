@@ -131,3 +131,34 @@ ads push `
 ```
 
 既定では local current version を push する。`--version` または `--latest` で対象 version を明示できる。既定の current push では local の explicit current pointer を remote に反映し、explicit でない場合は remote current を reset して latest fallback に戻す。`--set-current` を指定すると、明示 version/latest push でも remote current を push した version に設定する。
+
+## MVP-E: Resolver Remote Direct Read
+
+C++ ADS Resolver は、`ads resolve --mode remote|auto` が返した `http://` / `https://` URL を直接開ける。remote object は `curl` 互換 command で取得し、`ArInMemoryAsset` として USD に渡す。
+
+```powershell
+$env:ADS_RESOLVER_MODE = "remote"
+$env:ADS_RESOLVER_REMOTE_BASE_URL = "https://assets.example.com/objects/sha256"
+$env:ADS_RESOLVER_HTTP_EXECUTABLE = "curl"
+$env:ADS_RESOLVER_HTTP_TIMEOUT_SECONDS = "30"
+```
+
+認証が必要な object endpoint を使う場合は bearer token header を付けられる。
+
+```powershell
+$env:ADS_RESOLVER_HTTP_BEARER_TOKEN = $env:ADS_WEB_TOKEN
+```
+
+この実装は Phase3 completion 用の direct read MVP であり、range request / streaming / partial read はまだ行わない。大きなUSD layerを直接読む場合は一度全体をmemoryにbufferする。重いproduction workloadでは、引き続き `ads sync` / `ads fetch` / `ads pull` によるlocal materializeが安定運用の第一候補になる。
+
+## Phase3 Completion Criteria
+
+Phase3 は以下を満たした状態として完了扱いにする。
+
+- central `ads serve` から version metadata、manifest、object、thumbnail metadataを読める。
+- local store へ `ads fetch` / `ads sync` で必要objectをchecksum検証付きで取得できる。
+- local store から `ads push` で version、object、thumbnailをremoteへ送信できる。
+- Resolver はlocal workspace優先の `auto` と remote object URL direct read の両方を持つ。
+- Python API から remote read/write helper を呼び出せる。
+
+残る production hardening は Phase4 以降に送る。具体的には conflict report、dry-run plan、object GC、streaming/range read、auth/role管理、audit、approval workflow を対象にする。

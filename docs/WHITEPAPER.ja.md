@@ -641,7 +641,9 @@ $env:ADS_RESOLVER_MODE = "local"
 $env:PXR_PLUGINPATH_NAME = "D:\path\to\ads\resolver\build\houdini\resources"
 ```
 
-`ADS_RESOLVER_MODE` のdefaultは `local` です。これは、初期版Resolverが直接remote objectを読む `ArAsset` をまだ持たないためです。workspaceに対象versionが存在しない場合は、事前に `ads pull` を実行します。
+`ADS_RESOLVER_MODE` のdefaultは `local` です。workspaceに対象versionが存在しない場合は、事前に `ads pull` を実行します。
+
+Phase3ではremote direct read MVPとして、Resolverが `http://` / `https://` のresolved pathを `curl` 互換commandで取得し、`ArInMemoryAsset` としてUSDへ渡せるようにします。これはworkspaceにversion folderを生成しない読み取り経路です。ただし、初期実装はrange requestやstreamingではなく、対象object全体をmemoryにbufferします。
 
 buildはHoudini toolkitの `hcustom.exe -U` を使います。
 
@@ -655,7 +657,7 @@ buildはHoudini toolkitの `hcustom.exe -U` を使います。
 - `Sdf.Layer.FindOrOpen("ads://...")`
 - `ads://...` referenceを含むUSD stage open
 
-remote object URLを直接読むには、次段階でADS専用 `ArAsset` 実装が必要です。
+remote object URLはPhase3 MVPで直接読めます。production向けには、将来的にrange request、streaming、retry、cache policyを備えた専用 `ArAsset` 実装へ発展させます。
 
 ## Houdini USD ROP Publish
 
@@ -761,7 +763,7 @@ storeをバックアップする場合は、RocksDBの `db/` と `objects/` の�
 - schema migrationは未実装。開発中storeは再作成前提。
 - WebAppからのasset作成、new-version、addは未実装。
 - multi-user lock、review、approval、publish gateは未実装。
-- C++ USD Resolverはlocal file read-only prototype。remote objectを直接読む `ArAsset` は未実装。
+- C++ USD Resolverのremote direct readはin-memory MVP。range request / streaming / retry policyは未実装。
 
 これらは意図的に初期スコープ外としています。まずはversion folder、dedup store、Resolver向けURI、Web browserを最小構成で成立させることを優先しています。
 
@@ -789,13 +791,13 @@ Status: complete for local USD/Houdini integration. See `docs/PHASE2_COMPLETION.
 
 ### Phase 3: Remote Store / Sync
 
-Status: in progress. Remote read/fetch/sync/push MVP is described in `docs/PHASE3_REMOTE_SYNC.ja.md`.
+Status: complete for remote store MVP. Remote read/fetch/sync/push and resolver direct read MVP are described in `docs/PHASE3_REMOTE_SYNC.ja.md`.
 
-- remote object direct read用 `ArAsset` の設計
+- remote object direct read用 `ArAsset` MVP
 - `ads fetch` によるremote version metadata/object取得
 - `ads sync` によるfilter指定remote store同期
 - `ads push` によるlocal version metadata/object送信
-- remote store onlyを標準client modeとして実装
+- remote store onlyを標準client modeとして扱う設計
 - `--server <url>` によるcentral API接続
 - metadata/objectのremote lookupとworkspace pull
 - local + remote store向けのsync/fetch/push実装

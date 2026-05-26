@@ -2,6 +2,7 @@
 #include "pxr/usd/ar/defineResolver.h"
 #include "pxr/usd/ar/filesystemAsset.h"
 #include "pxr/usd/ar/filesystemWritableAsset.h"
+#include "pxr/usd/ar/inMemoryAsset.h"
 #include "pxr/usd/ar/resolvedPath.h"
 #include "pxr/usd/ar/resolver.h"
 
@@ -26,6 +27,11 @@ constexpr const char* kAdsScheme = "ads:";
 bool StartsWithAdsScheme(const std::string& value)
 {
     return value.rfind(kAdsScheme, 0) == 0;
+}
+
+bool StartsWithHttpScheme(const std::string& value)
+{
+    return value.rfind("http://", 0) == 0 || value.rfind("https://", 0) == 0;
 }
 
 std::string GetEnv(const char* name, const std::string& fallback = "")
@@ -139,6 +145,95 @@ std::string ReadCommandStdout(const std::string& command)
         return {};
     }
     return Trim(output);
+}
+
+bool ReadCommandBytes(const std::string& command, std::vector<char>* output)
+{
+    std::array<char, 64 * 1024> buffer {};
+
+#if defined(_WIN32)
+    FILE* pipe = _popen(command.c_str(), "rb");
+#else
+    FILE* pipe = popen(command.c_str(), "r");
+#endif
+    if (!pipe) {
+        return false;
+    }
+
+    output->clear();
+    while (true) {
+        const size_t bytesRead = std::fread(buffer.data(), 1, buffer.size(), pipe);
+        if (bytesRead > 0) {
+            output->insert(output->end(), buffer.data(), buffer.data() + bytesRead);
+        }
+        if (bytesRead < buffer.size()) {
+            if (std::feof(pipe)) {
+                break;
+            }
+            if (std::ferror(pipe)) {
+#if defined(_WIN32)
+                _pclose(pipe);
+#else
+                pclose(pipe);
+#endif
+                output->clear();
+                return false;
+            }
+        }
+    }
+
+#if defined(_WIN32)
+    const int status = _pclose(pipe);
+#else
+    const int status = pclose(pipe);
+#endif
+    if (status != 0) {
+        output->clear();
+        return false;
+    }
+    return true;
+}
+
+std::shared_ptr<ArAsset> OpenRemoteAsset(const std::string& url)
+{
+    const std::string executable = GetEnv("ADS_RESOLVER_HTTP_EXECUTABLE", "curl");
+    const std::string bearerToken = GetEnv("ADS_RESOLVER_HTTP_BEARER_TOKEN");
+    const std::string timeoutSeconds = GetEnv("ADS_RESOLVER_HTTP_TIMEOUT_SECONDS", "30");
+
+    std::vector<std::string> args {
+        executable,
+        "--location",
+        "--fail",
+        "--silent",
+        "--show-error",
+    };
+    if (!timeoutSeconds.empty()) {
+        args.push_back("--max-time");
+        args.push_back(timeoutSeconds);
+    }
+    if (!bearerToken.empty()) {
+        args.push_back("--header");
+        args.push_back("Authorization: Bearer " + bearerToken);
+    }
+    args.push_back(url);
+
+    const std::string command = JoinCommand(args);
+    if (DebugEnabled()) {
+        std::cerr << "ADS Resolver remote asset download `" << url << "` using `" << executable
+                  << "`\n";
+    }
+
+    std::vector<char> bytes;
+    if (!ReadCommandBytes(command, &bytes)) {
+        if (DebugEnabled()) {
+            std::cerr << "ADS Resolver failed to download remote asset `" << url << "`\n";
+        }
+        return {};
+    }
+
+    auto storage = std::make_shared<std::vector<char>>(std::move(bytes));
+    std::shared_ptr<const char> buffer(storage, storage->empty() ? nullptr : storage->data());
+    return ArInMemoryAsset::FromBuffer(std::move(buffer), storage->size());
 }
 
 std::string ResolveWithAdsCli(const std::string& assetPath)
@@ -262,6 +357,9 @@ protected:
         }
         if (DebugEnabled()) {
             std::cerr << "ADS Resolver open asset `" << resolvedPath.GetPathString() << "`\n";
+        }
+        if (StartsWithHttpScheme(resolvedPath.GetPathString())) {
+            return OpenRemoteAsset(resolvedPath.GetPathString());
         }
         auto asset = ArFilesystemAsset::Open(resolvedPath);
         if (!asset && DebugEnabled()) {
