@@ -5256,6 +5256,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
           <span id="detailDepartment" class="pill"></span>
         </div>
         <div class="preview" id="detailPreview"></div>
+        <label>ADS URI<input id="assetUriInput" type="text" readonly></label>
         <div class="field-row">
           <label>Version<select id="versionSelect"></select></label>
           <label class="check"><input id="forcePull" type="checkbox"> Force</label>
@@ -5266,6 +5267,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
           <button id="pullButton" type="button">Pull to Workspace</button>
         </div>
         <div class="button-row">
+          <button id="copyAssetUriButton" type="button">Copy ADS URI</button>
           <button id="copyThumbUrlButton" type="button">Copy Thumbnail URL</button>
           <label class="upload">
             Upload Thumbnail
@@ -5531,6 +5533,26 @@ const $ = (id) => document.getElementById(id);
 const status = (text) => { $('status').textContent = text || ''; };
 const esc = (value) => String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
 
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch (_) {
+    const area = document.createElement('textarea');
+    area.value = text;
+    area.setAttribute('readonly', '');
+    area.style.position = 'fixed';
+    area.style.left = '-9999px';
+    document.body.appendChild(area);
+    area.focus();
+    area.select();
+    area.setSelectionRange(0, area.value.length);
+    const ok = document.execCommand('copy');
+    document.body.removeChild(area);
+    return ok;
+  }
+}
+
 async function api(path, options = {}) {
   const headers = options.headers ? new Headers(options.headers) : new Headers();
   headers.set('Authorization', `Bearer ${state.token}`);
@@ -5641,6 +5663,7 @@ function renderDetail(asset, data) {
   const options = data.versions.map(v => `<option value="${esc(v.version)}">${esc(v.version)}</option>`).join('');
   $('versionSelect').innerHTML = options;
   $('versionSelect').value = state.selectedVersion || data.current_status.current || data.current_status.latest || '';
+  updateAssetUriField();
   $('versionList').innerHTML = data.versions.map(v => {
     const marker = v.version === data.current_status.current ? 'Current' : '';
     return `<div class="version-row"><strong>${esc(v.version)}</strong><span>${v.file_count} files / ${v.total_bytes} bytes</span><span>${marker}</span></div>`;
@@ -5679,8 +5702,28 @@ async function copyThumbUrl() {
   if (!asset) return;
   const version = $('versionSelect').value;
   const url = await api(`/api/thumbnail-url?${qs({profile: state.profile, category: asset.category, asset_code: asset.asset_code, department: asset.department, version})}`);
-  await navigator.clipboard.writeText(url);
-  status('Thumbnail URL copied');
+  const copied = await copyText(url);
+  status(copied ? 'Thumbnail URL copied' : `Clipboard blocked. Thumbnail URL: ${url}`);
+}
+
+function assetUri(asset, version) {
+  const base = `ads://${asset.category}/${asset.asset_code}/${asset.department}/${asset.asset_code}.usd`;
+  return version ? `${base}?v=${encodeURIComponent(version)}` : base;
+}
+
+function updateAssetUriField() {
+  const asset = state.selected;
+  if (!asset) return;
+  $('assetUriInput').value = assetUri(asset, $('versionSelect').value);
+}
+
+async function copyAssetUri() {
+  const asset = state.selected;
+  if (!asset) return;
+  updateAssetUriField();
+  const uri = $('assetUriInput').value;
+  const copied = await copyText(uri);
+  status(copied ? `ADS URI copied: ${uri}` : `Clipboard blocked. ADS URI: ${uri}`);
 }
 
 async function uploadThumbnail() {
@@ -5723,6 +5766,8 @@ $('logoutButton').addEventListener('click', () => { sessionStorage.removeItem('a
 $('setCurrentButton').addEventListener('click', () => setCurrent().catch(showError));
 $('resetCurrentButton').addEventListener('click', () => resetCurrent().catch(showError));
 $('pullButton').addEventListener('click', () => pullToWorkspace().catch(showError));
+$('versionSelect').addEventListener('change', updateAssetUriField);
+$('copyAssetUriButton').addEventListener('click', () => copyAssetUri().catch(showError));
 $('copyThumbUrlButton').addEventListener('click', () => copyThumbUrl().catch(showError));
 $('thumbnailInput').addEventListener('change', () => uploadThumbnail().catch(showError));
 

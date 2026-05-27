@@ -19,6 +19,45 @@ $env:ADS_RESOLVER_WORKSPACE = "D:\workspace"
 $env:ADS_OUTPUT_PUBLIC_ROOT = "D:\public"
 ```
 
+## Remote Resolver Launch
+
+For remote object-read testing, build the resolver and launch Houdini through:
+
+```bat
+houdini\launch_ads_remote_houdini.bat http://127.0.0.1:8789 main <token> D:\workspace
+```
+
+The first argument is the ADS Web/API server started by `ads serve`.
+The second argument is the allowed server profile. The third argument is the
+Bearer token. The workspace argument is optional for remote read, but useful
+for other Houdini-side ADS tools.
+
+In native remote mode the resolver queries `/api/resolve` directly and reads
+object URLs directly. It does not spawn `ads.exe` or `curl.exe` during USD
+resolution.
+
+The launcher sets:
+
+```text
+ADS_RESOLVER_MODE=remote
+ADS_RESOLVER_SERVER=<ads-server>
+ADS_RESOLVER_PROFILE=<profile>
+PXR_PLUGINPATH_NAME=<repo>\resolver\build\houdini\resources
+PYTHONPATH=<repo>\python\src
+HOUDINI_PATH=<repo>\houdini;&
+```
+
+Optional environment overrides:
+
+```bat
+set HOUDINI_ROOT=C:\Program Files\Side Effects Software\Houdini 21.0.700
+set ADS_RESOLVER_DEBUG=1
+set ADS_RESOLVER_LOG_FILE=%TEMP%\ads_resolver_houdini.log
+```
+
+If Houdini reports a resolver error, enable `ADS_RESOLVER_DEBUG=1` and inspect
+the log file printed by the launcher.
+
 ## USD ROP Output Processor
 
 `husdplugins/outputprocessors/adspublish.py` registers an `ADS Managed Publish` output processor for Solaris USD ROPs.

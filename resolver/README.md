@@ -14,6 +14,7 @@ The resolver is read-only. It delegates URI lookup to the `ads resolve` CLI comm
 
 - Local filesystem paths are opened through `ArFilesystemAsset`.
 - `http://` and `https://` resolved paths are downloaded into an in-memory `ArAsset`.
+- Native remote mode can query `ads serve` directly and does not spawn `ads.exe` or `curl.exe`.
 
 ## Environment
 
@@ -29,7 +30,17 @@ $env:PXR_PLUGINPATH_NAME = "D:\work\apps\ads\resolver\build\houdini\resources"
 
 `ADS_RESOLVER_MODE` defaults to `local`. Use `ads pull` before opening a stage when the version folder is not present in the workspace.
 
-For remote direct reads, set `ADS_RESOLVER_MODE=remote` or `auto` and configure a remote object base URL in the ADS store or through `ADS_RESOLVER_REMOTE_BASE_URL`.
+For native remote direct reads, point the resolver at an ADS Web/API server:
+
+```powershell
+$env:ADS_RESOLVER_SERVER = "http://127.0.0.1:8789"
+$env:ADS_RESOLVER_PROFILE = "main"
+$env:ADS_RESOLVER_API_TOKEN = "<token>"
+$env:ADS_RESOLVER_MODE = "remote"
+$env:PXR_PLUGINPATH_NAME = "D:\work\apps\ads\resolver\build\houdini\resources"
+```
+
+In this mode the resolver calls `/api/resolve` through native HTTP and opens returned object URLs through native HTTP. On Windows the backend is WinHTTP. The HTTP backend is isolated so macOS/Linux can use a native library backend such as libcurl without shelling out to the `curl` command.
 
 Texture-like files are resolved differently from USD layers. For reserved texture extensions such as `.tx`, `.rat`, `.exr`, `.tif`, `.png`, and `.jpg`, `ads resolve --mode local|auto` reads the manifest from the store and returns a hash-derived local cache path:
 
@@ -45,13 +56,13 @@ Optional:
 
 ```powershell
 $env:ADS_RESOLVER_DEBUG = "1"
+$env:ADS_RESOLVER_LOG_FILE = "$env:TEMP\ads_resolver_houdini.log"
 $env:ADS_RESOLVER_REMOTE_BASE_URL = "https://assets.example.com/objects/sha256"
-$env:ADS_RESOLVER_HTTP_EXECUTABLE = "curl"
-$env:ADS_RESOLVER_HTTP_BEARER_TOKEN = "<token>"
+$env:ADS_RESOLVER_HTTP_BEARER_TOKEN = "<object-token>"
 $env:ADS_RESOLVER_HTTP_TIMEOUT_SECONDS = "30"
 ```
 
-Remote direct read uses the configured HTTP executable, defaulting to `curl`, and buffers the full response into memory through `ArInMemoryAsset`. This avoids creating workspace version files, but it is not a streaming or range-read implementation.
+Remote direct read buffers the full response into memory through `ArInMemoryAsset`. This avoids creating workspace version files, but it is not a streaming or range-read implementation.
 
 ## Build With Houdini
 
@@ -101,6 +112,6 @@ If `shot.usd` contains references or sublayers using `ads://...`, USD should cal
 - This resolver is read-only. Create and edit explicit workspace version folders, then publish with `ads add`.
 - `ADS_RESOLVER_STORE` is required.
 - `ADS_RESOLVER_WORKSPACE` is recommended.
-- `ADS_RESOLVER_MODE=remote` can open HTTP object URLs directly when `curl` or a compatible executable is available.
+- `ADS_RESOLVER_MODE=remote` can open HTTP object URLs directly. On Windows this uses WinHTTP and does not spawn `curl.exe`.
 - Remote assets are currently downloaded as complete in-memory buffers.
 - The resolver treats ADS paths as context-dependent because `current`, `latest`, store configuration, and workspace configuration can change the resulting path.
