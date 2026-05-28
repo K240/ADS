@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="utf-8"?>
+<menuDocument>
+  <menu>
+    <scriptItem id="ads_asset_catalog">
+      <label>Open ADS Asset Catalog</label>
+      <scriptCode><![CDATA[
+server = hou.getenv('ADS_CATALOG_SERVER') or hou.getenv('ADS_RESOLVER_SERVER')
+if not server:
+    result = hou.ui.readInput(
+        'ADS server URL',
+        buttons=('Open', 'Cancel'),
+        initial_contents='http://127.0.0.1:8789')
+    if result[0] == 0:
+        server = result[1]
+
+if server:
+    profile = hou.getenv('ADS_CATALOG_PROFILE') or hou.getenv('ADS_RESOLVER_PROFILE') or 'main'
+    args = 'server={};profile={}'.format(server, profile)
+
+    category = hou.getenv('ADS_CATALOG_CATEGORY')
+    if category:
+        args += ';category={}'.format(category)
+
+    department = hou.getenv('ADS_CATALOG_DEPARTMENT')
+    if department:
+        args += ';department={}'.format(department)
+
+    query = hou.getenv('ADS_CATALOG_QUERY')
+    if query:
+        args += ';q={}'.format(query)
+
+    resolve_mode = hou.getenv('ADS_CATALOG_RESOLVE_MODE') or hou.getenv('ADS_RESOLVER_MODE')
+    if resolve_mode:
+        args += ';resolve_mode={}'.format(resolve_mode)
+
+    hou.ui.setSharedLayoutDataSource(
+        hou.AssetGalleryDataSource('ADS', args))
+      ]]></scriptCode>
+    </scriptItem>
+
+  </menu>
+</menuDocument>

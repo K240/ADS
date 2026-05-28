@@ -13,10 +13,25 @@
       "ADS_RESOLVER_MODE": "local"
     },
     {
+      "ADS_CATALOG_SERVER": "http://127.0.0.1:8789"
+    },
+    {
+      "ADS_CATALOG_PROFILE": "main"
+    },
+    {
+      "ADS_CATALOG_API_TOKEN": "replace-with-token"
+    },
+    {
+      "ADS_CATALOG_RESOLVE_MODE": "auto"
+    },
+    {
       "PXR_PLUGINPATH_NAME": "D:/work/apps/ads/resolver/build/houdini/resources;&"
     },
     {
       "PYTHONPATH": "D:/work/apps/ads/python/src;&"
+    },
+    {
+      "HOUDINI_HUSDPLUGINS_PATH": "D:/work/apps/ads/houdini/husdplugins;&"
     },
     {
       "HOUDINI_PATH": "D:/work/apps/ads/houdini;&"

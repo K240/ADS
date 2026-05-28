@@ -3,6 +3,8 @@
 ## Rust製アセットバージョニングシステム
 
 作成日: 2026-05-26  
+最終更新: 2026-05-27
+
 対象実装: ADS schema version 7
 
 ## Executive Summary
@@ -25,7 +27,7 @@ D:\workspace\char\hero\anim\v001
 
 USDファイルはアプリケーションが開いている間にファイルロックや書き込み競合を起こすことがあります。ADSは同一パスを更新し続けるのではなく、`v001`, `v002` のように物理パスを分けることで、既存versionを不変に近い状態で扱い、編集開始時には次のversionフォルダを作成します。
 
-また、USD AssetResolverを前提にした論理パスもサポートします。制作データ内では `ads://hero/model/hero.usd` のような短いURIを使い、実際にどのversion、どのローカルパス、どのObjectStorage URLへ解決するかはADS側で吸収する設計です。
+また、USD AssetResolverを前提にした論理パスもサポートします。制作データ内では `ads://hero/model/hero.usd` のような短いURIを使い、実際にどのversion、どのローカルパス、どのObjectStorage URLへ解決するかはADS側で吸収する設計です。現状実装ではHoudini 21.0.700向けC++ `ArResolver` pluginにより、local workspace解決とremote object direct readの両方を検証済みです。
 
 ## 背景と課題
 
@@ -98,7 +100,7 @@ ADSはローカルworkspaceから開く場合と、ObjectStorage風URLから直�
 - remote: object storeのURLへ解決
 - auto: localに実体があればlocal、なければremote
 
-USD/Houdini環境では、将来的にADS用AssetResolverを実装することで、`ads://` URIをproduction scene内で自然に扱えるようにすることを狙います。
+USD/Houdini環境では、ADS用C++ `ArResolver` pluginにより、`ads://` URIをproduction scene内で自然に扱えるようにします。local modeではworkspace上のversion folderへ解決し、remote modeではcentral ADS APIとobject URLから直接読み込みます。
 
 ## システム構成
 
@@ -111,7 +113,7 @@ flowchart LR
     Web["Asset Browser WebApp"] --> API["ads serve API"]
     API --> DB
     API --> Objects
-    Resolver["USD AssetResolver\nfuture"] --> CLI
+    Resolver["USD AssetResolver"] --> API
     Resolver --> Workspace
     Resolver --> Objects
 ```
@@ -150,8 +152,10 @@ flowchart LR
 - remote storeが唯一のsource of truth。
 - clientはworkspaceのversion folderだけを保持する。
 - asset list、current/latest、manifest、thumbnailはcentral APIへ問い合わせる。
-- `pull` はremote storeからworkspaceへ対象versionを展開する。
-- Resolverはlocal workspaceに実体があればlocal pathを返し、なければremote object URLを返す。
+- WebAppとHTTP APIは起動時に許可されたprofileのstore/workspaceだけを扱う。
+- `pull` / `restore` はprofileに紐づくworkspaceへ対象versionを展開する。
+- Resolverは `ADS_RESOLVER_SERVER` とprofile/tokenを使ってcentral APIへ問い合わせ、remote object URLをnative HTTPで直接読む。
+- Windows版Resolverのremote modeはWinHTTPを使い、`ads.exe` や `curl.exe` を起動しない。
 
 利点は運用が単純なことです。正規データが一箇所に集まるため、local storeの同期ずれ、破損、世代差を考える必要がありません。WebAppもcentral APIを見るだけで済みます。
 
@@ -188,23 +192,32 @@ flowchart LR
 
 ### コマンド設計方針
 
-remote store onlyでは、既存の `--store <path>` に加えて、将来的に `--server <url>` を受け付けるclient modeを追加する想定です。
+remote接続は、現状では `ads serve` をcentral APIとして起動し、`fetch` / `sync` / `push` でlocal storeと往復する形を実装しています。WebAppやResolverはcentral APIへ直接接続できます。
 
 ```powershell
-ads pull `
+ads sync `
   --server http://ads-server:8787 `
+  --auth-token <token> `
+  --profile main `
+  --store D:\local-store `
   --workspace D:\workspace `
   --category char `
   --asset-code hero `
-  --department model
+  --department model `
+  --latest `
+  --materialize
 ```
+
+完全な「local storeなしCLI client mode」は未実装ですが、Houdini Resolverのremote modeはlocal storeを必要とせず、central APIとremote object URLだけでUSD layerを開けます。
 
 local + remote storeでは、local storeを明示してpullし、remote storeとはsync/pushで接続します。
 
 ```powershell
 ads sync `
   --store D:\local-store `
-  --remote http://ads-server:8787 `
+  --server http://ads-server:8787 `
+  --auth-token <token> `
+  --profile main `
   --category char `
   --asset-code hero `
   --department model
@@ -466,9 +479,11 @@ ads set-remote `
   --remote-base-url https://assets.example.com/objects/sha256
 ```
 
-USD/Houdiniでは、最終的にAssetResolverがこの解決を担当する想定です。USDファイル内には極力 `ads://hero/model/hero.usd` のような論理パスを置き、versionや保存場所の変更をResolver側で吸収します。
+USD/Houdiniでは、C++ `ArResolver` pluginがこの解決を担当します。USDファイル内には極力 `ads://hero/model/hero.usd` のような論理パスを置き、versionや保存場所の変更をResolver側で吸収します。
 
-remote store onlyでは、Resolverはlocal workspaceにmaterialize済みのファイルがあればそれを返し、なければcentral APIまたはObjectStorage URLへ解決します。local + remote storeでは、workspace、local store/cache、remote storeの順に探索します。
+local modeではResolverは `ads resolve` CLIへ委譲し、workspaceまたはlocal cache上のファイルを開きます。remote modeでは `ADS_RESOLVER_SERVER` で指定したcentral ADS APIの `/api/resolve` をC++から直接呼び出し、返されたobject URLをnative HTTPで読みます。WindowsではWinHTTP backendを使うため、remote解決中に `ads.exe` や `curl.exe` は起動しません。
+
+remote store onlyでは、Resolverはcentral APIとremote object URLだけでUSD layerを開けます。local + remote storeでは、workspace、local store/cache、remote storeの順に探索する運用を選べます。
 
 ## Thumbnail Workflow
 
@@ -521,9 +536,9 @@ WebAppはMegascans Bridge風の構成です。
 
 - 左: profile、検索、category/department filter
 - 中央: thumbnail grid
-- 右: asset detail、version list、current操作、pull、thumbnail upload
+- 右: asset detail、ADS URI表示/コピー、version list、current操作、pull、thumbnail upload
 
-初期版ではWebAppからversion作成やasset登録は行いません。WebAppは閲覧、current管理、workspace pull、thumbnail uploadを主目的とします。
+初期版ではWebAppからversion作成やasset登録は行いません。WebAppは閲覧、ADS URIコピー、current管理、workspace pull、thumbnail uploadを主目的とします。
 
 ## HTTP API
 
@@ -534,11 +549,17 @@ GET  /api/profiles
 GET  /api/assets
 GET  /api/asset
 GET  /api/versions
+GET  /api/version
+PUT  /api/version
+GET  /api/object/status
+GET  /api/object
+PUT  /api/object
 GET  /api/current/status
 PUT  /api/current
 POST /api/pull
 POST /api/restore
 POST /api/thumbnails
+PUT  /api/thumbnail
 GET  /api/thumbnail-url
 GET  /api/resolve
 ```
@@ -592,7 +613,7 @@ client.pull(
 )
 ```
 
-このAPIは、Houdini shelf tool、Python Panel、USD Resolver補助処理、社内publish toolからADSを呼び出すための最小レイヤーです。将来的にnative bindingやResolver pluginを追加する場合も、まずこのPython APIを運用上の契約として使えます。
+このAPIは、Houdini shelf tool、Python Panel、USD Resolver補助処理、社内publish toolからADSを呼び出すための最小レイヤーです。C++ Resolver pluginとは別に、Houdini UI、preflight、publish補助などの運用上の契約として使えます。
 
 ### USD Dependency Preflight
 
@@ -615,13 +636,15 @@ uv run ads-deps D:\shots\shot010\shot.usda `
   --execute
 ```
 
-この運用により、Houdiniでstageを開く前に必要なADS version folderをworkspaceへ揃えられます。Resolverはその後、既に存在するlocal fileへ高速に解決するだけです。
+この運用により、Houdiniでstageを開く前に必要なADS version folderをworkspaceへ揃えられます。local modeのResolverはその後、既に存在するlocal fileへ高速に解決するだけです。remote modeではpreflight pullなしでもobject URLから直接読めますが、多数layerや大容量textureを扱う場合はpreflightでlocal化した方が安定するケースがあります。
 
 ## C++ USD Resolver
 
-Phase 2では、`ads://` URIをUSD composition arcから直接扱うためのC++ `ArResolver` pluginを提供します。
+`ads://` URIをUSD composition arcから直接扱うためのC++ `ArResolver` pluginを提供します。
 
-初期実装はread-only resolverです。Resolverは `ads://...` を受け取り、`ads resolve` CLIへ委譲してworkspace上のローカルファイルパスへ解決します。その後、USDの `ArFilesystemAsset` で実ファイルを開きます。
+Resolverはread-onlyです。ADS URIへの書き込みは行わず、作業者は明示的なworkspace version folderで編集し、`ads add` または `ads publish register` で登録します。
+
+local modeでは、Resolverは `ads resolve` CLIへ委譲してworkspace上のローカルファイルパスまたはtexture cache pathへ解決し、USDの `ArFilesystemAsset` で開きます。
 
 ```text
 USD / Houdini
@@ -631,7 +654,7 @@ USD / Houdini
   -> ArFilesystemAsset opens the local file
 ```
 
-必要な環境変数:
+local modeに必要な環境変数:
 
 ```powershell
 $env:ADS_RESOLVER_EXECUTABLE = "D:\tools\ads.exe"
@@ -643,7 +666,41 @@ $env:PXR_PLUGINPATH_NAME = "D:\path\to\ads\resolver\build\houdini\resources"
 
 `ADS_RESOLVER_MODE` のdefaultは `local` です。workspaceに対象versionが存在しない場合は、事前に `ads pull` を実行します。
 
-Phase3ではremote direct read MVPとして、Resolverが `http://` / `https://` のresolved pathを `curl` 互換commandで取得し、`ArInMemoryAsset` としてUSDへ渡せるようにします。これはworkspaceにversion folderを生成しない読み取り経路です。ただし、初期実装はrange requestやstreamingではなく、対象object全体をmemoryにbufferします。
+remote modeでは、Resolverは `ads.exe` を呼び出さず、`ADS_RESOLVER_SERVER` で指定されたcentral ADS APIへ直接問い合わせます。`/api/resolve` が返すremote object URLをnative HTTP backendで取得し、USDへ `ArInMemoryAsset` として渡します。これはworkspaceにversion folderを生成しない読み取り経路です。
+
+```text
+USD / Houdini
+  -> ArResolver receives ads://hero/model/hero.usd
+  -> GET /api/resolve?profile=main&asset_path=ads://hero/model/hero.usd&mode=remote
+  -> http://asset-server/objects/sha256/ab/abcd...
+  -> native HTTP download
+  -> ArInMemoryAsset opens the remote object bytes
+```
+
+remote modeに必要な環境変数:
+
+```powershell
+$env:ADS_RESOLVER_SERVER = "http://ads-server:8787"
+$env:ADS_RESOLVER_PROFILE = "main"
+$env:ADS_RESOLVER_API_TOKEN = "<token>"
+$env:ADS_RESOLVER_MODE = "remote"
+$env:PXR_PLUGINPATH_NAME = "D:\path\to\ads\resolver\build\houdini\resources"
+```
+
+WindowsではHTTP backendとしてWinHTTPを使います。そのため、remote modeの解決中に `ads.exe` や `curl.exe` のプロセスは起動しません。macOS/Linux向けには同じbackend境界でlibcurl等のnative library backendを追加する方針です。
+
+Houdini向けにはremote mode起動用batchを提供します。
+
+```bat
+houdini\launch_ads_remote_houdini.bat http://127.0.0.1:8789 phase3 phase3-test-token D:\workspace
+```
+
+問題調査用に `ADS_RESOLVER_DEBUG=1` と `ADS_RESOLVER_LOG_FILE` を設定できます。
+
+```powershell
+$env:ADS_RESOLVER_DEBUG = "1"
+$env:ADS_RESOLVER_LOG_FILE = "$env:TEMP\ads_resolver_houdini.log"
+```
 
 buildはHoudini toolkitの `hcustom.exe -U` を使います。
 
@@ -656,8 +713,9 @@ buildはHoudini toolkitの `hcustom.exe -U` を使います。
 - `Ar.GetResolver().Resolve("ads://...")`
 - `Sdf.Layer.FindOrOpen("ads://...")`
 - `ads://...` referenceを含むUSD stage open
+- remote modeでのroot layer、payload、sublayer、texture objectの直接読み込み
 
-remote object URLはPhase3 MVPで直接読めます。production向けには、将来的にrange request、streaming、retry、cache policyを備えた専用 `ArAsset` 実装へ発展させます。
+remote object URLは直接読めます。ただし現状は対象object全体をmemoryにbufferするMVPです。production向けには、range request、streaming、retry、cache policyを備えた専用 `ArAsset` 実装へ発展させます。
 
 ## Houdini USD ROP Publish
 
@@ -755,8 +813,8 @@ storeをバックアップする場合は、RocksDBの `db/` と `objects/` の�
 
 初期版の制約は以下です。
 
-- local filesystem専用。
-- S3互換backendへの直接書き込みは未実装。
+- store backendはlocal filesystem上のRocksDB/object store。remote accessは `ads serve` 経由で提供する。
+- S3互換backendへの直接読み書きは未実装。
 - `--server` 指定によるremote fetch/sync/pushは実装済みだが、全CLIを透過的にremote store onlyで扱うclient modeは未実装。
 - local + remote storeの基本fetch/sync/pushは実装済み。conflict解決、差分push、object pruningは未実装。
 - object garbage collectionは未実装。
@@ -764,6 +822,7 @@ storeをバックアップする場合は、RocksDBの `db/` と `objects/` の�
 - WebAppからのasset作成、new-version、addは未実装。
 - multi-user lock、review、approval、publish gateは未実装。
 - C++ USD Resolverのremote direct readはin-memory MVP。range request / streaming / retry policyは未実装。
+- Windows Resolver remote modeはWinHTTP native backendを実装済み。macOS/Linux向けnative library backendは未実装で、今後libcurl等のlibrary backendを追加する方針。
 
 これらは意図的に初期スコープ外としています。まずはversion folder、dedup store、Resolver向けURI、Web browserを最小構成で成立させることを優先しています。
 
@@ -791,9 +850,11 @@ Status: complete for local USD/Houdini integration. See `docs/PHASE2_COMPLETION.
 
 ### Phase 3: Remote Store / Sync
 
-Status: complete for remote store MVP. Remote read/fetch/sync/push and resolver direct read MVP are described in `docs/PHASE3_REMOTE_SYNC.ja.md`.
+Status: complete for remote store MVP. Base remote read/fetch/sync/push is described in `docs/PHASE3_REMOTE_SYNC.ja.md`; native remote Resolver details are reflected in this white paper and `resolver/README.md`.
 
 - remote object direct read用 `ArAsset` MVP
+- C++ Resolver native remote mode: `ADS_RESOLVER_SERVER` から `/api/resolve` を呼び、WindowsではWinHTTPでobjectを直接取得
+- Houdini 21.0.700向けremote起動batch
 - `ads fetch` によるremote version metadata/object取得
 - `ads sync` によるfilter指定remote store同期
 - `ads push` によるlocal version metadata/object送信
@@ -803,6 +864,7 @@ Status: complete for remote store MVP. Remote read/fetch/sync/push and resolver 
 - local + remote store向けのsync/fetch/push実装
 - local storeをcache/mirrorとして扱う運用
 - checksum検証付き転送
+- WebAppでADS URI表示/コピー、thumbnail preview/upload、current/pull操作
 
 ### Phase 4: Production Governance
 
@@ -812,6 +874,8 @@ Status: complete for remote store MVP. Remote read/fetch/sync/push and resolver 
 - object GC
 - schema migration
 - role-based access control
+- macOS/Linux向けResolver native HTTP backend
+- remote object range request / streaming / retry policy
 
 ## 結論
 
@@ -825,6 +889,7 @@ ADSは、USDを含むDCC制作環境で「ファイルを直接上書きし続�
 - version間の重複ファイルをdedupする。
 - latest/currentを使い分ける。
 - ブラウザでassetを探索できる。
-- 将来的にObjectStorageやAssetResolverへ拡張できる。
+- AssetResolverでlocal workspaceとremote object direct readを切り替えられる。
+- 将来的にS3互換ObjectStorage、range read、production governanceへ拡張できる。
 
-ADSの初期版は完成した制作管理システムではなく、堅牢なasset versioning layerです。このlayerを中心に、Houdini integration、remote storage、production governanceを段階的に追加していくことができます。
+ADSの初期版は完成した制作管理システムではなく、堅牢なasset versioning layerです。remote store MVPとHoudini integrationはすでに成立しており、今後はS3互換backend、range read、cache policy、production governanceを段階的に追加していく段階です。

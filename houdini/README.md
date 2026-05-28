@@ -7,9 +7,14 @@ This directory contains Houdini-side integration files for ADS.
 Copy or adapt `houdini/packages/ads.json.example` into a Houdini package directory. The package should add:
 
 ```text
-PYTHONPATH   -> <repo>/python/src
-HOUDINI_PATH -> <repo>/houdini
+PYTHONPATH                -> <repo>/python/src
+HOUDINI_PATH              -> <repo>/houdini
+HOUDINI_HUSDPLUGINS_PATH  -> <repo>/houdini/husdplugins
 ```
+
+`HOUDINI_PATH` is needed for menu XML files such as
+`AssetGallerySourceMenu.xml`. `HOUDINI_HUSDPLUGINS_PATH` is needed for Houdini
+to discover `husdplugins/datasources/ads.py`.
 
 It can also set ADS environment variables used by the resolver and USD ROP output processor:
 
@@ -18,6 +23,69 @@ $env:ADS_RESOLVER_STORE = "D:\store"
 $env:ADS_RESOLVER_WORKSPACE = "D:\workspace"
 $env:ADS_OUTPUT_PUBLIC_ROOT = "D:\public"
 ```
+
+## Asset Catalog DataSource
+
+`husdplugins/datasources/ads.py` registers a read-only Houdini Asset Gallery
+datasource named `ADS`. It lists ADS assets from `ads serve` and returns
+`ads://` file paths, so existing ADS AssetResolver settings decide whether the
+asset opens from a local workspace or from remote object storage.
+`AssetGallerySourceMenu.xml` adds an `Open ADS Asset Catalog` source menu item
+to Houdini's regular Asset Gallery. It uses `hou.ui.setSharedLayoutDataSource`
+so the catalog appears in the normal Asset Catalog, not only in the material
+gallery.
+
+Set the catalog API connection before launching Houdini:
+
+```powershell
+$env:ADS_CATALOG_SERVER = "http://127.0.0.1:8789"
+$env:ADS_CATALOG_PROFILE = "main"
+$env:ADS_CATALOG_API_TOKEN = "<token>"
+$env:ADS_CATALOG_RESOLVE_MODE = "auto"
+```
+
+You can create the datasource explicitly from Houdini Python:
+
+```python
+import hou
+
+source = hou.AssetGalleryDataSource(
+    "ADS",
+    "server=http://127.0.0.1:8789;profile=main",
+)
+print(source.isValid())
+print(source.itemIds())
+```
+
+Optional datasource args are `server`, `profile`, `q`, `category`,
+`department`, `token_env`, `resolve_mode`, and `timeout`. The `category`
+filter is prefix-based, so `category=show/char` also matches
+`show/char/main`. Token values should come from an environment variable rather
+than the args string. For example:
+
+```python
+source = hou.AssetGalleryDataSource(
+    "ADS",
+    "server=http://127.0.0.1:8789;profile=main;category=default;department=model;token_env=ADS_CATALOG_API_TOKEN",
+)
+```
+
+Catalog leaf items are `category / asset_code / department` current assets.
+Their `filePath()` is `ads://<category>/<asset_code>/<department>/<asset_code>.usd`
+without a version query, so the ADS current pointer is used by default.
+
+If the menu item or datasource is not visible, verify that Houdini was launched
+with both paths:
+
+```python
+import hou
+
+print(hou.findFiles("AssetGallerySourceMenu.xml"))
+print(hou.houdiniPath("HOUDINI_HUSDPLUGINS_PATH"))
+```
+
+The ADS menu XML file must appear in the first output, and
+`<repo>/houdini/husdplugins` must appear in the second.
 
 ## Remote Resolver Launch
 
@@ -42,9 +110,12 @@ The launcher sets:
 ADS_RESOLVER_MODE=remote
 ADS_RESOLVER_SERVER=<ads-server>
 ADS_RESOLVER_PROFILE=<profile>
+ADS_CATALOG_SERVER=<ads-server>
+ADS_CATALOG_PROFILE=<profile>
 PXR_PLUGINPATH_NAME=<repo>\resolver\build\houdini\resources
 PYTHONPATH=<repo>\python\src
 HOUDINI_PATH=<repo>\houdini;&
+HOUDINI_HUSDPLUGINS_PATH=<repo>\houdini\husdplugins;&
 ```
 
 Optional environment overrides:

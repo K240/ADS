@@ -5082,12 +5082,12 @@ fn build_asset_cards(store: &Store, query: &AssetsQuery) -> Result<AssetsRespons
     }
 
     let versions = store.list_versions(
-        query.category.as_deref(),
+        None,
         query.asset_code.as_deref(),
         query.department.as_deref(),
     )?;
     let statuses = store.current_status(
-        query.category.as_deref(),
+        None,
         query.asset_code.as_deref(),
         query.department.as_deref(),
     )?;
@@ -5106,6 +5106,15 @@ fn build_asset_cards(store: &Store, query: &AssetsQuery) -> Result<AssetsRespons
     let q = query.q.as_ref().map(|value| value.to_ascii_lowercase());
     let mut assets = Vec::new();
     for (department_key, versions) in by_department {
+        if query.category.as_ref().is_some_and(|category| {
+            !department_key
+                .asset_key
+                .category
+                .starts_with(category.as_str())
+        }) {
+            continue;
+        }
+
         if let Some(q) = &q {
             let haystack = format!(
                 "{}/{}/{}",
@@ -6830,6 +6839,22 @@ mod tests {
         store
             .set_thumbnail(&department_key, VersionId(2), &thumb)
             .unwrap();
+        let nested_department_key = DepartmentKey::new(
+            AssetKey::new("prop/vehicle".to_string(), "truck".to_string()).unwrap(),
+            "model".to_string(),
+        )
+        .unwrap();
+        store
+            .new_version_folder(&workspace, &nested_department_key)
+            .unwrap();
+        fs::write(
+            version_folder(&workspace, &nested_department_key, VersionId(1)).join("truck.usd"),
+            "truck-v1",
+        )
+        .unwrap();
+        store
+            .add_version_folder(&workspace, &nested_department_key, VersionId(1))
+            .unwrap();
         drop(store);
 
         let app = web_app(test_web_state(&store_path, &workspace));
@@ -6855,6 +6880,22 @@ mod tests {
                 .unwrap()
                 .starts_with("https://assets.example.com/objects/sha256/")
         );
+
+        let prefixed_assets = app
+            .clone()
+            .oneshot(api_request(
+                "GET",
+                "/api/assets?profile=main&category=prop/veh",
+                "secret",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(prefixed_assets.status(), StatusCode::OK);
+        let prefixed_assets = response_json(prefixed_assets).await;
+        assert_eq!(prefixed_assets["assets"].as_array().unwrap().len(), 1);
+        assert_eq!(prefixed_assets["assets"][0]["category"], "prop/vehicle");
+        assert_eq!(prefixed_assets["assets"][0]["asset_code"], "truck");
 
         let version_info = app
             .clone()
