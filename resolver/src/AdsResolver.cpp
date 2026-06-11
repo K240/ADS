@@ -89,6 +89,18 @@ bool DebugEnabled()
     return value == "1" || value == "true" || value == "TRUE" || value == "yes";
 }
 
+// Maximum remote object size in bytes (ADS_RESOLVER_MAX_DOWNLOAD_MB,
+// default 2048 MB). Zero disables the cap.
+unsigned long long MaxDownloadBytes()
+{
+    const std::string value = GetEnv("ADS_RESOLVER_MAX_DOWNLOAD_MB", "2048");
+    try {
+        return std::stoull(value) * 1024ull * 1024ull;
+    } catch (...) {
+        return 2048ull * 1024ull * 1024ull;
+    }
+}
+
 void LogResolverMessage(const std::string& message, bool always = false)
 {
     if (!always && !DebugEnabled()) {
@@ -622,6 +634,32 @@ bool HttpGetBytesNative(
         return false;
     }
 
+    // Remote reads are buffered fully in memory (ArInMemoryAsset), so cap the
+    // download size to keep one runaway object from taking the host process
+    // down. Checked against Content-Length up front and enforced during
+    // chunked reads.
+    const unsigned long long maxBytes = MaxDownloadBytes();
+    if (maxBytes != 0) {
+        wchar_t contentLength[32] = {};
+        DWORD contentLengthSize = sizeof(contentLength);
+        if (WinHttpQueryHeaders(
+                request.get(),
+                WINHTTP_QUERY_CONTENT_LENGTH,
+                WINHTTP_HEADER_NAME_BY_INDEX,
+                contentLength,
+                &contentLengthSize,
+                WINHTTP_NO_HEADER_INDEX)) {
+            const unsigned long long announced = std::wcstoull(contentLength, nullptr, 10);
+            if (announced > maxBytes) {
+                LogResolverMessage(
+                    "ADS Resolver refused remote object: Content-Length "
+                        + std::to_string(announced) + " exceeds ADS_RESOLVER_MAX_DOWNLOAD_MB",
+                    true);
+                return false;
+            }
+        }
+    }
+
     output->clear();
     while (true) {
         DWORD available = 0;
@@ -631,6 +669,15 @@ bool HttpGetBytesNative(
         }
         if (available == 0) {
             break;
+        }
+        if (maxBytes != 0
+            && static_cast<unsigned long long>(output->size()) + available > maxBytes) {
+            LogResolverMessage(
+                "ADS Resolver aborted remote object download: size exceeds "
+                "ADS_RESOLVER_MAX_DOWNLOAD_MB",
+                true);
+            output->clear();
+            return false;
         }
         const size_t offset = output->size();
         output->resize(offset + available);

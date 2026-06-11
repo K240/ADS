@@ -42,15 +42,22 @@ $env:PXR_PLUGINPATH_NAME = "D:\work\apps\ads\resolver\build\houdini\resources"
 
 In this mode the resolver calls `/api/resolve` through native HTTP and opens returned object URLs through native HTTP. On Windows the backend is WinHTTP. The HTTP backend is isolated so macOS/Linux can use a native library backend such as libcurl without shelling out to the `curl` command.
 
-Texture-like files are resolved differently from USD layers. For reserved texture extensions such as `.tx`, `.rat`, `.exr`, `.tif`, `.png`, and `.jpg`, `ads resolve --mode local|auto` reads the manifest from the store and returns a hash-derived local cache path:
+Resolution shape follows one rule. Composing formats that can carry relative
+sibling references (`.usd`, `.usda`, `.usdc`, `.usdz`, `.mtlx`) resolve into
+the eagerly materialized manifest view:
+
+```text
+<workspace>/.ads-cache/manifests/<manifest_hash>/<relative_path>
+```
+
+Every other file is a leaf (textures, volumes, caches, ...) and resolves
+lazily to its flat blob cache path — only the requested file is copied:
 
 ```text
 <workspace>/.ads-cache/sha256/<prefix>/<sha256>.<ext>
 ```
 
-USD layers (`.usd`, `.usda`, `.usdc`, `.usdz`) still resolve to their logical version-folder path.
-
-When the same logical texture filename is updated in a newer version, the resolver keeps the `ads://.../body_diffuse.1001.tx` URI stable and returns a different hash-derived cache file for the selected `current`, `latest`, or explicit `?v=v###` version.
+When the same logical filename is updated in a newer version, the resolver keeps the `ads://.../body_diffuse.1001.tx` URI stable and returns a different hash-derived cache file for the selected `current`, `latest`, `wip`, or explicit `?v=2` version.
 
 Optional:
 
@@ -61,6 +68,7 @@ $env:ADS_RESOLVER_REMOTE_BASE_URL = "https://assets.example.com/objects/sha256"
 $env:ADS_RESOLVER_HTTP_BEARER_TOKEN = "<object-token>"
 $env:ADS_RESOLVER_HTTP_TIMEOUT_SECONDS = "30"
 $env:ADS_RESOLVER_CACHE_TTL_SECONDS = "30"
+$env:ADS_RESOLVER_MAX_DOWNLOAD_MB = "2048"
 ```
 
 Resolve caching follows the schema v8 policy: explicit version pins (`?v=12`
@@ -71,7 +79,7 @@ on the server become visible without restarting Houdini. `?v=wip` resolutions
 are never cached: the WIP head moves on every registered write. WIP is
 local-only and does not resolve in remote mode.
 
-Remote direct read buffers the full response into memory through `ArInMemoryAsset`. This avoids creating workspace version files, but it is not a streaming or range-read implementation.
+Remote direct read buffers the full response into memory through `ArInMemoryAsset`. This avoids creating workspace version files, but it is not a streaming or range-read implementation. Downloads are capped at `ADS_RESOLVER_MAX_DOWNLOAD_MB` (default 2048, `0` disables the cap) — both via the announced Content-Length and during chunked reads — so one runaway object cannot take the host process down.
 
 ## Build With Houdini
 
