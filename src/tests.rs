@@ -1,4 +1,3 @@
-
 use super::*;
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode, header};
@@ -690,6 +689,109 @@ async fn web_api_accepts_object_and_version_import() {
     let import_thumbnail = response_json(import_thumbnail).await;
     assert_eq!(import_thumbnail["sha256"], object_hash);
     assert_eq!(import_thumbnail["width"], 256);
+}
+
+#[tokio::test]
+async fn web_api_lists_wips_promotes_and_runs_gc() {
+    let temp = TempDir::new().unwrap();
+    let store_path = temp.path().join("store");
+    let workspace = temp.path().join("workspace");
+    let store = Store::init(&store_path).unwrap();
+    let department_key = DepartmentKey::new(
+        AssetKey::new("prop".to_string(), "crate".to_string()).unwrap(),
+        "model".to_string(),
+    )
+    .unwrap();
+    let work = department_folder(&workspace, &department_key);
+    fs::create_dir_all(&work).unwrap();
+    fs::write(work.join("crate.usd"), "wip-1").unwrap();
+    store.add_wip_from_source(&work, &department_key).unwrap();
+    fs::write(work.join("crate.usd"), "wip-2").unwrap();
+    store.add_wip_from_source(&work, &department_key).unwrap();
+    drop(store);
+
+    let app = web_app(test_web_state(&store_path, &workspace));
+    let wips = app
+        .clone()
+        .oneshot(api_request(
+            "GET",
+            "/api/wips?profile=main&category=prop&asset_code=crate&department=model",
+            "secret",
+            Body::empty(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(wips.status(), StatusCode::OK);
+    let wips = response_json(wips).await;
+    assert_eq!(wips["wips"].as_array().unwrap().len(), 2);
+    assert_eq!(wips["wips"][1]["seq"], 2);
+    assert_eq!(wips["wips"][1]["source_path"], "prop/crate/model");
+
+    // Promote defaults to the head and passes the validation gate.
+    let promote = app
+        .clone()
+        .oneshot(api_request(
+            "POST",
+            "/api/promote",
+            "secret",
+            Body::from(
+                r#"{"profile":"main","category":"prop","asset_code":"crate","department":"model"}"#,
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(promote.status(), StatusCode::OK);
+    let promote = response_json(promote).await;
+    assert_eq!(promote["outcome"]["created"], true);
+    assert_eq!(promote["outcome"]["version"], 1);
+    assert_eq!(promote["validation"]["errors"].as_array().unwrap().len(), 0);
+
+    // Promoting the unchanged head again reuses the publish version.
+    let reused = app
+        .clone()
+        .oneshot(api_request(
+            "POST",
+            "/api/promote",
+            "secret",
+            Body::from(
+                r#"{"profile":"main","category":"prop","asset_code":"crate","department":"model"}"#,
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(reused.status(), StatusCode::OK);
+    let reused = response_json(reused).await;
+    assert_eq!(reused["outcome"]["created"], false);
+    assert_eq!(reused["outcome"]["version"], 1);
+
+    // GC with retention 1 prunes the older wip; the promoted manifest stays.
+    let gc = app
+        .clone()
+        .oneshot(api_request(
+            "POST",
+            "/api/gc",
+            "secret",
+            Body::from(r#"{"profile":"main","retention":1,"grace_hours":0}"#),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(gc.status(), StatusCode::OK);
+    let gc = response_json(gc).await;
+    assert_eq!(gc["dry_run"], false);
+    assert_eq!(gc["pruned_wips"], 1);
+
+    let remaining = app
+        .oneshot(api_request(
+            "GET",
+            "/api/wips?profile=main&category=prop&asset_code=crate&department=model",
+            "secret",
+            Body::empty(),
+        ))
+        .await
+        .unwrap();
+    let remaining = response_json(remaining).await;
+    assert_eq!(remaining["wips"].as_array().unwrap().len(), 1);
+    assert_eq!(remaining["wips"][0]["seq"], 2);
 }
 
 fn test_web_state(store_path: &Path, workspace: &Path) -> Arc<WebState> {

@@ -102,6 +102,14 @@ pub(crate) const INDEX_HTML: &str = r#"<!doctype html>
         </section>
 
         <section class="inspector-section">
+          <div class="section-head">
+            <h3 class="microlabel">WIP Stream</h3>
+            <span id="wipSummary" class="manifest-summary"></span>
+          </div>
+          <div id="wipList" class="take-log wip-log"></div>
+        </section>
+
+        <section class="inspector-section">
           <h3 class="microlabel">Take Log</h3>
           <div id="versionList" class="take-log"></div>
         </section>
@@ -799,6 +807,31 @@ button { font-family: var(--sans); cursor: pointer; }
 
 .take .tag.latest { border: 1px solid var(--line-strong); color: var(--ink-faint); }
 
+/* ---------- wip stream ---------- */
+
+.take .tag.head { border: 1px solid var(--amber); color: var(--amber); }
+
+.wip-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.promote-btn {
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: .12em;
+  padding: 2px 8px;
+  background: transparent;
+  border: 1px solid var(--line-strong);
+  border-radius: 2px;
+  color: var(--ink-dim);
+  transition: color .15s ease, border-color .15s ease, background .15s ease;
+}
+
+.promote-btn:hover { border-color: var(--amber); color: var(--amber-bright); background: var(--amber-dim); }
+
 /* ---------- manifest ---------- */
 
 .section-head {
@@ -943,6 +976,7 @@ pub(crate) const APP_JS: &str = r#"const state = {
   department: '',
   selected: null,
   versions: [],
+  wips: [],
   selectedVersion: '',
   manifestCache: new Map()
 };
@@ -1136,10 +1170,15 @@ async function selectAsset(asset) {
   // full rebuild costs ~80ms per click and reloads thumbnails.
   setActiveCard(assetKey(asset));
   const params = {profile: state.profile, category: asset.category, asset_code: asset.asset_code, department: asset.department};
-  const data = await api(`/api/versions?${qs(params)}`);
+  const [data, wipData] = await Promise.all([
+    api(`/api/versions?${qs(params)}`),
+    api(`/api/wips?${qs(params)}`)
+  ]);
   state.versions = data.versions;
+  state.wips = wipData.wips;
   state.lastCurrentStatus = data.current_status;
   renderDetail(asset, data);
+  renderWips();
   await loadManifest($('versionSelect').value);
 }
 
@@ -1184,6 +1223,54 @@ function renderTakeLog(data) {
       loadManifest(row.dataset.version).catch(showError);
     });
   });
+}
+
+function renderWips() {
+  const wips = state.wips || [];
+  $('wipSummary').textContent = wips.length
+    ? `${wips.length} write${wips.length === 1 ? '' : 's'}`
+    : 'empty';
+  const head = wips.length ? wips[wips.length - 1].seq : null;
+  $('wipList').innerHTML = wips.slice().reverse().map(w => {
+    const isHead = w.seq === head;
+    const date = (w.created_at || '').replace('T', ' ').slice(0, 16);
+    const tag = isHead ? '<span class="tag head">HEAD</span>' : '';
+    return `<div class="take wip" data-seq="${esc(w.seq)}" title="?v=wip resolves the newest WIP — click to copy the URI">
+      <span class="v">#${esc(w.seq)}</span>
+      <span class="meta">${w.file_count} files · ${humanBytes(w.total_bytes)}${date ? ' · ' + esc(date) : ''}</span>
+      <span class="wip-actions">${tag}<button type="button" class="promote-btn" data-seq="${esc(w.seq)}">PROMOTE</button></span>
+    </div>`;
+  }).join('');
+  $('wipList').querySelectorAll('.take.wip').forEach(row => {
+    row.addEventListener('click', async () => {
+      const asset = state.selected;
+      if (!asset) return;
+      const uri = assetUri(asset, 'wip');
+      const copied = await copyText(uri);
+      status(copied ? `Copied ${uri}` : `Clipboard blocked. ${uri}`, copied ? 'ok' : 'err');
+    });
+  });
+  $('wipList').querySelectorAll('.promote-btn').forEach(button => {
+    button.addEventListener('click', event => {
+      event.stopPropagation();
+      promoteWip(Number(button.dataset.seq)).catch(showError);
+    });
+  });
+}
+
+// Promote runs the same validation gate as `ads publish promote`; the server
+// rejects with the error list when references would break after publish.
+async function promoteWip(seq) {
+  const asset = state.selected;
+  if (!asset) return;
+  status(`Promoting WIP #${seq}…`);
+  const result = await api('/api/promote', {method: 'POST', body: JSON.stringify({profile: state.profile, category: asset.category, asset_code: asset.asset_code, department: asset.department, wip_seq: seq})});
+  const outcome = result.outcome;
+  const warnings = (result.validation && result.validation.warnings) || [];
+  await refreshSelection();
+  const verb = outcome.created ? 'Promoted to' : 'Already published as';
+  const suffix = warnings.length ? ` (${warnings.length} validation warning${warnings.length === 1 ? '' : 's'})` : '';
+  status(`${verb} ${fmtVersion(outcome.version)}${suffix}`, 'ok');
 }
 
 const USD_EXTENSIONS = ['usd', 'usda', 'usdc', 'usdz'];

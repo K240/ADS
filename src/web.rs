@@ -149,6 +149,9 @@ pub(crate) fn web_app(state: Arc<WebState>) -> Router {
         .route("/thumbnail", put(api_import_thumbnail))
         .route("/thumbnail-url", get(api_thumbnail_url))
         .route("/resolve", get(api_resolve))
+        .route("/wips", get(api_wips))
+        .route("/promote", post(api_promote))
+        .route("/gc", post(api_gc))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             api_auth_middleware,
@@ -596,6 +599,99 @@ pub(crate) async fn api_resolve(
         let asset_path = AssetPath::parse(&query.asset_path)?;
         let store = profile.store_handle.clone();
         store.resolve_asset_path(&profile.workspace, &asset_path, mode, None)
+    })
+    .await
+    .map(Json)
+}
+
+pub(crate) async fn api_wips(
+    State(state): State<Arc<WebState>>,
+    Query(query): Query<WipsQuery>,
+) -> std::result::Result<Json<WipsResponse>, ApiError> {
+    let profile = profile_for(&state, &query.profile)?;
+    run_store_read(move || {
+        let store = profile.store_handle.clone();
+        let asset_key = AssetKey::new(query.category, query.asset_code)?;
+        let department_key = DepartmentKey::new(asset_key, query.department)?;
+        let wips = store.list_wips(&department_key)?;
+        Ok(WipsResponse { wips })
+    })
+    .await
+    .map(Json)
+}
+
+pub(crate) async fn api_promote(
+    State(state): State<Arc<WebState>>,
+    Json(request): Json<PromoteRequest>,
+) -> std::result::Result<Json<PromoteResponse>, ApiError> {
+    let profile = profile_for(&state, &request.profile)?;
+    let lock = profile.mutation_lock.clone();
+    run_store_write(lock, move || {
+        let store = profile.store_handle.clone();
+        let asset_key = AssetKey::new(request.category, request.asset_code)?;
+        let department_key = DepartmentKey::new(asset_key, request.department)?;
+        let wip = match request.wip_seq {
+            Some(seq) => store.get_wip(&department_key, seq)?,
+            None => store.wip_head(&department_key)?.ok_or_else(|| {
+                anyhow!(
+                    "no wip versions to promote for {}/{}/{}",
+                    department_key.asset_key.category,
+                    department_key.asset_key.asset_code,
+                    department_key.department
+                )
+            })?,
+        };
+        // Same gate as `ads publish promote`: validate by default, reject on
+        // errors, and pass warnings through so the caller can surface them.
+        let validation = if request.no_validate.unwrap_or(false) {
+            None
+        } else {
+            let manifest = store.get_manifest(&wip.manifest_hash)?;
+            let report = validate_manifest_references(
+                &store,
+                format!(
+                    "wip seq {} of {}/{}/{}",
+                    wip.seq,
+                    department_key.asset_key.category,
+                    department_key.asset_key.asset_code,
+                    department_key.department
+                ),
+                &manifest,
+            )?;
+            if !report.errors.is_empty() {
+                bail!(
+                    "promote validation gate failed for {}: {}",
+                    report.target,
+                    report.errors.join("; ")
+                );
+            }
+            Some(report)
+        };
+        let outcome = store.promote_wip(&department_key, Some(wip.seq))?;
+        Ok(PromoteResponse {
+            outcome,
+            validation,
+        })
+    })
+    .await
+    .map(Json)
+}
+
+pub(crate) async fn api_gc(
+    State(state): State<Arc<WebState>>,
+    Json(request): Json<GcRequest>,
+) -> std::result::Result<Json<GcOutcome>, ApiError> {
+    let profile = profile_for(&state, &request.profile)?;
+    let lock = profile.mutation_lock.clone();
+    run_store_write(lock, move || {
+        let store = profile.store_handle.clone();
+        store.gc(
+            request.retention.unwrap_or(DEFAULT_WIP_RETENTION),
+            std::time::Duration::from_secs(
+                request.grace_hours.unwrap_or(DEFAULT_GC_GRACE_HOURS) * 3600,
+            ),
+            request.dry_run.unwrap_or(false),
+        )
     })
     .await
     .map(Json)

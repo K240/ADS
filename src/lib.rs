@@ -39,6 +39,9 @@ const USD_EXTENSIONS: &[&str] = &["usd", "usda", "usdc", "usdz"];
 /// blob cache path — one file copied per request instead of the whole
 /// version.
 const VIEW_EXTENSIONS: &[&str] = &["usd", "usda", "usdc", "usdz", "mtlx"];
+/// Defaults shared by `ads gc` and the `/api/gc` endpoint.
+const DEFAULT_WIP_RETENTION: usize = 20;
+const DEFAULT_GC_GRACE_HOURS: u64 = 24;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -173,10 +176,10 @@ enum Commands {
         #[arg(long)]
         store: PathBuf,
         /// Newest WIP micro-versions to keep per department.
-        #[arg(long, default_value_t = 20)]
+        #[arg(long, default_value_t = DEFAULT_WIP_RETENTION)]
         retention: usize,
         /// Grace period in hours: unreferenced objects newer than this are kept.
-        #[arg(long = "grace-hours", default_value_t = 24)]
+        #[arg(long = "grace-hours", default_value_t = DEFAULT_GC_GRACE_HOURS)]
         grace_hours: u64,
         /// Report what would be deleted without deleting anything.
         #[arg(long = "dry-run")]
@@ -2667,6 +2670,43 @@ struct WorkspacePullRequest {
     version: Option<VersionId>,
     latest: Option<bool>,
     force: Option<bool>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct WipsQuery {
+    profile: String,
+    category: String,
+    asset_code: String,
+    department: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct WipsResponse {
+    wips: Vec<WipRecord>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct PromoteRequest {
+    profile: String,
+    category: String,
+    asset_code: String,
+    department: String,
+    wip_seq: Option<u64>,
+    no_validate: Option<bool>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct PromoteResponse {
+    outcome: AddOutcome,
+    validation: Option<PublishValidateReport>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct GcRequest {
+    profile: String,
+    retention: Option<usize>,
+    grace_hours: Option<u64>,
+    dry_run: Option<bool>,
 }
 
 #[derive(Clone, Debug, Serialize)]
