@@ -259,6 +259,48 @@ fn add_reuses_identical_manifest() {
     assert_eq!(first.version, second.version);
 }
 
+#[test]
+fn scan_hash_cache_memoizes_by_stat_and_never_corrupts_the_store() {
+    let temp = TempDir::new().unwrap();
+    let store_path = temp.path().join("store");
+    let source = temp.path().join("source");
+    let store = Store::init(&store_path).unwrap();
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("a.usd"), "content-a").unwrap();
+    fs::write(source.join("b.usd"), "content-b").unwrap();
+
+    let manifest = store.build_manifest(&source).unwrap();
+    let sha_a = sha256_bytes(b"content-a");
+    let sha_b = sha256_bytes(b"content-b");
+    assert_eq!(manifest.entries[0].sha256, sha_a);
+
+    // The memo is consulted while the stat is unchanged: poison the recorded
+    // hash for a.usd with b's (already stored) object and watch it be
+    // believed on the next scan.
+    let index_path = source.join(".ads-cache").join("hash-index.json");
+    let mut index: HashIndex = serde_json::from_slice(&fs::read(&index_path).unwrap()).unwrap();
+    index.entries.get_mut("a.usd").unwrap().sha256 = sha_b.clone();
+    fs::write(&index_path, serde_json::to_vec(&index).unwrap()).unwrap();
+    let memoized = store.build_manifest(&source).unwrap();
+    assert_eq!(memoized.entries[0].sha256, sha_b);
+
+    // A content change moves the stat, invalidating the memo.
+    fs::write(source.join("a.usd"), "content-a2").unwrap();
+    let rehashed = store.build_manifest(&source).unwrap();
+    assert_eq!(rehashed.entries[0].sha256, sha256_bytes(b"content-a2"));
+
+    // A memoized hash without a stored object is never trusted when
+    // persisting: objects must only be written under hashes computed from
+    // their bytes, so a stale memo cannot corrupt the store.
+    let mut index: HashIndex = serde_json::from_slice(&fs::read(&index_path).unwrap()).unwrap();
+    let bogus = "0".repeat(64);
+    index.entries.get_mut("a.usd").unwrap().sha256 = bogus.clone();
+    fs::write(&index_path, serde_json::to_vec(&index).unwrap()).unwrap();
+    let recovered = store.build_manifest(&source).unwrap();
+    assert_eq!(recovered.entries[0].sha256, sha256_bytes(b"content-a2"));
+    assert!(!object_path(&store_path, &bogus).exists());
+}
+
 #[tokio::test]
 async fn web_api_requires_bearer_token_and_serves_static_ui() {
     let temp = TempDir::new().unwrap();

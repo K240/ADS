@@ -4725,6 +4725,13 @@ impl Store {
         }
 
         let ignore_rules = IgnoreRules::load(&source_abs)?;
+        let cache_enabled = hash_cache_enabled();
+        let index = if cache_enabled {
+            load_hash_index(&source_abs)
+        } else {
+            HashIndex::default()
+        };
+        let mut fresh_index: BTreeMap<String, HashIndexEntry> = BTreeMap::new();
         let mut entries = Vec::new();
         for entry in WalkDir::new(&source_abs)
             .follow_links(false)
@@ -4759,9 +4766,43 @@ impl Store {
             }
 
             let relative_path = normalize_relative_path(rel_path)?;
-            let (sha256, size) = hash_file(entry.path())?;
+            let metadata = entry
+                .metadata()
+                .with_context(|| format!("failed to stat {}", entry.path().display()))?;
+            let stat = file_stat_key(&metadata);
+            let cached_sha256 = stat.and_then(|(mtime_secs, mtime_nanos, size)| {
+                index
+                    .entries
+                    .get(&relative_path)
+                    .filter(|cached| {
+                        cached.mtime_secs == mtime_secs
+                            && cached.mtime_nanos == mtime_nanos
+                            && cached.size == size
+                    })
+                    .map(|cached| cached.sha256.clone())
+            });
+            // Trust the memo only when the blob is already in the store (or
+            // when nothing is persisted): an object must never be written
+            // under a hash that was not computed from its bytes.
+            let (sha256, size) = match cached_sha256 {
+                Some(sha256) if !persist_objects || object_path(&self.root, &sha256).exists() => {
+                    (sha256, metadata.len())
+                }
+                _ => hash_file(entry.path())?,
+            };
             if persist_objects {
                 self.ensure_object(entry.path(), &sha256)?;
+            }
+            if let Some((mtime_secs, mtime_nanos, stat_size)) = stat {
+                fresh_index.insert(
+                    relative_path.clone(),
+                    HashIndexEntry {
+                        mtime_secs,
+                        mtime_nanos,
+                        size: stat_size,
+                        sha256: sha256.clone(),
+                    },
+                );
             }
             entries.push(ManifestEntry {
                 relative_path,
@@ -4769,6 +4810,15 @@ impl Store {
                 size,
                 mode: simple_mode(entry.path())?,
             });
+        }
+        if cache_enabled && fresh_index != index.entries {
+            store_hash_index(
+                &source_abs,
+                &HashIndex {
+                    version: HASH_INDEX_VERSION,
+                    entries: fresh_index,
+                },
+            );
         }
         entries.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
         Ok(Manifest { entries })
@@ -5740,6 +5790,78 @@ fn hash_file(path: &Path) -> Result<(String, u64)> {
         size += bytes_read as u64;
     }
     Ok((hex::encode(hasher.finalize()), size))
+}
+
+/// Stat-based hash memo for a scanned source folder, stored at
+/// `<source>/.ads-cache/hash-index.json` (a location every scan ignores).
+/// A file whose (mtime, size) is unchanged since the previous scan reuses
+/// its recorded sha256 instead of being re-read — the same trade git's
+/// stat cache makes. `ADS_HASH_CACHE=0` disables both reads and writes.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct HashIndex {
+    version: u32,
+    entries: BTreeMap<String, HashIndexEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct HashIndexEntry {
+    mtime_secs: u64,
+    mtime_nanos: u32,
+    size: u64,
+    sha256: String,
+}
+
+const HASH_INDEX_VERSION: u32 = 1;
+const HASH_INDEX_FILE: &str = "hash-index.json";
+
+fn hash_cache_enabled() -> bool {
+    std::env::var("ADS_HASH_CACHE").map_or(true, |value| value != "0")
+}
+
+fn hash_index_path(source_abs: &Path) -> PathBuf {
+    source_abs.join(CACHE_DIR).join(HASH_INDEX_FILE)
+}
+
+fn load_hash_index(source_abs: &Path) -> HashIndex {
+    let path = hash_index_path(source_abs);
+    let Ok(bytes) = fs::read(&path) else {
+        return HashIndex::default();
+    };
+    match serde_json::from_slice::<HashIndex>(&bytes) {
+        Ok(index) if index.version == HASH_INDEX_VERSION => index,
+        _ => HashIndex::default(),
+    }
+}
+
+/// Best effort: a failure to persist the memo never fails the scan.
+fn store_hash_index(source_abs: &Path, index: &HashIndex) {
+    let path = hash_index_path(source_abs);
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let Ok(bytes) = serde_json::to_vec(index) else {
+        return;
+    };
+    let temp_path = path.with_extension(format!("tmp.{}", std::process::id()));
+    if fs::write(&temp_path, bytes).is_err() {
+        return;
+    }
+    if fs::rename(&temp_path, &path).is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+}
+
+fn file_stat_key(metadata: &fs::Metadata) -> Option<(u64, u32, u64)> {
+    let modified = metadata.modified().ok()?;
+    let since_epoch = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
+    Some((
+        since_epoch.as_secs(),
+        since_epoch.subsec_nanos(),
+        metadata.len(),
+    ))
 }
 
 fn sha256_bytes(bytes: &[u8]) -> String {
