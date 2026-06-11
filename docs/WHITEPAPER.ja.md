@@ -3,9 +3,10 @@
 ## Rust製アセットバージョニングシステム
 
 作成日: 2026-05-26  
-最終更新: 2026-05-27
+最終更新: 2026-06-11
 
 対象実装: ADS schema version 7
+次期設計: ADS schema version 8(WIP/Publishモデル、`docs/SPEC_WIP_PUBLISH.ja.md`)
 
 ## Executive Summary
 
@@ -29,6 +30,8 @@ USDファイルはアプリケーションが開いている間にファイル�
 
 また、USD AssetResolverを前提にした論理パスもサポートします。制作データ内では `ads://hero/model/hero.usd` のような短いURIを使い、実際にどのversion、どのローカルパス、どのObjectStorage URLへ解決するかはADS側で吸収する設計です。現状実装ではHoudini 21.0.700向けC++ `ArResolver` pluginにより、local workspace解決とremote object direct readの両方を検証済みです。
 
+なお、設計改訂としてschema version 8(WIP/Publishモデル)への移行を決定しています。versionフォルダはworkspace契約から外れ、頻繁なローカル書き出しはWIP micro-versionとして自動登録され、publishはコピーゼロのメタデータ昇格になります。本書の大部分は現行実装(schema version 7)の記述です。改訂の決定内容は「設計改訂(schema version 8)」の章および `docs/SPEC_WIP_PUBLISH.ja.md` を参照してください。
+
 ## 背景と課題
 
 ### DCC制作におけるアセット管理の難しさ
@@ -47,6 +50,8 @@ ADSはこの問題に対して、次の前提を置きます。
 
 ## 設計原則
 
+以下はschema version 7(現行実装)の設計原則です。schema version 8での改訂内容は次章「設計改訂(schema version 8)」を参照してください。
+
 ### 1. Version Folder First
 
 ADSのworkspaceは、常にversionフォルダを持ちます。
@@ -58,6 +63,8 @@ category/asset_code/department/v###
 `department` は作業区分を表します。例えば `model`, `rig`, `anim`, `lookdev`, `fx` です。
 
 この構造により、`v001` をHoudiniで開いたままでも、`v002` を別フォルダとして作成できます。既存versionを上書きしないため、USDファイルのロックやDCCアプリケーションの保持状態から正規ストアを守れます。
+
+注: この原則はschema version 8で撤回が決定しています。上書き保護の実体はcontent-addressed storeへ移っており、versionフォルダはworkspace契約から外れます。詳細は「設計改訂(schema version 8)」の章を参照してください。
 
 ### 2. Store Is Canonical
 
@@ -101,6 +108,44 @@ ADSはローカルworkspaceから開く場合と、ObjectStorage風URLから直�
 - auto: localに実体があればlocal、なければremote
 
 USD/Houdini環境では、ADS用C++ `ArResolver` pluginにより、`ads://` URIをproduction scene内で自然に扱えるようにします。local modeではworkspace上のversion folderへ解決し、remote modeではcentral ADS APIとobject URLから直接読み込みます。
+
+## 設計改訂(schema version 8)
+
+実装と運用の検証を経て、以下の3点を決定しました。詳細仕様は `docs/SPEC_WIP_PUBLISH.ja.md` にあります。
+
+### 決定1: versionフォルダの廃止
+
+上書き保護の実体は既にcontent-addressed object storeにあります。objectは同一内容=同一hashで保存され、既存objectが再書き込みされることはありません。実際、remote modeのResolverとtexture解決はversionフォルダを参照していません。一方、登録前のWIPイテレーション(同一versionフォルダ内への反復書き出し)はversionフォルダでは保護されておらず、当初のusdcロック問題がそのまま残っていました。
+
+そこでversionフォルダをworkspace契約から外し、workspaceは純粋な作業領域(scratch)とします。読み込みはmanifest hashキーの不変キャッシュ(manifest view)へ解決し、versionの実体フォルダが必要な場合は `checkout` がオンデマンドで実体化します。
+
+### 決定2: WIP / Publishの2層化
+
+「version」を性質の異なる2層に分離します。
+
+- WIP層(micro-version): 書き出し1回 = 1 micro-version。Output processorが書き込み先を一意なstagingパスへ振り替え、自動でlocal storeへ登録する。local store限定、GC対象、`?v=wip` の明示指定でのみ解決される。
+- Publish層(named version): 従来のversion。密な整数列、current/latest、remote push、将来のgovernanceはこの層に付く。
+
+publishはWIP micro-versionへの番号付与(メタデータ昇格)であり、ファイルコピーは発生しません。書き込み先が毎回一意になるため、usdcロック問題はWIPイテレーションを含めて構造的に解消されます。
+
+### 決定3: version表現の整数化
+
+`v###` 文字列を廃止し、正準表現を整数(u32)とします。JSON APIはnumber型、URIは `?v=12`、RocksDB keyのversion部は固定幅10桁ゼロ埋めになります。`v012` / `12` の両形式を受理する寛容パースを恒久仕様とし、published USD内に焼き込まれたpinned URIとの互換を維持します。`v###` はUI表示の整形に格下げされます。
+
+### 改訂後の設計原則
+
+1. Store Is Canonical(継続)
+2. Never Overwrite — すべての書き出しは一意パスへ行う。登録済みバイト列の上書きはシステムのどこにも存在しない。
+3. Cache Is Immutable — 読み込みは不変なキャッシュ実体(object blob / manifest view)から行う。
+4. Workspace Is Scratch — workspaceは契約外。ADSはレイアウトを要求しない。
+5. WIP Stream + Promoted Publish — 頻繁な書き出しはWIPストリームに吸収し、公開はpromotionで行う。
+
+Content Deduplication、Current By Default、Resolver-Oriented Accessは補助原則として継続します。
+
+### 代償として必須化されるもの
+
+- object garbage collection(WIPが書き出しごとにobjectを生むため、optionalではなくなる)
+- Resolverキャッシュポリシーの規律(pinnedは恒久キャッシュ可、current/latestはTTL付き、wipはキャッシュ禁止)
 
 ## システム構成
 
@@ -254,6 +299,8 @@ version sequence、latest、current、thumbnailはdepartment単位で管理さ�
 
 内部的には数値で保持し、表示は `v001`, `v002` 形式です。3桁を最低桁数とし、必要に応じて `v1000` のように拡張されます。
 
+schema version 8では正準表現が整数に変わります。JSON APIはnumber型、URIは `?v=12` となり、`v###` はUI表示の整形に格下げされます。`v012` / `12` の両形式を受理する寛容パースは恒久仕様です。
+
 ### VersionRecord
 
 version recordは以下を保持します。
@@ -317,6 +364,8 @@ objects/sha256/ab/abcdef...
 ファイル内容、thumbnail画像ともに同じ仕組みで保存されます。これにより、version間で同一ファイルがある場合や、同一thumbnailが再利用される場合に重複保存を避けられます。
 
 ## Workspace Workflow
+
+以下は現行実装(schema version 7)のワークフローです。schema version 8では `new-version` が廃止され、登録は任意パスから可能になり、`pull` / `restore` は `checkout` へ整理されます(`docs/SPEC_WIP_PUBLISH.ja.md`)。
 
 ### Store初期化
 
@@ -809,6 +858,31 @@ ads verify --store D:\store
 
 storeをバックアップする場合は、RocksDBの `db/` と `objects/` の両方を対象にする必要があります。
 
+## 開発環境メモ
+
+ADS本体はRocksDBを使うため、Rust crate `librocksdb-sys` のbuild scriptが `bindgen` 経由で `libclang.dll` を要求することがあります。Windowsで `cargo build` や `cargo test` が以下のようなエラーで失敗する場合は、`LIBCLANG_PATH` を設定します。
+
+```text
+Unable to find libclang: "couldn't find any valid shared libraries matching:
+['clang.dll', 'libclang.dll']"
+```
+
+Visual Studio LLVMを使う例:
+
+```powershell
+$env:LIBCLANG_PATH = "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\Llvm\x64\bin"
+cargo test
+```
+
+Houdini同梱の `libclang.dll` を使う場合は、Houdini versionに合わせて以下のようなpathを指定します。
+
+```powershell
+$env:LIBCLANG_PATH = "C:\Program Files\Side Effects Software\Houdini 21.0.700\python311\lib\site-packages-forced\shiboken6_generator"
+cargo test
+```
+
+これは開発・CIでRust側をbuild/testするための要件であり、配布済み `ads.exe` の通常実行やHoudini AssetResolverの実行時要件ではありません。
+
 ## 既知の制約
 
 初期版の制約は以下です。
@@ -825,6 +899,8 @@ storeをバックアップする場合は、RocksDBの `db/` と `objects/` の�
 - Windows Resolver remote modeはWinHTTP native backendを実装済み。macOS/Linux向けnative library backendは未実装で、今後libcurl等のlibrary backendを追加する方針。
 
 これらは意図的に初期スコープ外としています。まずはversion folder、dedup store、Resolver向けURI、Web browserを最小構成で成立させることを優先しています。
+
+このうちversionフォルダ前提の運用に由来するもの(`new-version` のlatestコピー、`pull` の内容競合判定、preflight前提の運用)は、schema version 8(WIP/Publishモデル)への移行で解消されます。object GCとResolverキャッシュ無効化は同移行で必須機能に昇格します。
 
 ## Roadmap
 
@@ -866,12 +942,19 @@ Status: complete for remote store MVP. Base remote read/fetch/sync/push is descr
 - checksum検証付き転送
 - WebAppでADS URI表示/コピー、thumbnail preview/upload、current/pull操作
 
-### Phase 4: Production Governance
+### Phase 4: WIP / Publishモデル移行(schema version 8)
+
+設計確定済み。仕様は `docs/SPEC_WIP_PUBLISH.ja.md`。実装は独立リリース可能な3段階に分けます。
+
+1. 読み込み側の切り離し: VersionId整数化、RocksDB key v8化(固定幅エンコード)、manifest viewキャッシュ、Resolver local解決の切り替え、Resolverキャッシュポリシー(pinned恒久 / current TTL / wipキャッシュ禁止)
+2. 書き込み側のWIP化: Output processorのstaging振り替え、WIP micro-version自動登録、wip head、`?v=wip` 解決、object garbage collection
+3. publishの昇格化と整理: `publish promote`、`new-version` 廃止、`pull` / `restore` の `checkout` への整理
+
+### Phase 5: Production Governance
 
 - publish state
 - approval workflow
 - user/audit metadata
-- object GC
 - schema migration
 - role-based access control
 - macOS/Linux向けResolver native HTTP backend
@@ -893,3 +976,5 @@ ADSは、USDを含むDCC制作環境で「ファイルを直接上書きし続�
 - 将来的にS3互換ObjectStorage、range read、production governanceへ拡張できる。
 
 ADSの初期版は完成した制作管理システムではなく、堅牢なasset versioning layerです。remote store MVPとHoudini integrationはすでに成立しており、今後はS3互換backend、range read、cache policy、production governanceを段階的に追加していく段階です。
+
+次の節目はschema version 8(WIP/Publishモデル)への移行です。versionフォルダが担っていた役割をWIPストリームとコピーゼロのpublish昇格へ引き継ぎ、当初の動機であったusdcロック問題をWIPイテレーションを含めて構造的に解消します。
