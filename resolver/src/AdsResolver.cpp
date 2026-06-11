@@ -3,6 +3,7 @@
 #include "pxr/usd/ar/filesystemAsset.h"
 #include "pxr/usd/ar/filesystemWritableAsset.h"
 #include "pxr/usd/ar/inMemoryAsset.h"
+#include "pxr/usd/ar/notice.h"
 #include "pxr/usd/ar/resolvedPath.h"
 #include "pxr/usd/ar/resolver.h"
 
@@ -891,6 +892,34 @@ long CacheTtlSeconds()
     }
 }
 
+// The two resolve caches (server and CLI) live at file scope so that
+// _RefreshContext can drop them when the host asks for a refresh.
+struct ResolveCache
+{
+    std::mutex mutex;
+    std::unordered_map<std::string, ResolveCacheEntry> entries;
+};
+
+ResolveCache& ServerResolveCache()
+{
+    static ResolveCache cache;
+    return cache;
+}
+
+ResolveCache& CliResolveCache()
+{
+    static ResolveCache cache;
+    return cache;
+}
+
+void ClearResolveCaches()
+{
+    for (ResolveCache* cache : {&ServerResolveCache(), &CliResolveCache()}) {
+        std::lock_guard<std::mutex> lock(cache->mutex);
+        cache->entries.clear();
+    }
+}
+
 bool LookupResolveCache(
     std::mutex& mutex,
     std::unordered_map<std::string, ResolveCacheEntry>& cache,
@@ -948,11 +977,10 @@ std::string ResolveWithAdsServer(const std::string& assetPath)
 
     const std::string cacheKey =
         "server\n" + server + "\n" + profile + "\n" + mode + "\n" + normalizedAssetPath;
-    static std::mutex cacheMutex;
-    static std::unordered_map<std::string, ResolveCacheEntry> cache;
+    ResolveCache& cache = ServerResolveCache();
     const bool wip = HasWipSelector(normalizedAssetPath);
     std::string cached;
-    if (!wip && LookupResolveCache(cacheMutex, cache, cacheKey, &cached)) {
+    if (!wip && LookupResolveCache(cache.mutex, cache.entries, cacheKey, &cached)) {
         return cached;
     }
 
@@ -976,8 +1004,8 @@ std::string ResolveWithAdsServer(const std::string& assetPath)
     }
     if (!location.empty() && !wip) {
         StoreResolveCache(
-            cacheMutex,
-            cache,
+            cache.mutex,
+            cache.entries,
             cacheKey,
             location,
             HasExplicitVersionPin(normalizedAssetPath));
@@ -1024,11 +1052,10 @@ std::string ResolveWithAdsCli(const std::string& assetPath)
 
     const std::string cacheKey = "cli\n" + executable + "\n" + store + "\n" + workspace + "\n" + mode
         + "\n" + remoteBaseUrl + "\n" + cliAssetPath;
-    static std::mutex cacheMutex;
-    static std::unordered_map<std::string, ResolveCacheEntry> cache;
+    ResolveCache& cache = CliResolveCache();
     const bool wip = HasWipSelector(cliAssetPath);
     std::string cached;
-    if (!wip && LookupResolveCache(cacheMutex, cache, cacheKey, &cached)) {
+    if (!wip && LookupResolveCache(cache.mutex, cache.entries, cacheKey, &cached)) {
         return cached;
     }
 
@@ -1060,8 +1087,8 @@ std::string ResolveWithAdsCli(const std::string& assetPath)
     }
     if (!resolved.empty() && !wip) {
         StoreResolveCache(
-            cacheMutex,
-            cache,
+            cache.mutex,
+            cache.entries,
             cacheKey,
             resolved,
             HasExplicitVersionPin(cliAssetPath));
@@ -1138,6 +1165,20 @@ protected:
     bool _IsContextDependentPath(const std::string& assetPath) const override
     {
         return StartsWithAdsScheme(assetPath);
+    }
+
+    // Hosts call ArResolver::RefreshContext() (e.g. from a pipeline menu or
+    // shelf tool) to pick up server-side current/latest moves without waiting
+    // for the TTL or restarting. Drop both resolve caches, then tell every
+    // listener (usdview, Solaris, ...) that previously resolved paths may now
+    // resolve differently so open stages re-resolve.
+    void _RefreshContext(const ArResolverContext& /*context*/) override
+    {
+        ClearResolveCaches();
+        if (DebugEnabled()) {
+            LogResolverMessage("ADS Resolver caches cleared by RefreshContext");
+        }
+        ArNotice::ResolverChanged().Send();
     }
 
     std::string _GetExtension(const std::string& assetPath) const override
@@ -1217,5 +1258,26 @@ protected:
 };
 
 AR_DEFINE_RESOLVER(AdsResolver, ArResolver);
+
+// Direct refresh entry point for pipeline tooling (ads.usd_refresh).
+//
+// ArResolver::RefreshContext() only reaches the primary resolver in the USD
+// builds shipped with current Houdini releases — URI resolvers like this one
+// never see _RefreshContext. Pipeline code therefore calls this exported
+// function (via ctypes on the already-loaded plugin module) to drop the
+// resolve caches and broadcast ArNotice::ResolverChanged so open stages
+// re-resolve ads:// paths.
+extern "C"
+#if defined(_WIN32)
+__declspec(dllexport)
+#endif
+void AdsResolverRefreshCaches()
+{
+    ClearResolveCaches();
+    if (DebugEnabled()) {
+        LogResolverMessage("ADS Resolver caches cleared by AdsResolverRefreshCaches");
+    }
+    ArNotice::ResolverChanged().Send();
+}
 
 PXR_NAMESPACE_CLOSE_SCOPE
