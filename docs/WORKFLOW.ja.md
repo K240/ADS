@@ -109,6 +109,8 @@ from ads.houdini_wip import commit_staged; commit_staged()
 
 これで書き出し完了ごとにWIP micro-versionが登録され、stagingは消えます。同一内容の書き出しは新しいWIPを作りません(dedup)。
 
+登録時のスキャンはstatベースのハッシュメモ(`<source>/.ads-cache/hash-index.json`)で高速化されており、(mtime, size)が変わっていないファイルは読み直しません(実測: 120ファイル/120MBで初回2.3秒→変更なし再登録0.05秒)。メモはstoreへの書き込みでは信用されない設計なので、stale化してもstoreは壊れません。無効化する場合は `ADS_HASH_CACHE=0`。
+
 Houdiniを使わない場合や手動で登録したい場合:
 
 ```powershell
@@ -133,6 +135,7 @@ ads://char/hero/model/hero.usd?v=wip
 - wipは**自分のマシンのlocal storeに閉じています**。他人には見えず、pushもされません
 - Resolverはwip解決を一切キャッシュしないため、書き出すたびに最新が返ります(開いているstageへの反映は手動reload)
 - 他の人は同じURIの `current` を見ているので、作業中のデータが他人のシーンに混ざることはありません
+- WebAppのインスペクタにも **WIP Stream** セクションがあり、書き出し履歴(seq・ファイル数・サイズ・日時)とHEADを一覧できます。行クリックで `?v=wip` URIをコピーできます
 
 ### 3.4 公開する(promote)
 
@@ -150,6 +153,7 @@ ads publish promote `
 - 公開済みversionと同一内容なら新規作成せず既存番号を返します
 - 昇格したversionには `promoted_from`(由来WIPのseq)が記録されます
 - **promoteは参照検証ゲートをデフォルトで実行します**: 他アセット参照は `ads://`、同一version内は相対参照OK。絶対パス・`file://`・version外/存在しないファイルへの参照があると昇格は拒否されます(意図的に通すなら `--no-validate`)
+- WebAppからも昇格できます: インスペクタの WIP Stream で対象行の **PROMOTE** を押すと同じ検証ゲートを通って公開されます(拒否時は理由がステータスに表示されます)
 
 検証だけを単体で行うこともできます(昇格前のWIPチェックや、登録前のフォルダ検査):
 
@@ -195,6 +199,7 @@ ads://hero/model/hero.usd               category省略形(一意に解決でき�
 - local/autoの解決先はworkspaceの**不変キャッシュ**です: 合成形式(usd/usda/usdc/usdz/mtlx)は `.ads-cache/manifests/<hash>/`(version全体を実体化、相対参照が生きる)、それ以外の葉ファイル(テクスチャ・ボリューム・キャッシュ等)は `.ads-cache/sha256/`(要求した1ファイルだけ遅延取得)。workフォルダは読みません
 - 事前のpullは不要です(解決時にstoreから自動実体化)。多数の依存を事前に温めたい場合のみ `uv run ads-deps <root.usd> --store ... --workspace ... --execute`
 - Resolverキャッシュ: pin(`?v=2`)はセッション中ずっと、current/latestは30秒(`ADS_RESOLVER_CACHE_TTL_SECONDS`)、wipはキャッシュなし
+- currentの切替を**即時に**開いているstageへ反映したい場合は、DCC内で `import ads.usd_refresh; ads.usd_refresh.refresh()`(シェルフ/パイプラインメニュー登録を推奨)。Resolverキャッシュを破棄して `ArNotice::ResolverChanged` を送るため、TTLを待たずに再解決されます
 
 ### 4.3 実体フォルダが必要なとき
 
@@ -251,6 +256,16 @@ ads gc --store D:\store               # retention 20 / 猶予24hで実行
 - 保持されるもの: 全publish version、thumbnail、部門ごとのWIP直近20件(`--retention`)
 - 作成から24時間以内(`--grace-hours`)のobjectは並行書き込み保護のため削除されません
 
+中央サーバ運用では、serve稼働中のstoreに対してAPIから実行できます(サーバ内で他の書き込みと直列化されます):
+
+```powershell
+curl.exe -X POST "http://server:8787/api/gc" `
+  -H "Authorization: Bearer <token>" -H "Content-Type: application/json" `
+  -d '{"profile":"main","dry_run":true}'
+```
+
+`retention` / `grace_hours` / `dry_run` は省略可(既定はCLIと同じ 20 / 24 / false)。
+
 ### Workspaceキャッシュの掃除
 
 `.ads-cache`(manifest view+blob)はWIP運用で書き出しごとに成長します。各作業マシンで定期的に掃除してください。
@@ -282,7 +297,7 @@ ads thumbnail set --store D:\store --category char --asset-code hero --departmen
 | `unsupported store schema version` | 旧schemaのstore。開発中storeは再作成が前提(`ads init` し直し) |
 | `wip versions are local-only` | `?v=wip` をremote modeで解決しようとした。wipは自分のlocal storeでのみ有効 |
 | `department has no wip versions` | そのdepartmentにWIPが未登録。書き出し(またはwip add)が先 |
-| 書き出したのにviewerが古い | 開いているstageは自動では再解決されない。reloadする。current/latestの切替反映は最大30秒(Resolver TTL) |
+| 書き出したのにviewerが古い | 開いているstageは自動では再解決されない。`import ads.usd_refresh; ads.usd_refresh.refresh()` で即時再解決(またはreload)。放置でもcurrent/latestの切替は最大30秒(Resolver TTL)で反映 |
 | Resolverの動きを調べたい | `ADS_RESOLVER_DEBUG=1` と `ADS_RESOLVER_LOG_FILE=%TEMP%\ads_resolver.log` を設定 |
 | `version must be the next version` | `add --version` の明示番号が飛んでいる。`--version` を省略すれば自動採番 |
 
@@ -303,7 +318,9 @@ ads thumbnail set --store D:\store --category char --asset-code hero --departmen
 | URI解決 | `ads resolve --store --workspace --mode local\|remote\|auto <ads://...>` |
 | 一覧/詳細 | `ads list` / `ads info` |
 | GC(store) | `ads gc --store [--retention N] [--grace-hours H] [--dry-run]` |
+| GC(中央サーバ) | `POST /api/gc` body `{"profile":"main","dry_run":true}` |
 | GC(workspaceキャッシュ) | `ads cache gc --store --workspace [--staging-hours H] [--dry-run]` |
+| Resolver即時更新(DCC内) | `import ads.usd_refresh; ads.usd_refresh.refresh()` |
 | 整合性検査 | `ads verify --store` |
 | リモート同期 | `ads fetch` / `ads sync` / `ads push` |
 | 参照検証 | `ads publish validate --store ... [--version N\|--wip\|--wip-seq N]` または `--source <dir>` |

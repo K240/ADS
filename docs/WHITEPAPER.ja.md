@@ -397,6 +397,8 @@ ads wip add `
 
 同一内容の再登録は新しいmicro-versionを作らず、既存のwip headを返します。HoudiniではUSD ROPの `ADS WIP Staging` output processorが保存先をstagingへ振り替え、post-renderの `ads.houdini_wip.commit_staged()` が登録とstaging削除を行います。
 
+登録時のソーススキャンはstatベースのハッシュメモ(`<source>/.ads-cache/hash-index.json`)で高速化されます。(mtime, size)が前回スキャンと一致するファイルはsha256を読み直さず再利用します(gitのstat cacheと同じトレード)。メモはobject書き込みの根拠としては信用されない設計のため、staleなメモがcontent-addressed storeを破壊することはありません。`ADS_HASH_CACHE=0` で無効化できます。
+
 ```powershell
 ads wip list `
   --store D:\store `
@@ -618,9 +620,14 @@ POST /api/thumbnails
 PUT  /api/thumbnail
 GET  /api/thumbnail-url
 GET  /api/resolve
+GET  /api/wips
+POST /api/promote
+POST /api/gc
 ```
 
 互換用に `POST /api/materialize` も残していますが、通常は `/api/pull` または `/api/restore` を使います。
+
+`/api/wips` は部門のWIPストリーム一覧、`/api/promote` はWIPのpublish昇格(CLIと同じ参照検証ゲートをデフォルト実行、`no_validate` で回避)、`/api/gc` は中央サーバのstoreに対するmark-and-sweep GC(CLIと同じ既定: retention 20 / 猶予24h)です。WebAppのインスペクタにはWIP Streamセクションがあり、ブラウザからの昇格と `?v=wip` URIコピーに対応します。
 
 APIはBearer token必須です。
 
@@ -762,6 +769,8 @@ Houdini向けにはremote mode起動用batchを提供します。
 ```bat
 houdini\launch_ads_remote_houdini.bat http://127.0.0.1:8789 phase3 phase3-test-token D:\workspace
 ```
+
+Resolverの解決結果キャッシュ(pinned恒久 / current・latest TTL / wipなし)は、DCC内から明示的に破棄できます。`ads.usd_refresh.refresh()` がResolverキャッシュをクリアし `ArNotice::ResolverChanged` を送るため、currentの切替がTTLや手動reloadを待たずに開いているstageへ反映されます(現行DCCのUSDビルドは `ArResolver::RefreshContext` をURIスキームresolverへ転送しないため、プラグインのCエントリ `AdsResolverRefreshCaches` をctypesで直接呼ぶ実装になっています)。
 
 問題調査用に `ADS_RESOLVER_DEBUG=1` と `ADS_RESOLVER_LOG_FILE` を設定できます。
 

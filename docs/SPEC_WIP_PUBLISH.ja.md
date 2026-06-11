@@ -4,11 +4,19 @@
 作成日: 2026-06-11
 Status: Implemented(2026-06-11、全3段階実装済み)
 
-実装ノート: 以下の緩和策・周辺項目は本体実装から意図的に切り離し、未実装のまま残しています。
+実装ノート: 以下の周辺項目は本体実装から切り離した後、2026-06-11に実装済みです。
 
-- (path, mtime, size) → sha256 のハッシュ高速化サイドテーブル
+- (path, mtime, size) → sha256 のハッシュメモ(`<source>/.ads-cache/hash-index.json`、
+  store書き込みでは不信用、`ADS_HASH_CACHE=0` で無効化)
+- ArNoticeによるstage refresh(`_RefreshContext` + DLL直接エントリ
+  `AdsResolverRefreshCaches` + `ads.usd_refresh.refresh()`。
+  現行DCCのUSDは `RefreshContext` をURI resolverへ転送しないため直接エントリを併設)
+- WIPのWebApp可視化と昇格(GET /api/wips、POST /api/promote=検証ゲート付き、
+  インスペクタの WIP Stream セクション)、中央サーバ向け POST /api/gc
+
+未実装のまま残しているもの:
+
 - department別のWIP自動登録ポリシー(off設定)
-- ArNoticeによるstage自動refresh(現状は手動reload)
 
 実装後の改訂: 解決形状の分類を「texture拡張子/texture department」から
 「合成形式(usd/usda/usdc/usdz/mtlx)→ manifest view / それ以外の葉 →
