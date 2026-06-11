@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import threading
 import urllib.error
 import urllib.request
 
@@ -15,13 +16,16 @@ from ads.houdini_catalog import CatalogConfig, CatalogIndex, asset_uri, parse_da
 
 class AdsDataSource(husd.datasource.DataSource):
     _SOURCE_NAMES = ("ADS", "ads://catalog")
+    _THUMBNAIL_CACHE_LIMIT = 256
 
     def __init__(self, source_identifier, args):
         super(AdsDataSource, self).__init__(source_identifier, args)
         self._config = None
         self._client = None
         self._index = CatalogIndex([])
+        # Houdini panels may query thumbnails from several threads.
         self._thumbnail_cache = {}
+        self._thumbnail_lock = threading.Lock()
         self._last_error = ""
         self._load(args)
 
@@ -91,15 +95,23 @@ class AdsDataSource(husd.datasource.DataSource):
         url = asset.get("thumbnail_url")
         if not url:
             return None
-        if url in self._thumbnail_cache:
-            return self._thumbnail_cache[url]
+        url = str(url)
+        scheme = url.split(":", 1)[0].lower() if ":" in url else ""
+        if scheme not in ("http", "https"):
+            return None
+        with self._thumbnail_lock:
+            if url in self._thumbnail_cache:
+                return self._thumbnail_cache[url]
         try:
-            request = urllib.request.Request(str(url), headers=self._thumbnail_headers(str(url)))
+            request = urllib.request.Request(url, headers=self._thumbnail_headers(url))
             with urllib.request.urlopen(request, timeout=self._config.timeout) as response:
                 data = response.read()
         except (OSError, urllib.error.URLError, urllib.error.HTTPError):
             return None
-        self._thumbnail_cache[url] = data
+        with self._thumbnail_lock:
+            if len(self._thumbnail_cache) >= self._THUMBNAIL_CACHE_LIMIT:
+                self._thumbnail_cache.pop(next(iter(self._thumbnail_cache)))
+            self._thumbnail_cache[url] = data
         return data
 
     def creationDate(self, item_id):
