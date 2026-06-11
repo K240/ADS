@@ -1,0 +1,31 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "ads-web",
+      "runtimeExecutable": "D:\\work\\apps\\ads\\target\\debug\\ads.exe",
+      "runtimeArgs": [
+        "serve",
+        "--bind",
+        "127.0.0.1:8799",
+        "--auth-token",
+        "demo-token",
+        "--profile",
+        "main=D:\\work\\apps\\ads\\target\\webapp_tmp\\store::D:\\work\\apps\\ads\\target\\webapp_tmp\\ws"
+      ],
+      "port": 8799
+    },
+    {
+      "name": "ads-objects",
+      "runtimeExecutable": "D:\\work\\apps\\ads\\python\\.venv\\Scripts\\python.exe",
+      "runtimeArgs": [
+        "-m",
+        "http.server",
+        "8800",
+        "--directory",
+        "D:\\work\\apps\\ads\\target\\webapp_tmp\\store\\objects"
+      ],
+      "port": 8800
+    }
+  ]
+}
