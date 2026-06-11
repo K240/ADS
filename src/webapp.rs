@@ -947,15 +947,15 @@ pub(crate) const APP_JS: &str = r#"const state = {
   manifestCache: new Map()
 };
 
-pub(crate) const $ = (id) => document.getElementById(id);
-pub(crate) const esc = (value) => String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+const $ = (id) => document.getElementById(id);
+const esc = (value) => String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
 // Versions are plain integers on the wire (schema v8); v### is display-only sugar.
-pub(crate) const fmtVersion = (version) => (version === null || version === undefined || version === '') ? '-' : 'v' + String(version).padStart(3, '0');
+const fmtVersion = (version) => (version === null || version === undefined || version === '') ? '-' : 'v' + String(version).padStart(3, '0');
 
 // Department badge hues: fixed palette for the canonical departments, stable
 // hash fallback for custom names. The amber zone (~38) is reserved for the
 // app accent, so fx sits at red instead.
-pub(crate) const DEPT_HUES = {model: 210, lookdev: 268, texture: 175, textures: 175, tex: 175, rig: 330, anim: 110, layout: 75, fx: 8};
+const DEPT_HUES = {model: 210, lookdev: 268, texture: 175, textures: 175, tex: 175, rig: 330, anim: 110, layout: 75, fx: 8};
 function deptHue(name) {
   const key = String(name || '').toLowerCase();
   if (key in DEPT_HUES) return DEPT_HUES[key];
@@ -1186,8 +1186,8 @@ function renderTakeLog(data) {
   });
 }
 
-pub(crate) const USD_EXTENSIONS = ['usd', 'usda', 'usdc', 'usdz'];
-pub(crate) const TEXTURE_EXTENSIONS = ['tx', 'rat', 'exr', 'tif', 'tiff', 'png', 'jpg', 'jpeg', 'tga', 'bmp', 'hdr', 'pic', 'tex'];
+const USD_EXTENSIONS = ['usd', 'usda', 'usdc', 'usdz'];
+const TEXTURE_EXTENSIONS = ['tx', 'rat', 'exr', 'tif', 'tiff', 'png', 'jpg', 'jpeg', 'tga', 'bmp', 'hdr', 'pic', 'tex'];
 
 function fileKindHue(path) {
   const ext = String(path).split('.').pop().toLowerCase();
