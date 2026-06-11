@@ -349,7 +349,11 @@ fn wip_stream_promotes_resolves_and_gc_prunes() {
     assert!(promoted.status.success(), "{}", stderr(&promoted));
     assert!(stdout(&promoted).contains("promoted v001"));
     let promoted_again = publish_promote(&store, false);
-    assert!(promoted_again.status.success(), "{}", stderr(&promoted_again));
+    assert!(
+        promoted_again.status.success(),
+        "{}",
+        stderr(&promoted_again)
+    );
     assert!(stdout(&promoted_again).contains("reused v001"));
     let resolved = resolve_asset(
         &store,
@@ -972,7 +976,12 @@ fn read_commands_work_while_a_writer_holds_the_store() {
     let _writer = ads::Store::open(&store).unwrap();
 
     // Read commands open the store read-only and keep working.
-    let list = ads().arg("list").arg("--store").arg(&store).output().unwrap();
+    let list = ads()
+        .arg("list")
+        .arg("--store")
+        .arg(&store)
+        .output()
+        .unwrap();
     assert!(list.status.success(), "{}", stderr(&list));
     let resolved = resolve_asset(
         &store,
@@ -1759,12 +1768,7 @@ fn thumbnail_url(
 /// Asserts that a resolve output points into the immutable manifest view
 /// cache and carries the expected file content (schema v8: local/auto USD
 /// resolution returns view paths instead of workspace version folders).
-fn assert_view_resolution(
-    workspace: &Path,
-    output: &Output,
-    relative_path: &str,
-    content: &str,
-) {
+fn assert_view_resolution(workspace: &Path, output: &Output, relative_path: &str, content: &str) {
     let resolved = stdout(output).trim().to_string();
     let view_prefix = workspace.join(".ads-cache").join("manifests");
     assert!(
