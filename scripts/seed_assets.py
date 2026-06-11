@@ -1,13 +1,22 @@
-"""Seed an ADS store with thousands of synthetic assets through the HTTP API.
+"""Seed an ADS store with thousands of synthetic assets (schema v8).
 
-Drives a running `ads serve` instance, so it needs no direct store access and
-no CLI process per asset. Objects are uploaded first, then version records are
-imported with client-side canonical manifest hashes, then thumbnails and
-current pins are applied.
+Publish tier (HTTP): drives a running `ads serve` instance. Objects are
+uploaded first, then version records are imported with client-side canonical
+manifest hashes — about 60% as WIP promotions (`promoted_from` + staging
+source paths), the rest as direct `add --source` registrations — then
+thumbnails and current pins are applied.
+
+WIP tier (CLI): WIP streams are local-only by design and have no HTTP API, so
+they are seeded by driving the real `ads wip add` / `publish promote`
+workflow against the store directly. Stop `ads serve` first (RocksDB allows a
+single writer process).
 
 Usage:
     python scripts/seed_assets.py --server http://127.0.0.1:8799 \
         --token demo-token --profile main --target 3200
+    # then, with ads serve stopped:
+    python scripts/seed_assets.py --wip-store target/webapp_tmp/store \
+        --ads target/debug/ads.exe --wip-departments 40
 """
 
 from __future__ import annotations
@@ -199,6 +208,96 @@ def asset_name(rng, kind, used):
     return name
 
 
+def run_cli(executable, arguments):
+    import subprocess
+
+    completed = subprocess.run(
+        [str(Path(executable).resolve()), *arguments],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"ads {' '.join(arguments[:2])} failed: {completed.stderr.strip()}"
+        )
+    return completed.stdout.strip()
+
+
+def seed_wip(args):
+    """Seeds live WIP streams by driving the real v8 workflow via the CLI.
+
+    For each sampled department: register a series of WIP micro-versions from
+    a mutating work folder, promote the head once or twice along the way, and
+    leave trailing unpromoted WIPs. The first departments exceed the default
+    GC retention (20) so `ads gc --dry-run` has something to report.
+    """
+
+    import tempfile
+    from pathlib import Path as _Path
+
+    rng = random.Random(args.seed + 1000)
+    started = time.time()
+    used_names = set()
+    departments_seeded = 0
+    wips_registered = 0
+    promotes = 0
+    pins = 0
+
+    for index in range(args.wip_departments):
+        category = weighted_choice(rng, [(c, w) for c, _, w in CATEGORIES])
+        kind = next(k for c, k, _ in CATEGORIES if c == category)
+        code = asset_name(rng, kind, used_names)
+        department = weighted_choice(rng, DEPARTMENTS[kind])
+        common = [
+            "--store", str(args.wip_store),
+            "--category", category,
+            "--asset-code", code,
+            "--department", department,
+        ]
+
+        # The first two departments exceed the default GC retention of 20.
+        wip_count = 25 if index < 2 else weighted_choice(
+            rng, [(3, 5), (5, 4), (8, 3), (12, 2), (18, 1)])
+        promote_count = min(rng.randint(1, 2), max(1, wip_count - 2))
+        promote_points = sorted(
+            rng.sample(range(2, wip_count), promote_count)) if wip_count > 2 else []
+
+        department_promotes = 0
+        with tempfile.TemporaryDirectory() as temp:
+            work = _Path(temp)
+            file_names = [f"{code}.usd", f"geo/{code}_geo.usd"][: rng.randint(1, 2)]
+            for seq in range(1, wip_count + 1):
+                target = work / rng.choice(file_names)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(
+                    f"{code} {department} wip {seq}\n" * rng.randint(2, 30),
+                    encoding="utf-8",
+                )
+                run_cli(args.ads, ["wip", "add", *common, "--source", str(work)])
+                wips_registered += 1
+                if seq in promote_points:
+                    run_cli(args.ads, ["publish", "promote", *common])
+                    promotes += 1
+                    department_promotes += 1
+
+        if department_promotes >= 2 and rng.random() < 0.5:
+            run_cli(args.ads, ["current", "set", *common, "--version", "1"])
+            pins += 1
+
+        departments_seeded += 1
+        if departments_seeded % 10 == 0:
+            print(f"{departments_seeded}/{args.wip_departments} departments "
+                  f"({wips_registered} wips, {time.time() - started:.0f}s)")
+
+    print("wip seed complete:")
+    print(f"  departments: {departments_seeded}")
+    print(f"  wips:        {wips_registered}")
+    print(f"  promotes:    {promotes}")
+    print(f"  pins:        {pins}")
+    print(f"  elapsed:     {time.time() - started:.1f}s")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--server", default="http://127.0.0.1:8799")
@@ -208,7 +307,17 @@ def main():
                         help="number of category/asset/department entries")
     parser.add_argument("--seed", type=int, default=8)
     parser.add_argument("--thumb-dir", default="target/webapp_tmp/seed_thumbs")
+    parser.add_argument("--wip-store",
+                        help="seed WIP streams via the ads CLI against this store "
+                             "(requires ads serve to be stopped); skips the HTTP phase")
+    parser.add_argument("--ads", default="target/debug/ads.exe",
+                        help="ads executable used by --wip-store")
+    parser.add_argument("--wip-departments", type=int, default=40)
     args = parser.parse_args()
+
+    if args.wip_store:
+        seed_wip(args)
+        return
 
     rng = random.Random(args.seed)
     client = AdsHttpClient(args.server, token=args.token, timeout=60.0)
@@ -249,6 +358,7 @@ def main():
                 files[template.format(code=code)] = blob_pool.pick()
 
             day = rng.randint(0, 540)
+            wip_seq = 0
             for version in range(1, version_count + 1):
                 if version > 1:
                     for path in rng.sample(list(files), max(1, len(files) // 3)):
@@ -262,6 +372,23 @@ def main():
                 created_at = (
                     f"2025-01-06T{rng.randint(8, 19):02d}:{rng.randint(0, 59):02d}:00+00:00"
                 )
+                # Schema v8: most versions are promotions of WIP micro-versions
+                # (metadata-only, staging source paths, promoted_from set); the
+                # rest are direct `add --source` registrations.
+                promoted = rng.random() < 0.6
+                if promoted:
+                    wip_seq += rng.randint(1, 6)
+                    source_path = (
+                        f"D:/workspace/.ads-staging/{rng.randrange(16 ** 8):08x}"
+                        f"/{category}/{code}/{department}"
+                    )
+                else:
+                    source_path = rng.choice(
+                        [
+                            f"D:/delivery/{code}_{department}_fix",
+                            f"D:/work/{code}/{department}/out",
+                        ]
+                    )
                 record = {
                     "department_key": {
                         "asset_key": {"category": category, "asset_code": code},
@@ -271,10 +398,12 @@ def main():
                     "manifest_hash": canonical_manifest_hash(manifest_entries),
                     "created_at": created_at.replace(
                         "2025-01-06", offset_date(day)),
-                    "source_path": f"{category}/{code}/{department}/v{version:03d}",
+                    "source_path": source_path,
                     "file_count": len(manifest_entries),
                     "total_bytes": sum(e["size"] for e in manifest_entries),
                 }
+                if promoted:
+                    record["promoted_from"] = wip_seq
                 client.import_version_info(
                     {"version": record, "manifest": {"entries": manifest_entries}},
                     profile=args.profile,
