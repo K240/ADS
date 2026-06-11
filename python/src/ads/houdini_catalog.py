@@ -327,6 +327,9 @@ def _env_value(env: Mapping[str, str], name: str | None) -> str:
 def _version_string(value: Any) -> str | None:
     if value is None:
         return None
+    # Versions arrive as plain integers from the v8 API; v### is display sugar.
+    if isinstance(value, int):
+        return f"v{value:03d}"
     return str(value)
 
 

@@ -90,6 +90,9 @@ def Xform "sub" (
         self.assertEqual(query_version.category, "char")
         self.assertEqual(query_version.version, "v002")
 
+        integer_version = parse_ads_uri("ads://char/hero/model/hero.usd?v=2")
+        self.assertEqual(integer_version.version, "2")
+
     def test_build_pull_plan_marks_present_and_missing_dependencies(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / "root.usda"
@@ -119,13 +122,14 @@ def Xform "root" (
         self.assertEqual(plan.pull_urls, ["ads://prop/crate/model/crate.usd?v=v003"])
 
     def test_execute_pull_plan_restores_explicit_version(self):
+        # The canonical v8 pin form is a bare integer; v### stays accepted.
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / "root.usda"
             root.write_text(
                 """
 #usda 1.0
 def Xform "root" (
-    references = @ads://prop/crate/model/crate.usd?v=v003@
+    references = @ads://prop/crate/model/crate.usd?v=3@
 )
 {
 }
@@ -139,7 +143,7 @@ def Xform "root" (
 
         restore_calls = [call for call in fake.calls if call[0] == "restore"]
         self.assertEqual(len(restore_calls), 1)
-        self.assertEqual(restore_calls[0][1]["version"], "v003")
+        self.assertEqual(restore_calls[0][1]["version"], "3")
 
 
 if __name__ == "__main__":

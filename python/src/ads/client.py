@@ -138,7 +138,7 @@ class AdsCli:
         category: str,
         asset_code: str,
         department: str,
-        version: str,
+        version: int | str,
     ) -> str:
         return self.run_text(
             [
@@ -164,7 +164,7 @@ class AdsCli:
         category: str,
         asset_code: str,
         department: str | None = None,
-        version: str | None = None,
+        version: int | str | None = None,
     ) -> JsonObject:
         args = [
             "info",
@@ -218,7 +218,7 @@ class AdsCli:
         category: str,
         asset_code: str,
         department: str,
-        version: str,
+        version: int | str,
         force: bool = False,
     ) -> str:
         args = [
@@ -247,7 +247,7 @@ class AdsCli:
         category: str,
         asset_code: str,
         department: str,
-        version: str,
+        version: int | str,
     ) -> str:
         return self.run_text(
             _publish_args(
@@ -269,7 +269,7 @@ class AdsCli:
         category: str,
         asset_code: str,
         department: str,
-        version: str,
+        version: int | str,
     ) -> str:
         return self.run_text(
             _publish_args(
@@ -293,7 +293,7 @@ class AdsCli:
         category: str,
         asset_code: str,
         department: str,
-        version: str | None = None,
+        version: int | str | None = None,
         latest: bool = False,
         workspace: str | os.PathLike[str] | None = None,
         materialize: bool = False,
@@ -383,7 +383,7 @@ class AdsCli:
         category: str,
         asset_code: str,
         department: str,
-        version: str | None = None,
+        version: int | str | None = None,
         latest: bool = False,
         set_current: bool = False,
     ) -> str:
@@ -420,7 +420,7 @@ class AdsCli:
         asset_code: str,
         department: str,
         dest: str | os.PathLike[str],
-        version: str | None = None,
+        version: int | str | None = None,
         latest: bool = False,
         force: bool = False,
     ) -> str:
@@ -509,7 +509,7 @@ class AdsCli:
         category: str,
         asset_code: str,
         department: str,
-        version: str,
+        version: int | str,
     ) -> str:
         return self.run_text(
             [
@@ -537,7 +537,7 @@ class AdsCli:
         category: str,
         asset_code: str,
         department: str,
-        version: str,
+        version: int | str,
     ) -> JsonObject:
         return self.run_json(
             [
@@ -564,7 +564,7 @@ class AdsCli:
         category: str,
         asset_code: str,
         department: str,
-        version: str | None = None,
+        version: int | str | None = None,
         latest: bool = False,
         remote_base_url: str | None = None,
     ) -> str:
@@ -591,18 +591,18 @@ class AdsCli:
     def verify(self, *, store: str | os.PathLike[str]) -> str:
         return self.run_text(["verify", "--store", _path(store)])
 
-    def run_json(self, args: Sequence[str | os.PathLike[str]]) -> JsonObject:
+    def run_json(self, args: Sequence[str | int | os.PathLike[str]]) -> JsonObject:
         text = self.run_text(args)
         data = json.loads(text)
         if not isinstance(data, dict):
             raise ValueError("ADS command did not return a JSON object")
         return data
 
-    def run_text(self, args: Sequence[str | os.PathLike[str]]) -> str:
+    def run_text(self, args: Sequence[str | int | os.PathLike[str]]) -> str:
         result = self.run(args)
         return result.stdout.strip()
 
-    def run(self, args: Sequence[str | os.PathLike[str]]) -> subprocess.CompletedProcess[str]:
+    def run(self, args: Sequence[str | int | os.PathLike[str]]) -> subprocess.CompletedProcess[str]:
         cmd = [_path(self.executable), *[_path(arg) for arg in args]]
         result = subprocess.run(cmd, text=True, capture_output=True, check=False)
         if result.returncode != 0:
@@ -676,7 +676,7 @@ class AdsHttpClient:
         category: str,
         asset_code: str,
         department: str,
-        version: str | None = None,
+        version: int | str | None = None,
         latest: bool = False,
     ) -> JsonObject:
         return self.get(
@@ -786,7 +786,7 @@ class AdsHttpClient:
         category: str,
         asset_code: str,
         department: str,
-        version: str,
+        version: int | str,
     ) -> JsonObject:
         return self.put_json(
             "/api/current",
@@ -825,7 +825,7 @@ class AdsHttpClient:
         category: str,
         asset_code: str,
         department: str,
-        version: str | None = None,
+        version: int | str | None = None,
         latest: bool = False,
         force: bool = False,
     ) -> JsonObject:
@@ -841,7 +841,7 @@ class AdsHttpClient:
         category: str,
         asset_code: str,
         department: str,
-        version: str,
+        version: int | str,
         force: bool = False,
     ) -> JsonObject:
         return self.post_json(
@@ -868,7 +868,7 @@ class AdsHttpClient:
         category: str,
         asset_code: str,
         department: str,
-        version: str | None = None,
+        version: int | str | None = None,
         latest: bool = False,
         remote_base_url: str | None = None,
     ) -> str:
@@ -898,7 +898,7 @@ class AdsHttpClient:
         category: str,
         asset_code: str,
         department: str,
-        version: str,
+        version: int | str,
     ) -> JsonObject:
         path = Path(thumbnail)
         content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
@@ -995,7 +995,10 @@ class AdsHttpClient:
             raise AdsHttpError(0, str(error)) from error
 
 
-def _path(value: str | os.PathLike[str]) -> str:
+def _path(value: str | int | os.PathLike[str]) -> str:
+    # Versions are plain integers in schema v8; let callers pass them as-is.
+    if isinstance(value, int):
+        return str(value)
     return os.fspath(value)
 
 
@@ -1033,7 +1036,7 @@ def _publish_args(
     category: str,
     asset_code: str,
     department: str,
-    version: str,
+    version: int | str,
 ) -> list[str]:
     return [
         "publish",
@@ -1058,7 +1061,7 @@ def _workspace_request(
     category: str,
     asset_code: str,
     department: str,
-    version: str | None,
+    version: int | str | None,
     latest: bool,
     force: bool,
 ) -> JsonObject:

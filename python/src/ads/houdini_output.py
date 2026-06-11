@@ -133,8 +133,16 @@ def _build_ads_uri(
     parts.extend([asset_code, department, asset_relative_path])
     uri = "ads://" + "/".join(part.strip("/") for part in parts if part)
     if include_version_query:
-        uri += f"?v={version}"
+        uri += f"?v={_version_query_value(version)}"
     return uri
+
+
+def _version_query_value(version: str) -> str:
+    """Emits the canonical integer form (schema v8) for `v###` folder names."""
+    digits = version[1:] if version.startswith("v") else version
+    if digits.isdigit():
+        return str(int(digits))
+    return version
 
 
 def _normalize_root(value: str | os.PathLike[str] | None) -> str | None:

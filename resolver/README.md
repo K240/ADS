@@ -60,7 +60,14 @@ $env:ADS_RESOLVER_LOG_FILE = "$env:TEMP\ads_resolver_houdini.log"
 $env:ADS_RESOLVER_REMOTE_BASE_URL = "https://assets.example.com/objects/sha256"
 $env:ADS_RESOLVER_HTTP_BEARER_TOKEN = "<object-token>"
 $env:ADS_RESOLVER_HTTP_TIMEOUT_SECONDS = "30"
+$env:ADS_RESOLVER_CACHE_TTL_SECONDS = "30"
 ```
+
+Resolve caching follows the schema v8 policy: explicit version pins (`?v=12`
+or `?v=v012`) are immutable and cached for the whole session, while
+`current` / `latest` resolutions expire after `ADS_RESOLVER_CACHE_TTL_SECONDS`
+(default 30, `0` disables caching for mutable selectors) so pointer switches
+on the server become visible without restarting Houdini.
 
 Remote direct read buffers the full response into memory through `ArInMemoryAsset`. This avoids creating workspace version files, but it is not a streaming or range-read implementation.
 

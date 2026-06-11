@@ -15,8 +15,8 @@ ASSET = {
     "category": "show/char",
     "asset_code": "hero",
     "department": "model",
-    "current": "v001",
-    "latest": "v002",
+    "current": 1,
+    "latest": 2,
     "explicit_current": True,
     "version_count": 2,
     "latest_created_at": "2026-05-28T00:00:00+00:00",
@@ -74,8 +74,8 @@ class CatalogIndexTests(unittest.TestCase):
                 {
                     **ASSET,
                     "department": "anim",
-                    "current": "v003",
-                    "latest": "v003",
+                    "current": 3,
+                    "latest": 3,
                 },
             ]
         )

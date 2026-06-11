@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -777,6 +778,100 @@ std::string JsonStringField(const std::string& json, const std::string& field)
     return {};
 }
 
+// Schema v8 cache policy: an explicit version pin resolves to an immutable
+// manifest, so the result may be cached for the whole session. current/latest
+// are mutable pointers and only stay cached for a short TTL so pointer
+// switches on the server become visible without restarting the host process.
+struct ResolveCacheEntry
+{
+    std::string location;
+    std::chrono::steady_clock::time_point expiry;
+    bool permanent = false;
+};
+
+bool HasExplicitVersionPin(const std::string& assetPath)
+{
+    const std::size_t query = assetPath.find('?');
+    if (query == std::string::npos) {
+        return false;
+    }
+    std::size_t position = query + 1;
+    while (position < assetPath.size()) {
+        std::size_t end = assetPath.find('&', position);
+        if (end == std::string::npos) {
+            end = assetPath.size();
+        }
+        const std::string pair = assetPath.substr(position, end - position);
+        if (pair.rfind("v=", 0) == 0) {
+            std::string value = pair.substr(2);
+            if (!value.empty() && value[0] == 'v') {
+                value = value.substr(1);
+            }
+            if (value.empty()) {
+                return false;
+            }
+            for (const char ch : value) {
+                if (ch < '0' || ch > '9') {
+                    return false;
+                }
+            }
+            return true;
+        }
+        position = end + 1;
+    }
+    return false;
+}
+
+long CacheTtlSeconds()
+{
+    const std::string value = GetEnv("ADS_RESOLVER_CACHE_TTL_SECONDS", "30");
+    try {
+        return std::stol(value);
+    } catch (...) {
+        return 30;
+    }
+}
+
+bool LookupResolveCache(
+    std::mutex& mutex,
+    std::unordered_map<std::string, ResolveCacheEntry>& cache,
+    const std::string& key,
+    std::string* location)
+{
+    std::lock_guard<std::mutex> lock(mutex);
+    const auto found = cache.find(key);
+    if (found == cache.end()) {
+        return false;
+    }
+    if (!found->second.permanent && std::chrono::steady_clock::now() >= found->second.expiry) {
+        cache.erase(found);
+        return false;
+    }
+    *location = found->second.location;
+    return true;
+}
+
+void StoreResolveCache(
+    std::mutex& mutex,
+    std::unordered_map<std::string, ResolveCacheEntry>& cache,
+    const std::string& key,
+    const std::string& location,
+    bool permanent)
+{
+    ResolveCacheEntry entry;
+    entry.location = location;
+    entry.permanent = permanent;
+    if (!permanent) {
+        const long ttl = CacheTtlSeconds();
+        if (ttl <= 0) {
+            return;
+        }
+        entry.expiry = std::chrono::steady_clock::now() + std::chrono::seconds(ttl);
+    }
+    std::lock_guard<std::mutex> lock(mutex);
+    cache[key] = std::move(entry);
+}
+
 std::string ResolveWithAdsServer(const std::string& assetPath)
 {
     const std::string server = TrimTrailingSlashes(GetEnv("ADS_RESOLVER_SERVER"));
@@ -795,13 +890,10 @@ std::string ResolveWithAdsServer(const std::string& assetPath)
     const std::string cacheKey =
         "server\n" + server + "\n" + profile + "\n" + mode + "\n" + normalizedAssetPath;
     static std::mutex cacheMutex;
-    static std::unordered_map<std::string, std::string> cache;
-    {
-        std::lock_guard<std::mutex> lock(cacheMutex);
-        const auto found = cache.find(cacheKey);
-        if (found != cache.end()) {
-            return found->second;
-        }
+    static std::unordered_map<std::string, ResolveCacheEntry> cache;
+    std::string cached;
+    if (LookupResolveCache(cacheMutex, cache, cacheKey, &cached)) {
+        return cached;
     }
 
     const std::string url = server + "/api/resolve?profile=" + PercentEncode(profile)
@@ -823,8 +915,12 @@ std::string ResolveWithAdsServer(const std::string& assetPath)
             true);
     }
     if (!location.empty()) {
-        std::lock_guard<std::mutex> lock(cacheMutex);
-        cache[cacheKey] = location;
+        StoreResolveCache(
+            cacheMutex,
+            cache,
+            cacheKey,
+            location,
+            HasExplicitVersionPin(normalizedAssetPath));
     }
     return location;
 }
@@ -869,13 +965,10 @@ std::string ResolveWithAdsCli(const std::string& assetPath)
     const std::string cacheKey = "cli\n" + executable + "\n" + store + "\n" + workspace + "\n" + mode
         + "\n" + remoteBaseUrl + "\n" + cliAssetPath;
     static std::mutex cacheMutex;
-    static std::unordered_map<std::string, std::string> cache;
-    {
-        std::lock_guard<std::mutex> lock(cacheMutex);
-        const auto found = cache.find(cacheKey);
-        if (found != cache.end()) {
-            return found->second;
-        }
+    static std::unordered_map<std::string, ResolveCacheEntry> cache;
+    std::string cached;
+    if (LookupResolveCache(cacheMutex, cache, cacheKey, &cached)) {
+        return cached;
     }
 
     std::vector<std::string> args {
@@ -905,8 +998,12 @@ std::string ResolveWithAdsCli(const std::string& assetPath)
         LogResolverMessage("ADS Resolver resolved `" + assetPath + "` -> `" + resolved + "`");
     }
     if (!resolved.empty()) {
-        std::lock_guard<std::mutex> lock(cacheMutex);
-        cache[cacheKey] = resolved;
+        StoreResolveCache(
+            cacheMutex,
+            cache,
+            cacheKey,
+            resolved,
+            HasExplicitVersionPin(cliAssetPath));
     }
     return resolved;
 }

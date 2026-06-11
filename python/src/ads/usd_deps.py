@@ -193,7 +193,7 @@ def execute_pull_plan(
             item.error = "cannot execute pull for category-less ADS URI; use ads://category/asset_code/department/..."
             continue
         try:
-            if item.action == "restore" and item.version.startswith("v"):
+            if item.action == "restore" and _is_explicit_version(item.version):
                 ads.restore(
                     store=store,
                     workspace=workspace,
@@ -382,12 +382,20 @@ def _first(values: list[str] | None) -> str | None:
     return value or None
 
 
+def _is_explicit_version(version: str | None) -> bool:
+    """True for pinned versions in either form (`v012` or the canonical `12`)."""
+    if not version or version in ("current", "latest"):
+        return False
+    digits = version[1:] if version.startswith("v") else version
+    return digits.isdigit() and int(digits) > 0
+
+
 def _plan_action(parts: AdsUriParts, present: bool | None) -> str:
     if present is True:
         return "none"
     if not parts.asset_code or not parts.department:
         return "inspect"
-    if parts.version and parts.version.startswith("v"):
+    if _is_explicit_version(parts.version):
         return "restore"
     return "pull"
 

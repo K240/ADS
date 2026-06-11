@@ -223,10 +223,7 @@ fn nested_category_paths_create_expected_folders_and_resolve() {
         "ads://assets/characters/main/hero/model/v001/geo/model.usd",
     );
     assert!(resolved.status.success(), "{}", stderr(&resolved));
-    assert_eq!(
-        stdout(&resolved).trim(),
-        v001.join("geo").join("model.usd").display().to_string()
-    );
+    assert_view_resolution(&workspace, &resolved, "geo/model.usd", "nested category");
 }
 
 #[test]
@@ -282,8 +279,8 @@ fn departments_have_independent_version_sequences() {
     let log = asset_log(&store, "char", "hero");
     assert!(log.status.success(), "{}", stderr(&log));
     let log_stdout = stdout(&log);
-    assert!(log_stdout.contains("\"model\": \"v001\""));
-    assert!(log_stdout.contains("\"anim\": \"v001\""));
+    assert!(log_stdout.contains("\"model\": 1"));
+    assert!(log_stdout.contains("\"anim\": 1"));
 }
 
 #[test]
@@ -583,13 +580,7 @@ fn resolve_supports_local_remote_auto_and_latest_asset_paths() {
         "ads://prop/crate/model/v001/model.usd",
     );
     assert!(local.status.success(), "{}", stderr(&local));
-    assert_eq!(
-        stdout(&local).trim(),
-        version_folder(&workspace, "prop", "crate", "v001")
-            .join("model.usd")
-            .display()
-            .to_string()
-    );
+    assert_view_resolution(&workspace, &local, "model.usd", "v1");
 
     let remote = resolve_asset(
         &store,
@@ -629,24 +620,29 @@ fn resolve_supports_local_remote_auto_and_latest_asset_paths() {
         "ads://prop/crate/model/latest/model.usd",
     );
     assert!(latest.status.success(), "{}", stderr(&latest));
-    assert_eq!(
-        stdout(&latest).trim(),
-        version_folder(&workspace, "prop", "crate", "v002")
-            .join("model.usd")
-            .display()
-            .to_string()
-    );
+    assert_view_resolution(&workspace, &latest, "model.usd", "v2");
 
+    // v8: removing the workspace folder no longer breaks local resolve —
+    // the manifest view is materialized from the store instead.
     fs::remove_dir_all(version_folder(&workspace, "prop", "crate", "v002")).unwrap();
-    let local_missing = resolve_asset(
+    let local_after_workspace_removal = resolve_asset(
         &store,
         &workspace,
         "local",
         None,
         "ads://prop/crate/model/latest/model.usd",
     );
-    assert!(!local_missing.status.success());
-    assert!(stderr(&local_missing).contains("does not exist"));
+    assert!(
+        local_after_workspace_removal.status.success(),
+        "{}",
+        stderr(&local_after_workspace_removal)
+    );
+    assert_view_resolution(
+        &workspace,
+        &local_after_workspace_removal,
+        "model.usd",
+        "v2",
+    );
 }
 
 #[test]
@@ -796,12 +792,11 @@ fn resolve_accepts_simplified_uri_current_and_query_version() {
         "{}",
         stderr(&implicit_current_without_category)
     );
-    assert_eq!(
-        stdout(&implicit_current_without_category).trim(),
-        version_folder(&workspace, "prop", "crate", "v002")
-            .join("crate.usd")
-            .display()
-            .to_string()
+    assert_view_resolution(
+        &workspace,
+        &implicit_current_without_category,
+        "crate.usd",
+        "v2",
     );
 
     let explicit_v001 = resolve_asset(
@@ -812,13 +807,7 @@ fn resolve_accepts_simplified_uri_current_and_query_version() {
         "ads://prop/crate/model/crate.usd?v=v001",
     );
     assert!(explicit_v001.status.success(), "{}", stderr(&explicit_v001));
-    assert_eq!(
-        stdout(&explicit_v001).trim(),
-        version_folder(&workspace, "prop", "crate", "v001")
-            .join("crate.usd")
-            .display()
-            .to_string()
-    );
+    assert_view_resolution(&workspace, &explicit_v001, "crate.usd", "v1");
 
     let default_file = resolve_asset(
         &store,
@@ -828,13 +817,7 @@ fn resolve_accepts_simplified_uri_current_and_query_version() {
         "ads://prop/crate/model?v=v001",
     );
     assert!(default_file.status.success(), "{}", stderr(&default_file));
-    assert_eq!(
-        stdout(&default_file).trim(),
-        version_folder(&workspace, "prop", "crate", "v001")
-            .join("crate.usd")
-            .display()
-            .to_string()
-    );
+    assert_view_resolution(&workspace, &default_file, "crate.usd", "v1");
 
     let set_current = ads()
         .arg("current")
@@ -865,13 +848,7 @@ fn resolve_accepts_simplified_uri_current_and_query_version() {
         "{}",
         stderr(&implicit_current)
     );
-    assert_eq!(
-        stdout(&implicit_current).trim(),
-        version_folder(&workspace, "prop", "crate", "v001")
-            .join("crate.usd")
-            .display()
-            .to_string()
-    );
+    assert_view_resolution(&workspace, &implicit_current, "crate.usd", "v1");
 
     let explicit_latest = resolve_asset(
         &store,
@@ -885,13 +862,44 @@ fn resolve_accepts_simplified_uri_current_and_query_version() {
         "{}",
         stderr(&explicit_latest)
     );
-    assert_eq!(
-        stdout(&explicit_latest).trim(),
-        version_folder(&workspace, "prop", "crate", "v002")
-            .join("crate.usd")
-            .display()
-            .to_string()
+    assert_view_resolution(&workspace, &explicit_latest, "crate.usd", "v2");
+}
+
+#[test]
+fn resolve_materializes_manifest_view_with_sibling_files_and_integer_pin() {
+    let temp = TempDir::new().unwrap();
+    let store = temp.path().join("store");
+    let workspace = temp.path().join("workspace");
+    assert!(ads().arg("init").arg(&store).status().unwrap().success());
+
+    assert!(
+        new_version(&store, &workspace, "char", "hero")
+            .status
+            .success()
     );
+    let v001 = version_folder(&workspace, "char", "hero", "v001");
+    fs::create_dir(v001.join("geo")).unwrap();
+    fs::write(v001.join("hero.usd"), "root layer").unwrap();
+    fs::write(v001.join("geo").join("body.usd"), "sibling layer").unwrap();
+    add_asset(&store, &workspace, "char", "hero", "v001");
+    fs::remove_dir_all(&v001).unwrap();
+
+    // Integer version pins are the canonical v8 form.
+    let pinned = resolve_asset(
+        &store,
+        &workspace,
+        "local",
+        None,
+        "ads://char/hero/model/hero.usd?v=1",
+    );
+    assert!(pinned.status.success(), "{}", stderr(&pinned));
+    assert_view_resolution(&workspace, &pinned, "hero.usd", "root layer");
+
+    // The whole manifest is materialized, so sibling-relative references
+    // inside USD layers keep working from the view.
+    let resolved_root = PathBuf::from(stdout(&pinned).trim());
+    let sibling = resolved_root.parent().unwrap().join("geo").join("body.usd");
+    assert_eq!(fs::read_to_string(&sibling).unwrap(), "sibling layer");
 }
 
 #[test]
@@ -935,7 +943,7 @@ fn thumbnails_are_version_metadata_and_use_object_store() {
         .unwrap();
     assert!(info.status.success(), "{}", stderr(&info));
     let info_stdout = stdout(&info);
-    assert!(info_stdout.contains("\"version\": \"v001\""));
+    assert!(info_stdout.contains("\"version\": 1"));
     assert!(info_stdout.contains("\"mime_type\": \"image/png\""));
     assert!(info_stdout.contains("\"width\": 1"));
     assert!(info_stdout.contains("\"height\": 1"));
@@ -1108,7 +1116,7 @@ fn thumbnail_url_uses_configured_or_overridden_remote_base_url() {
 }
 
 #[test]
-fn set_remote_config_is_used_by_auto_resolve_when_local_file_is_missing() {
+fn set_remote_config_is_used_by_auto_resolve_when_local_object_is_missing() {
     let temp = TempDir::new().unwrap();
     let store = temp.path().join("store");
     let workspace = temp.path().join("workspace");
@@ -1135,6 +1143,17 @@ fn set_remote_config_is_used_by_auto_resolve_when_local_file_is_missing() {
     .unwrap();
     add_asset(&store, &workspace, "char", "hero", "v001");
     fs::remove_dir_all(version_folder(&workspace, "char", "hero", "v001")).unwrap();
+    // v8: auto resolve materializes the manifest view from store objects, so
+    // the remote fallback only triggers once the object itself is missing.
+    let hero_hash = sha256_hex(b"hero");
+    fs::remove_file(
+        store
+            .join("objects")
+            .join("sha256")
+            .join(&hero_hash[0..2])
+            .join(&hero_hash),
+    )
+    .unwrap();
 
     let resolved = resolve_asset(
         &store,
@@ -1144,7 +1163,6 @@ fn set_remote_config_is_used_by_auto_resolve_when_local_file_is_missing() {
         "ads://char/hero/model/v001/model.usd",
     );
     assert!(resolved.status.success(), "{}", stderr(&resolved));
-    let hero_hash = sha256_hex(b"hero");
     assert_eq!(
         stdout(&resolved).trim(),
         format!(
@@ -1580,6 +1598,33 @@ fn thumbnail_url(
         command.arg("--remote-base-url").arg(remote_base_url);
     }
     command.output().unwrap()
+}
+
+/// Asserts that a resolve output points into the immutable manifest view
+/// cache and carries the expected file content (schema v8: local/auto USD
+/// resolution returns view paths instead of workspace version folders).
+fn assert_view_resolution(
+    workspace: &Path,
+    output: &Output,
+    relative_path: &str,
+    content: &str,
+) {
+    let resolved = stdout(output).trim().to_string();
+    let view_prefix = workspace.join(".ads-cache").join("manifests");
+    assert!(
+        Path::new(&resolved).starts_with(&view_prefix),
+        "resolved location {resolved} is not under {}",
+        view_prefix.display()
+    );
+    assert!(
+        resolved.replace('\\', "/").ends_with(relative_path),
+        "resolved location {resolved} does not end with {relative_path}"
+    );
+    assert_eq!(
+        fs::read_to_string(&resolved).unwrap(),
+        content,
+        "unexpected content at {resolved}"
+    );
 }
 
 fn resolve_asset(

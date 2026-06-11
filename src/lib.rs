@@ -18,7 +18,7 @@ use axum::{Json, Router};
 use chrono::Utc;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use globset::{Glob, GlobMatcher};
-use rocksdb::{DB, IteratorMode, Options, WriteBatch};
+use rocksdb::{DB, Direction, IteratorMode, Options, WriteBatch};
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
@@ -26,11 +26,12 @@ use tokio::net::TcpListener;
 use tower_http::cors::CorsLayer;
 use walkdir::{DirEntry, WalkDir};
 
-const SCHEMA_VERSION: &str = "7";
+const SCHEMA_VERSION: &str = "8";
 const DB_DIR: &str = "db";
 const OBJECTS_DIR: &str = "objects";
 const SHA256_DIR: &str = "sha256";
 const CACHE_DIR: &str = ".ads-cache";
+const MANIFESTS_DIR: &str = "manifests";
 const TEXTURE_DEPARTMENTS: &[&str] = &["texture", "textures", "tex"];
 const TEXTURE_EXTENSIONS: &[&str] = &[
     "tx", "rat", "exr", "tif", "tiff", "png", "jpg", "jpeg", "tga", "bmp", "hdr", "pic", "tex",
@@ -223,7 +224,7 @@ enum Commands {
         /// Override the store remote object base URL.
         #[arg(long = "remote-base-url")]
         remote_base_url: Option<String>,
-        /// Asset path such as ads://hero/model/hero.usd or ads://char/hero/model/hero.usd?v=v002.
+        /// Asset path such as ads://hero/model/hero.usd or ads://char/hero/model/hero.usd?v=2 (v002 form also accepted).
         asset_path: String,
     },
     /// Set the store remote object base URL used by resolve --mode remote/auto.
@@ -1883,6 +1884,13 @@ impl VersionId {
     pub fn next(self) -> Self {
         Self(self.0 + 1)
     }
+
+    /// Fixed-width encoding for RocksDB keys so lexicographic order matches
+    /// numeric order (the display form `v###` is variable width and breaks
+    /// ordering past v999).
+    fn key_encode(self) -> String {
+        format!("{:010}", self.0)
+    }
 }
 
 impl fmt::Display for VersionId {
@@ -1895,11 +1903,12 @@ impl FromStr for VersionId {
     type Err = anyhow::Error;
 
     fn from_str(value: &str) -> Result<Self> {
-        let Some(digits) = value.strip_prefix('v') else {
-            bail!("version must start with 'v': {value}");
-        };
+        // Lenient parse is a permanent contract: pinned URIs like `?v=v003`
+        // are baked into published USD files, while the canonical form is a
+        // bare integer.
+        let digits = value.strip_prefix('v').unwrap_or(value);
         if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
-            bail!("version must be formatted like v001: {value}");
+            bail!("version must be an integer like 12 or v012: {value}");
         }
         let number = digits
             .parse::<u32>()
@@ -1916,7 +1925,7 @@ impl Serialize for VersionId {
     where
         S: Serializer,
     {
-        serializer.serialize_str(&self.to_string())
+        serializer.serialize_u32(self.0)
     }
 }
 
@@ -1931,7 +1940,26 @@ impl<'de> Deserialize<'de> for VersionId {
             type Value = VersionId;
 
             fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("a version string like v001")
+                formatter.write_str("a version number like 12 or a version string like v012")
+            }
+
+            fn visit_u64<E>(self, value: u64) -> std::result::Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                if value == 0 || value > u64::from(u32::MAX) {
+                    return Err(E::custom(format!("version out of range: {value}")));
+                }
+                Ok(VersionId(value as u32))
+            }
+
+            fn visit_i64<E>(self, value: i64) -> std::result::Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                let value = u64::try_from(value)
+                    .map_err(|_| E::custom(format!("version out of range: {value}")))?;
+                self.visit_u64(value)
             }
 
             fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
@@ -1942,7 +1970,7 @@ impl<'de> Deserialize<'de> for VersionId {
             }
         }
 
-        deserializer.deserialize_str(VersionVisitor)
+        deserializer.deserialize_any(VersionVisitor)
     }
 }
 
@@ -2225,6 +2253,7 @@ struct WebProfile {
     name: String,
     store: PathBuf,
     workspace: PathBuf,
+    store_handle: Arc<Store>,
     mutation_lock: Arc<Mutex<()>>,
 }
 
@@ -2681,12 +2710,12 @@ impl Store {
         if should_update_latest {
             batch.put(
                 key_latest(&info.version.department_key),
-                info.version.version.to_string().as_bytes(),
+                info.version.version.0.to_string().as_bytes(),
             );
         }
         batch.put(
             key_manifest_index(&info.version.department_key, &manifest_hash),
-            info.version.version.to_string().as_bytes(),
+            info.version.version.0.to_string().as_bytes(),
         );
         self.db.write(batch)?;
         Ok(())
@@ -2787,7 +2816,7 @@ impl Store {
             key_asset(&department_key.asset_key),
             serde_json::to_vec(&asset).context("failed to serialize asset record")?,
         );
-        batch.put(key_latest(department_key), version.to_string().as_bytes());
+        batch.put(key_latest(department_key), version.0.to_string().as_bytes());
         batch.put(
             key_manifest_index(department_key, &manifest_hash),
             version.to_string().as_bytes(),
@@ -2809,6 +2838,41 @@ impl Store {
         asset_code: Option<&str>,
         department: Option<&str>,
     ) -> Result<Vec<VersionRecord>> {
+        // v8 fixed-width keys keep a department's versions contiguous, so the
+        // exact-department query (the hot /api/versions path) can prefix-seek
+        // instead of scanning every record. Nested categories make raw key
+        // prefixes ambiguous, so decoded records are still field-checked.
+        if let (Some(category), Some(asset_code), Some(department)) =
+            (category, asset_code, department)
+        {
+            let prefix = format!("version/{category}/{asset_code}/{department}/");
+            let mut versions = Vec::new();
+            for item in self
+                .db
+                .iterator(IteratorMode::From(prefix.as_bytes(), Direction::Forward))
+            {
+                let (key, value) = item?;
+                if !key.starts_with(prefix.as_bytes()) {
+                    break;
+                }
+                let record: VersionRecord = serde_json::from_slice(&value)
+                    .with_context(|| format!("failed to decode {}", String::from_utf8_lossy(&key)))?;
+                if record.department_key.asset_key.category != category
+                    || record.department_key.asset_key.asset_code != asset_code
+                    || record.department_key.department != department
+                {
+                    continue;
+                }
+                versions.push(record);
+            }
+            versions.sort_by(|left, right| {
+                left.department_key
+                    .cmp(&right.department_key)
+                    .then(left.version.cmp(&right.version))
+            });
+            return Ok(versions);
+        }
+
         let mut versions = Vec::new();
         for item in self.db.iterator(IteratorMode::Start) {
             let (key, value) = item?;
@@ -2999,15 +3063,16 @@ impl Store {
                     asset_path.relative_path
                 )
             })?;
-        let local_path = safe_join(
-            &version_folder(workspace, &asset_path.department_key, version),
-            &asset_path.relative_path,
-        )?;
         let asset_file_kind = asset_file_kind(
             &asset_path.department_key.department,
             &asset_path.relative_path,
         );
 
+        // Local/auto resolve materializes from the store cache instead of the
+        // workspace: textures resolve to flat blob cache paths, every other
+        // file resolves into the immutable manifest view so sibling-relative
+        // references keep working (schema v8: version folders are no longer
+        // load targets).
         match mode {
             ResolveMode::Local => {
                 if asset_file_kind == AssetFileKind::Texture {
@@ -3019,12 +3084,12 @@ impl Store {
                         sha256: entry.sha256.clone(),
                     });
                 }
-                if !local_path.exists() {
-                    bail!("local asset path does not exist: {}", local_path.display());
-                }
+                let view_root =
+                    self.ensure_manifest_view(workspace, &record.manifest_hash, &manifest)?;
+                let view_path = safe_join(&view_root, &asset_path.relative_path)?;
                 Ok(ResolveOutcome {
-                    location: local_path.display().to_string(),
-                    source: ResolveSource::Local,
+                    location: view_path.display().to_string(),
+                    source: ResolveSource::Cache,
                     version,
                     sha256: entry.sha256.clone(),
                 })
@@ -3045,20 +3110,22 @@ impl Store {
                         sha256: entry.sha256.clone(),
                     });
                 }
-                if local_path.exists() {
-                    Ok(ResolveOutcome {
-                        location: local_path.display().to_string(),
-                        source: ResolveSource::Local,
-                        version,
-                        sha256: entry.sha256.clone(),
-                    })
-                } else {
-                    Ok(ResolveOutcome {
+                match self.ensure_manifest_view(workspace, &record.manifest_hash, &manifest) {
+                    Ok(view_root) => {
+                        let view_path = safe_join(&view_root, &asset_path.relative_path)?;
+                        Ok(ResolveOutcome {
+                            location: view_path.display().to_string(),
+                            source: ResolveSource::Cache,
+                            version,
+                            sha256: entry.sha256.clone(),
+                        })
+                    }
+                    Err(_) => Ok(ResolveOutcome {
                         location: self.resolve_remote_url(entry, remote_base_url_override)?,
                         source: ResolveSource::Remote,
                         version,
                         sha256: entry.sha256.clone(),
-                    })
+                    }),
                 }
             }
         }
@@ -3088,7 +3155,7 @@ impl Store {
     ) -> Result<CurrentStatus> {
         self.get_version(department_key, version)?;
         self.db
-            .put(key_current(department_key), version.to_string().as_bytes())?;
+            .put(key_current(department_key), version.0.to_string().as_bytes())?;
         self.current_status_for_department(department_key)
     }
 
@@ -3225,6 +3292,39 @@ impl Store {
         asset_code: Option<&str>,
         department: Option<&str>,
     ) -> Result<Vec<ThumbnailRecord>> {
+        // Same prefix-seek fast path as list_versions for the exact
+        // department query.
+        if let (Some(category), Some(asset_code), Some(department)) =
+            (category, asset_code, department)
+        {
+            let prefix = format!("thumbnail/{category}/{asset_code}/{department}/");
+            let mut records = Vec::new();
+            for item in self
+                .db
+                .iterator(IteratorMode::From(prefix.as_bytes(), Direction::Forward))
+            {
+                let (key, value) = item?;
+                if !key.starts_with(prefix.as_bytes()) {
+                    break;
+                }
+                let record: ThumbnailRecord = serde_json::from_slice(&value)
+                    .with_context(|| format!("failed to decode {}", String::from_utf8_lossy(&key)))?;
+                if record.department_key.asset_key.category != category
+                    || record.department_key.asset_key.asset_code != asset_code
+                    || record.department_key.department != department
+                {
+                    continue;
+                }
+                records.push(record);
+            }
+            records.sort_by(|left, right| {
+                left.department_key
+                    .cmp(&right.department_key)
+                    .then(left.version.cmp(&right.version))
+            });
+            return Ok(records);
+        }
+
         let mut records = Vec::new();
         for item in self.db.iterator(IteratorMode::Start) {
             let (key, value) = item?;
@@ -3320,6 +3420,76 @@ impl Store {
                 )
             }),
         }
+    }
+
+    /// Materializes an immutable folder-shaped view of a manifest under
+    /// `<workspace>/.ads-cache/manifests/<manifest_hash>/`. Each entry is a
+    /// hardlink to its blob in the sha256 cache (copy fallback), so relative
+    /// references between files keep working and unchanged files cost no disk.
+    /// The view is keyed by manifest hash and therefore never overwritten; a
+    /// sibling `<manifest_hash>.complete` marker short-circuits repeat calls.
+    fn ensure_manifest_view(
+        &self,
+        workspace: &Path,
+        manifest_hash: &str,
+        manifest: &Manifest,
+    ) -> Result<PathBuf> {
+        let view_root = manifest_view_root(workspace, manifest_hash);
+        let marker = manifest_view_marker(workspace, manifest_hash);
+        if marker.exists() {
+            return Ok(view_root);
+        }
+        for entry in &manifest.entries {
+            let link_path = safe_join(&view_root, &entry.relative_path)?;
+            if let Ok(metadata) = fs::metadata(&link_path) {
+                if metadata.is_file() && metadata.len() == entry.size {
+                    continue;
+                }
+                if metadata.is_dir() {
+                    bail!(
+                        "manifest view path exists and is a directory: {}",
+                        link_path.display()
+                    );
+                }
+                fs::remove_file(&link_path).with_context(|| {
+                    format!(
+                        "failed to remove incomplete view file {}",
+                        link_path.display()
+                    )
+                })?;
+            }
+            let blob_path = self.ensure_cache_object(workspace, entry)?;
+            let parent = link_path
+                .parent()
+                .ok_or_else(|| anyhow!("invalid view path: {}", link_path.display()))?;
+            fs::create_dir_all(parent).with_context(|| {
+                format!("failed to create view directory {}", parent.display())
+            })?;
+            if fs::hard_link(&blob_path, &link_path).is_err() {
+                if link_path.exists() {
+                    continue;
+                }
+                fs::copy(&blob_path, &link_path).with_context(|| {
+                    format!(
+                        "failed to copy blob {} into manifest view {}",
+                        blob_path.display(),
+                        link_path.display()
+                    )
+                })?;
+            }
+        }
+        let marker_parent = marker
+            .parent()
+            .ok_or_else(|| anyhow!("invalid view marker path: {}", marker.display()))?;
+        fs::create_dir_all(marker_parent).with_context(|| {
+            format!(
+                "failed to create cache directory {}",
+                marker_parent.display()
+            )
+        })?;
+        fs::write(&marker, b"")
+            .with_context(|| format!("failed to write view marker {}", marker.display()))?;
+        Ok(view_root)
     }
 
     pub fn remove_thumbnail(
@@ -4125,7 +4295,7 @@ impl RemoteClient {
         match selector {
             VersionSelector::Current => {}
             VersionSelector::Latest => query.push(("latest", "true".to_string())),
-            VersionSelector::Version(version) => query.push(("version", version.to_string())),
+            VersionSelector::Version(version) => query.push(("version", version.0.to_string())),
         }
         self.get_json("/api/version", &query)
     }
@@ -4417,29 +4587,32 @@ impl RemoteClient {
     }
 }
 
-impl From<ServeConfig> for WebState {
-    fn from(config: ServeConfig) -> Self {
-        let profiles = config
-            .profiles
-            .into_iter()
-            .map(|(name, profile)| {
-                (
-                    name,
-                    WebProfile {
-                        name: profile.name,
-                        store: profile.store,
-                        workspace: profile.workspace,
-                        mutation_lock: Arc::new(Mutex::new(())),
-                    },
-                )
-            })
-            .collect();
-        Self {
+impl WebState {
+    /// Opens every profile's store once and shares the handle across
+    /// requests. RocksDB allows only a single open per store directory, so
+    /// per-request opens would make concurrent API calls race on the LOCK
+    /// file.
+    fn try_new(config: ServeConfig) -> Result<Self> {
+        let mut profiles = BTreeMap::new();
+        for (name, profile) in config.profiles {
+            let store_handle = Arc::new(Store::open(&profile.store)?);
+            profiles.insert(
+                name,
+                WebProfile {
+                    name: profile.name,
+                    store: profile.store,
+                    workspace: profile.workspace,
+                    store_handle,
+                    mutation_lock: Arc::new(Mutex::new(())),
+                },
+            );
+        }
+        Ok(Self {
             auth_token: config.auth_token,
             profiles: Arc::new(profiles),
             max_upload_bytes: config.max_upload_bytes,
             max_object_upload_bytes: config.max_object_upload_bytes,
-        }
+        })
     }
 }
 
@@ -4487,7 +4660,7 @@ impl IntoResponse for ApiError {
 
 async fn serve_web(config: ServeConfig) -> Result<()> {
     let bind = config.bind;
-    let state = Arc::new(WebState::from(config));
+    let state = Arc::new(WebState::try_new(config)?);
     let listener = TcpListener::bind(bind)
         .await
         .with_context(|| format!("failed to bind {bind}"))?;
@@ -4601,7 +4774,7 @@ async fn api_assets(
 ) -> std::result::Result<Json<AssetsResponse>, ApiError> {
     let profile = profile_for(&state, &query.profile)?;
     run_store_read(move || {
-        let store = Store::open(&profile.store)?;
+        let store = profile.store_handle.clone();
         build_asset_cards(&store, &query)
     })
     .await
@@ -4614,7 +4787,7 @@ async fn api_asset(
 ) -> std::result::Result<Json<AssetDetailResponse>, ApiError> {
     let profile = profile_for(&state, &query.profile)?;
     run_store_read(move || {
-        let store = Store::open(&profile.store)?;
+        let store = profile.store_handle.clone();
         let asset_key = AssetKey::new(query.category, query.asset_code)?;
         let info = store.asset_info(&asset_key)?;
         let current_status =
@@ -4637,7 +4810,7 @@ async fn api_versions(
 ) -> std::result::Result<Json<VersionsResponse>, ApiError> {
     let profile = profile_for(&state, &query.profile)?;
     run_store_read(move || {
-        let store = Store::open(&profile.store)?;
+        let store = profile.store_handle.clone();
         let asset_key = AssetKey::new(query.category, query.asset_code)?;
         let department_key = DepartmentKey::new(asset_key, query.department)?;
         let versions = store.list_versions(
@@ -4667,7 +4840,7 @@ async fn api_version_info(
 ) -> std::result::Result<Json<VersionInfo>, ApiError> {
     let profile = profile_for(&state, &query.profile)?;
     run_store_read(move || {
-        let store = Store::open(&profile.store)?;
+        let store = profile.store_handle.clone();
         let asset_key = AssetKey::new(query.category, query.asset_code)?;
         let department_key = DepartmentKey::new(asset_key, query.department)?;
         let selector = if query.latest.unwrap_or(false) {
@@ -4690,7 +4863,7 @@ async fn api_import_version(
     let profile = profile_for(&state, &request.profile)?;
     let lock = profile.mutation_lock.clone();
     run_store_write(lock, move || {
-        let store = Store::open(&profile.store)?;
+        let store = profile.store_handle.clone();
         for entry in &request.version_info.manifest.entries {
             if !store.object_is_valid(&entry.sha256, entry.size)? {
                 bail!(
@@ -4715,7 +4888,7 @@ async fn api_object_status(
     run_store_read(move || {
         validate_sha256(&query.sha256)?;
         let exists = if let Some(size) = query.size {
-            let store = Store::open(&profile.store)?;
+            let store = profile.store_handle.clone();
             store.object_is_valid(&query.sha256, size)?
         } else {
             object_path(&profile.store, &query.sha256).exists()
@@ -4769,7 +4942,7 @@ async fn api_upload_object(
     let lock = profile.mutation_lock.clone();
     run_store_write(lock, move || {
         validate_sha256(&query.sha256)?;
-        let store = Store::open(&profile.store)?;
+        let store = profile.store_handle.clone();
         let size = body.len() as u64;
         let reused = store.object_is_valid(&query.sha256, size)?;
         if !reused {
@@ -4800,7 +4973,7 @@ async fn api_current_status(
         if let Some(department) = &query.department {
             validate_department(department)?;
         }
-        let store = Store::open(&profile.store)?;
+        let store = profile.store_handle.clone();
         store.current_status(
             query.category.as_deref(),
             query.asset_code.as_deref(),
@@ -4818,7 +4991,7 @@ async fn api_update_current(
     let profile = profile_for(&state, &request.profile)?;
     let lock = profile.mutation_lock.clone();
     run_store_write(lock, move || {
-        let store = Store::open(&profile.store)?;
+        let store = profile.store_handle.clone();
         let asset_key = AssetKey::new(request.category, request.asset_code)?;
         let department_key = DepartmentKey::new(asset_key, request.department)?;
         if request.reset.unwrap_or(false) {
@@ -4865,7 +5038,7 @@ async fn api_pull_impl(
     let profile = profile_for(&state, &request.profile)?;
     let lock = profile.mutation_lock.clone();
     run_store_write(lock, move || {
-        let store = Store::open(&profile.store)?;
+        let store = profile.store_handle.clone();
         let asset_key = AssetKey::new(request.category, request.asset_code)?;
         let department_key = DepartmentKey::new(asset_key, request.department)?;
         let selector = if request.latest.unwrap_or(false) {
@@ -4898,7 +5071,7 @@ async fn api_upload_thumbnail(
         fs::write(&temp_path, &upload.bytes)
             .with_context(|| format!("failed to write {}", temp_path.display()))?;
         let result = (|| {
-            let store = Store::open(&profile.store)?;
+            let store = profile.store_handle.clone();
             let asset_key = AssetKey::new(upload.category, upload.asset_code)?;
             let department_key = DepartmentKey::new(asset_key, upload.department)?;
             store.set_thumbnail(&department_key, upload.version, &temp_path)
@@ -4917,7 +5090,7 @@ async fn api_import_thumbnail(
     let profile = profile_for(&state, &request.profile)?;
     let lock = profile.mutation_lock.clone();
     run_store_write(lock, move || {
-        let store = Store::open(&profile.store)?;
+        let store = profile.store_handle.clone();
         store.import_thumbnail_info(&request.thumbnail)?;
         Ok(request.thumbnail)
     })
@@ -4931,7 +5104,7 @@ async fn api_thumbnail_url(
 ) -> std::result::Result<Json<String>, ApiError> {
     let profile = profile_for(&state, &query.profile)?;
     run_store_read(move || {
-        let store = Store::open(&profile.store)?;
+        let store = profile.store_handle.clone();
         let asset_key = AssetKey::new(query.category, query.asset_code)?;
         let department_key = DepartmentKey::new(asset_key, query.department)?;
         let selector = if query.latest.unwrap_or(false) {
@@ -4955,7 +5128,7 @@ async fn api_resolve(
     run_store_read(move || {
         let mode = parse_resolve_mode(query.mode.as_deref().unwrap_or("auto"))?;
         let asset_path = AssetPath::parse(&query.asset_path)?;
-        let store = Store::open(&profile.store)?;
+        let store = profile.store_handle.clone();
         store.resolve_asset_path(&profile.workspace, &asset_path, mode, None)
     })
     .await
@@ -5216,7 +5389,7 @@ fn unique_temp_upload_path() -> PathBuf {
 }
 
 const INDEX_HTML: &str = r#"<!doctype html>
-<html lang="ja">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -5224,72 +5397,121 @@ const INDEX_HTML: &str = r#"<!doctype html>
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-  <div id="auth" class="auth">
-    <form id="authForm" class="auth-panel">
+  <div id="auth" class="auth hidden">
+    <form id="authForm" class="auth-card">
+      <div class="auth-mark">ADS</div>
       <h1>ADS Asset Browser</h1>
-      <input id="tokenInput" type="password" autocomplete="current-password" placeholder="Bearer token">
-      <button type="submit">Connect</button>
+      <p class="auth-note">Production asset store &mdash; authorization required</p>
+      <input id="tokenInput" type="password" autocomplete="current-password" placeholder="Bearer token" spellcheck="false">
+      <button type="submit" class="solid-btn">Unlock</button>
     </form>
   </div>
 
-  <main class="shell">
-    <aside class="sidebar">
-      <div class="brand">ADS</div>
-      <label>Profile<select id="profileSelect"></select></label>
-      <label>Search<input id="searchInput" type="search" placeholder="asset, category, department"></label>
-      <label>Category<select id="categoryFilter"><option value="">All categories</option></select></label>
-      <label>Department<select id="departmentFilter"><option value="">All departments</option></select></label>
-      <button id="refreshButton" type="button">Refresh</button>
-      <button id="logoutButton" type="button" class="ghost">Lock</button>
-      <div id="status" class="status"></div>
+  <div class="shell">
+    <header class="slate">
+      <div class="brand">
+        <span class="brand-badge">ADS</span>
+        <span class="brand-sub">Asset&nbsp;Browser</span>
+      </div>
+      <label class="slate-field">
+        <span class="microlabel">Profile</span>
+        <select id="profileSelect"></select>
+      </label>
+      <div class="slate-search">
+        <input id="searchInput" type="search" placeholder="Search assets, categories, departments&hellip;" spellcheck="false">
+      </div>
+      <div class="slate-right">
+        <span class="schema-chip">SCHEMA&nbsp;V8</span>
+        <span id="connectionLed" class="led" title="Connection"></span>
+        <button id="refreshButton" type="button" class="ghost-btn">Rescan</button>
+        <button id="logoutButton" type="button" class="ghost-btn">Lock</button>
+      </div>
+    </header>
+
+    <aside class="rail">
+      <nav class="rail-block">
+        <h2 class="microlabel">Category</h2>
+        <ul id="categoryList" class="rail-list"></ul>
+      </nav>
+      <nav class="rail-block">
+        <h2 class="microlabel">Department</h2>
+        <ul id="departmentList" class="rail-list"></ul>
+      </nav>
+      <div class="rail-foot">
+        <div id="status" class="status"></div>
+      </div>
     </aside>
 
-    <section class="browser">
-      <header class="toolbar">
-        <div>
-          <h2>Assets</h2>
-          <span id="assetCount">0 assets</span>
-        </div>
-      </header>
-      <div id="assetGrid" class="asset-grid"></div>
-    </section>
+    <main class="stage">
+      <div class="stage-bar">
+        <span id="assetCount" class="count">0 ASSETS</span>
+      </div>
+      <div id="assetGrid" class="grid"></div>
+      <div id="gridEmpty" class="void hidden">
+        <div class="void-cube"></div>
+        <p>No assets match the current filters.</p>
+      </div>
+    </main>
 
-    <aside class="detail">
-      <div id="detailEmpty" class="empty">Select an asset</div>
-      <div id="detailPanel" class="detail-panel hidden">
-        <div class="detail-head">
-          <div>
+    <aside class="inspector">
+      <div id="detailEmpty" class="void">
+        <div class="void-cube"></div>
+        <p>Select an asset to inspect</p>
+      </div>
+      <div id="detailPanel" class="inspector-body hidden">
+        <div class="inspector-head">
+          <div class="inspector-title">
             <h2 id="detailTitle"></h2>
-            <p id="detailSubtitle"></p>
+            <p id="detailSubtitle" class="mono"></p>
           </div>
-          <span id="detailDepartment" class="pill"></span>
+          <span id="detailDepartment" class="dept-tag"></span>
         </div>
-        <div class="preview" id="detailPreview"></div>
-        <label>ADS URI<input id="assetUriInput" type="text" readonly></label>
-        <div class="field-row">
-          <label>Version<select id="versionSelect"></select></label>
-          <label class="check"><input id="forcePull" type="checkbox"> Force</label>
-        </div>
-        <div class="button-row">
-          <button id="setCurrentButton" type="button">Set Current</button>
-          <button id="resetCurrentButton" type="button">Reset</button>
-          <button id="pullButton" type="button">Pull to Workspace</button>
-        </div>
-        <div class="button-row">
-          <button id="copyAssetUriButton" type="button">Copy ADS URI</button>
-          <button id="copyThumbUrlButton" type="button">Copy Thumbnail URL</button>
-          <label class="upload">
-            Upload Thumbnail
-            <input id="thumbnailInput" type="file" accept="image/png,image/jpeg,image/webp">
-          </label>
-        </div>
-        <section>
-          <h3>Versions</h3>
-          <div id="versionList" class="version-list"></div>
+        <div id="detailPreview" class="preview"></div>
+
+        <section class="inspector-section">
+          <h3 class="microlabel">ADS URI</h3>
+          <div class="uri-row">
+            <input id="assetUriInput" type="text" readonly spellcheck="false">
+            <button id="copyAssetUriButton" type="button" class="amber-btn">Copy</button>
+          </div>
+        </section>
+
+        <section class="inspector-section">
+          <h3 class="microlabel">Version</h3>
+          <div class="version-controls">
+            <select id="versionSelect"></select>
+            <label class="force-check"><input id="forcePull" type="checkbox"><span>Force</span></label>
+          </div>
+          <div class="action-row">
+            <button id="setCurrentButton" type="button" class="amber-btn">Pin Current</button>
+            <button id="resetCurrentButton" type="button" class="ghost-btn">Reset</button>
+          </div>
+          <button id="pullButton" type="button" class="solid-btn block-btn">Pull to Workspace</button>
+        </section>
+
+        <section class="inspector-section">
+          <h3 class="microlabel">Take Log</h3>
+          <div id="versionList" class="take-log"></div>
+        </section>
+
+        <section class="inspector-section">
+          <div class="section-head">
+            <h3 class="microlabel">Manifest</h3>
+            <span id="manifestSummary" class="manifest-summary"></span>
+          </div>
+          <div id="manifestList" class="manifest"></div>
+        </section>
+
+        <section class="inspector-section">
+          <h3 class="microlabel">Thumbnail</h3>
+          <div class="action-row">
+            <label class="ghost-btn upload-btn">Upload<input id="thumbnailInput" type="file" accept="image/png,image/jpeg,image/webp"></label>
+            <button id="copyThumbUrlButton" type="button" class="ghost-btn">Copy URL</button>
+          </div>
         </section>
       </div>
     </aside>
-  </main>
+  </div>
   <script src="/app.js"></script>
 </body>
 </html>
@@ -5297,250 +5519,867 @@ const INDEX_HTML: &str = r#"<!doctype html>
 
 const STYLE_CSS: &str = r#":root {
   color-scheme: dark;
-  --bg: #171717;
-  --panel: #202020;
-  --panel-2: #262626;
-  --line: #363636;
-  --text: #ece7dc;
-  --muted: #a59f93;
-  --accent: #d6ff67;
-  --accent-2: #58d0a7;
-  --danger: #ff7a68;
+  --bg: #131210;
+  --panel: #1a1816;
+  --panel-2: #201d1a;
+  --panel-3: #272320;
+  --line: #2c2823;
+  --line-strong: #3d372f;
+  --ink: #e9e4da;
+  --ink-dim: #9b948a;
+  --ink-faint: #6e6759;
+  --amber: #f2a93c;
+  --amber-bright: #ffc14d;
+  --amber-dim: rgba(242, 169, 60, .13);
+  --green: #8cd97c;
+  --red: #e0604a;
+  --mono: 'Cascadia Code', Consolas, 'SF Mono', 'JetBrains Mono', monospace;
+  --sans: Bahnschrift, 'Avenir Next Condensed', 'Segoe UI', 'Helvetica Neue', sans-serif;
+  --radius: 4px;
 }
 
 * { box-sizing: border-box; }
+
+html, body { height: 100%; }
+
 body {
   margin: 0;
-  min-height: 100vh;
-  background: var(--bg);
-  color: var(--text);
-  font-family: "Segoe UI", system-ui, sans-serif;
-  letter-spacing: 0;
+  font-family: var(--sans);
+  font-size: 14px;
+  color: var(--ink);
+  background:
+    radial-gradient(1100px 700px at 75% -12%, rgba(242, 169, 60, .045), transparent 60%),
+    repeating-linear-gradient(0deg, rgba(255, 255, 255, .012) 0 1px, transparent 1px 3px),
+    var(--bg);
+  overflow: hidden;
 }
-button, input, select { font: inherit; }
-button {
-  min-height: 34px;
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  background: var(--accent);
-  color: #111;
-  padding: 0 12px;
-  cursor: pointer;
+
+::selection { background: var(--amber-dim); color: var(--amber-bright); }
+
+:focus-visible { outline: 1px solid var(--amber); outline-offset: 1px; }
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--line-strong); border-radius: 5px; border: 2px solid var(--bg); }
+::-webkit-scrollbar-thumb:hover { background: var(--ink-faint); }
+
+.hidden { display: none !important; }
+
+.mono { font-family: var(--mono); }
+
+.microlabel {
+  margin: 0;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: .16em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
 }
-button.ghost {
-  background: transparent;
-  color: var(--text);
-}
-input, select {
-  width: 100%;
-  min-height: 34px;
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  background: #121212;
-  color: var(--text);
-  padding: 0 10px;
-}
-label {
-  display: grid;
-  gap: 6px;
-  color: var(--muted);
-  font-size: 12px;
-}
+
+/* ---------- shell layout ---------- */
+
 .shell {
   display: grid;
-  grid-template-columns: 260px minmax(360px, 1fr) 380px;
-  min-height: 100vh;
+  grid-template-columns: 218px 1fr 348px;
+  grid-template-rows: 52px 1fr;
+  grid-template-areas:
+    'slate slate slate'
+    'rail  stage inspector';
+  height: 100vh;
 }
-.sidebar, .detail {
-  background: var(--panel);
-  border-color: var(--line);
-  padding: 18px;
+
+@media (max-width: 1280px) {
+  .shell { grid-template-columns: 196px 1fr 312px; }
 }
-.sidebar {
-  display: grid;
-  align-content: start;
-  gap: 14px;
-  border-right: 1px solid var(--line);
+
+/* ---------- top slate ---------- */
+
+.slate {
+  grid-area: slate;
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  padding: 0 16px;
+  background: linear-gradient(180deg, var(--panel-2), var(--panel));
+  border-bottom: 1px solid var(--line-strong);
 }
-.detail { border-left: 1px solid var(--line); }
-.brand {
-  font-size: 28px;
+
+.brand { display: flex; align-items: baseline; gap: 10px; }
+
+.brand-badge {
+  display: inline-block;
+  padding: 3px 9px 2px;
+  background: var(--amber);
+  color: #181307;
   font-weight: 700;
-  color: var(--accent);
+  font-size: 15px;
+  letter-spacing: .22em;
+  border-radius: 2px;
+  transform: translateY(-1px);
 }
-.browser {
-  display: grid;
-  grid-template-rows: auto 1fr;
-  min-width: 0;
+
+.brand-sub {
+  font-size: 11px;
+  letter-spacing: .24em;
+  text-transform: uppercase;
+  color: var(--ink-dim);
 }
-.toolbar {
+
+.slate-field { display: flex; align-items: center; gap: 8px; }
+
+.slate-field select {
+  min-width: 130px;
+}
+
+.slate-search { flex: 1; max-width: 520px; }
+
+.slate-search input {
+  width: 100%;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 7px 12px;
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 12.5px;
+  transition: border-color .15s ease;
+}
+
+.slate-search input:hover { border-color: var(--line-strong); }
+.slate-search input:focus { border-color: var(--amber); outline: none; }
+
+.slate-right { display: flex; align-items: center; gap: 10px; margin-left: auto; }
+
+.schema-chip {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: .1em;
+  color: var(--ink-faint);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 3px 9px;
+}
+
+.led {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--ink-faint);
+  box-shadow: 0 0 0 0 transparent;
+  transition: background .2s ease;
+}
+
+.led.on {
+  background: var(--green);
+  animation: pulse 2.4s ease-in-out infinite;
+}
+
+.led.err { background: var(--red); animation: none; }
+
+@keyframes pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(140, 217, 124, .35); }
+  50% { box-shadow: 0 0 7px 2px rgba(140, 217, 124, .25); }
+}
+
+/* ---------- controls ---------- */
+
+select {
+  appearance: none;
+  background: var(--panel-3);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 12.5px;
+  padding: 6px 26px 6px 10px;
+  background-image: linear-gradient(45deg, transparent 50%, var(--ink-dim) 50%),
+    linear-gradient(135deg, var(--ink-dim) 50%, transparent 50%);
+  background-position: calc(100% - 15px) 55%, calc(100% - 10px) 55%;
+  background-size: 5px 5px;
+  background-repeat: no-repeat;
+  cursor: pointer;
+  transition: border-color .15s ease;
+}
+
+select:hover { border-color: var(--ink-faint); }
+select:focus { border-color: var(--amber); outline: none; }
+
+button { font-family: var(--sans); cursor: pointer; }
+
+.ghost-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  background: transparent;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  color: var(--ink-dim);
+  font-size: 12px;
+  letter-spacing: .06em;
+  padding: 6px 12px;
+  transition: color .15s ease, border-color .15s ease, background .15s ease;
+}
+
+.ghost-btn:hover { color: var(--ink); border-color: var(--ink-faint); background: var(--panel-2); }
+
+.amber-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: 1px solid var(--amber);
+  border-radius: var(--radius);
+  color: var(--amber);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: .06em;
+  padding: 6px 12px;
+  transition: background .15s ease, color .15s ease;
+}
+
+.amber-btn:hover { background: var(--amber-dim); color: var(--amber-bright); }
+
+.solid-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--amber);
+  border: 1px solid var(--amber);
+  border-radius: var(--radius);
+  color: #181307;
+  font-size: 12.5px;
+  font-weight: 700;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  padding: 8px 14px;
+  transition: background .15s ease, transform .1s ease;
+}
+
+.solid-btn:hover { background: var(--amber-bright); }
+.solid-btn:active { transform: translateY(1px); }
+
+.block-btn { width: 100%; margin-top: 8px; }
+
+/* ---------- left rail ---------- */
+
+.rail {
+  grid-area: rail;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  padding: 16px 12px 12px;
+  background: var(--panel);
+  border-right: 1px solid var(--line);
+  overflow-y: auto;
+}
+
+.rail-block .microlabel { padding: 0 6px 8px; }
+
+.rail-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 1px; }
+
+.rail-item {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 18px 22px;
+  gap: 8px;
+  padding: 6px 9px;
+  border-radius: 3px;
+  border-left: 2px solid transparent;
+  color: var(--ink-dim);
+  font-size: 13px;
+  cursor: pointer;
+  transition: background .12s ease, color .12s ease;
+}
+
+.rail-item:hover { background: var(--panel-2); color: var(--ink); }
+
+.rail-item.active {
+  background: var(--amber-dim);
+  border-left-color: var(--amber);
+  color: var(--amber-bright);
+}
+
+.rail-label {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dept-dot {
+  flex-shrink: 0;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: hsl(var(--dh) 50% 58%);
+  box-shadow: 0 0 4px hsl(var(--dh) 50% 58% / .4);
+}
+
+.rail-item .n {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--ink-faint);
+}
+
+.rail-item.active .n { color: var(--amber); }
+
+.rail-foot { margin-top: auto; padding: 6px; }
+
+.status {
+  min-height: 16px;
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--ink-faint);
+  word-break: break-word;
+}
+
+.status.ok { color: var(--green); }
+.status.err { color: var(--red); }
+
+/* ---------- stage / asset grid ---------- */
+
+.stage {
+  grid-area: stage;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.stage-bar {
+  display: flex;
+  align-items: center;
+  padding: 12px 18px 4px;
+}
+
+.count {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: .14em;
+  color: var(--ink-faint);
+}
+
+.grid {
+  flex: 1;
+  overflow-y: auto;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(168px, 1fr));
+  /* Explicit row sizing: Chromium collapses `auto` rows to near-zero in
+     scrollable grids with thousands of rows. */
+  grid-auto-rows: max-content;
+  gap: 12px;
+  align-content: start;
+  padding: 12px 18px 24px;
+}
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  overflow: hidden;
+  cursor: pointer;
+  animation: rise .4s ease backwards;
+  transition: transform .15s ease, border-color .15s ease, box-shadow .15s ease;
+}
+
+.card:hover {
+  transform: translateY(-2px);
+  border-color: var(--line-strong);
+  box-shadow: 0 8px 20px rgba(0, 0, 0, .45);
+}
+
+.card.active {
+  border-color: var(--amber);
+  box-shadow: 0 0 0 1px var(--amber), 0 10px 24px rgba(0, 0, 0, .5);
+}
+
+.card:nth-child(1) { animation-delay: .02s; }
+.card:nth-child(2) { animation-delay: .05s; }
+.card:nth-child(3) { animation-delay: .08s; }
+.card:nth-child(4) { animation-delay: .11s; }
+.card:nth-child(5) { animation-delay: .14s; }
+.card:nth-child(6) { animation-delay: .17s; }
+.card:nth-child(7) { animation-delay: .2s; }
+.card:nth-child(8) { animation-delay: .23s; }
+.card:nth-child(9) { animation-delay: .26s; }
+.card:nth-child(10) { animation-delay: .29s; }
+.card:nth-child(11) { animation-delay: .32s; }
+.card:nth-child(12) { animation-delay: .35s; }
+
+@keyframes rise {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: none; }
+}
+
+.thumb {
+  position: relative;
+  aspect-ratio: 4 / 3;
+  background:
+    url('data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 80 80%22%3E%3Cg fill=%22none%22 stroke=%22%23332e28%22 stroke-width=%221%22%3E%3Cpath d=%22M40 14 66 28v24L40 66 14 52V28z%22/%3E%3Cpath d=%22M40 14v24m0 0L14 28m26 10 26-10M40 38v28%22/%3E%3C/g%3E%3C/svg%3E') center / 64px no-repeat,
+    linear-gradient(160deg, var(--panel-2), var(--panel));
   border-bottom: 1px solid var(--line);
 }
-.toolbar h2, .detail h2, .detail h3 { margin: 0; }
-.toolbar span, .status, .detail p { color: var(--muted); }
-.asset-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
-  gap: 14px;
-  padding: 18px;
-  align-content: start;
-  overflow: auto;
-}
-.asset-card {
-  display: grid;
-  grid-template-rows: 130px auto;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  overflow: hidden;
-  background: var(--panel-2);
-  cursor: pointer;
-}
-.asset-card.active { outline: 2px solid var(--accent); }
-.thumb {
-  display: grid;
-  place-items: center;
-  background: #101010;
-  color: var(--muted);
-  min-height: 130px;
-  overflow: hidden;
-}
+
 .thumb img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.dept-badge {
+  position: absolute;
+  top: 6px;
+  left: 6px;
+  max-width: calc(100% - 12px);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  padding: 2px 7px;
+  border-radius: 2px;
+  background: rgba(12, 11, 9, .78);
+  border: 1px solid hsl(var(--dh) 45% 60% / .55);
+  color: hsl(var(--dh) 55% 70%);
+  pointer-events: none;
+}
+
+.card-meta { padding: 9px 10px 10px; display: flex; flex-direction: column; gap: 4px; }
+
+.card-name {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  font-weight: 600;
+  font-size: 13.5px;
+  letter-spacing: .02em;
+}
+
+.card-name .ver {
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--amber);
+}
+
+.card-sub {
+  font-size: 11px;
+  color: var(--ink-faint);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ---------- empty states ---------- */
+
+.void {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  color: var(--ink-faint);
+  font-size: 12.5px;
+  letter-spacing: .04em;
+  padding: 32px;
+  text-align: center;
+}
+
+.void-cube {
+  width: 72px;
+  height: 72px;
+  background: url('data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 80 80%22%3E%3Cg fill=%22none%22 stroke=%22%233d372f%22 stroke-width=%221.2%22%3E%3Cpath d=%22M40 10 70 26v28L40 70 10 54V26z%22/%3E%3Cpath d=%22M40 10v28m0 0L10 26m30 12 30-12M40 38v32%22/%3E%3C/g%3E%3C/svg%3E') center / contain no-repeat;
+  opacity: .9;
+}
+
+/* ---------- inspector ---------- */
+
+.inspector {
+  grid-area: inspector;
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+  border-left: 1px solid var(--line);
+  overflow-y: auto;
+}
+
+.inspector-body {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  padding: 18px 16px 24px;
+  animation: rise .3s ease backwards;
+}
+
+.inspector-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.inspector-title h2 {
+  margin: 0;
+  font-size: 19px;
+  font-weight: 700;
+  letter-spacing: .02em;
+}
+
+.inspector-title p {
+  margin: 3px 0 0;
+  font-size: 11px;
+  color: var(--ink-faint);
+}
+
+.dept-tag {
+  flex-shrink: 0;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: hsl(var(--dh, 38) 55% 70%);
+  background: hsl(var(--dh, 38) 45% 60% / .1);
+  border: 1px solid hsl(var(--dh, 38) 45% 60% / .5);
+  border-radius: 2px;
+  padding: 3px 8px;
+}
+
+.preview {
+  position: relative;
+  aspect-ratio: 16 / 10;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  overflow: hidden;
+  background:
+    url('data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 80 80%22%3E%3Cg fill=%22none%22 stroke=%22%23332e28%22 stroke-width=%221%22%3E%3Cpath d=%22M40 14 66 28v24L40 66 14 52V28z%22/%3E%3Cpath d=%22M40 14v24m0 0L14 28m26 10 26-10M40 38v28%22/%3E%3C/g%3E%3C/svg%3E') center / 72px no-repeat,
+    linear-gradient(160deg, var(--panel-2), var(--bg));
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--ink-faint);
+  font-size: 11.5px;
+  letter-spacing: .06em;
+}
+
+.preview img {
+  position: absolute;
+  inset: 0;
   width: 100%;
   height: 100%;
   object-fit: cover;
 }
-.asset-meta {
-  display: grid;
-  gap: 6px;
-  padding: 10px;
+
+.inspector-section { display: flex; flex-direction: column; gap: 9px; }
+
+.uri-row { display: flex; gap: 8px; }
+
+.uri-row input {
+  flex: 1;
+  min-width: 0;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  color: var(--amber-bright);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  padding: 7px 10px;
 }
-.asset-name {
-  display: flex;
-  justify-content: space-between;
-  gap: 8px;
-  font-weight: 650;
-}
-.asset-sub {
-  color: var(--muted);
-  font-size: 12px;
-  overflow-wrap: anywhere;
-}
-.pill {
+
+.uri-row input:focus { border-color: var(--amber); outline: none; }
+
+.version-controls { display: flex; align-items: center; gap: 10px; }
+
+.version-controls select { flex: 1; }
+
+.force-check {
   display: inline-flex;
   align-items: center;
-  width: fit-content;
-  min-height: 24px;
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  padding: 0 8px;
-  color: var(--accent-2);
+  gap: 6px;
   font-size: 12px;
-}
-.detail-panel { display: grid; gap: 16px; }
-.hidden { display: none !important; }
-.empty {
-  display: grid;
-  place-items: center;
-  min-height: 240px;
-  color: var(--muted);
-}
-.detail-head {
-  display: flex;
-  align-items: start;
-  justify-content: space-between;
-  gap: 12px;
-}
-.preview {
-  display: grid;
-  place-items: center;
-  min-height: 210px;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: #111;
-  overflow: hidden;
-}
-.preview img {
-  width: 100%;
-  height: 100%;
-  object-fit: contain;
-}
-.field-row, .button-row {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 10px;
-}
-.button-row { grid-template-columns: repeat(3, 1fr); }
-.check {
-  display: flex;
-  align-items: end;
-  gap: 8px;
-}
-.check input { width: auto; }
-.upload {
-  display: grid;
-  place-items: center;
-  min-height: 34px;
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  background: #151515;
-  color: var(--text);
+  color: var(--ink-dim);
   cursor: pointer;
+  user-select: none;
 }
-.upload input { display: none; }
-.version-list {
+
+.force-check input { accent-color: var(--amber); }
+
+.action-row { display: flex; gap: 8px; }
+
+.action-row > * { flex: 1; }
+
+.upload-btn { position: relative; overflow: hidden; }
+
+.upload-btn input { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
+
+/* ---------- take log ---------- */
+
+.take-log {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  overflow: hidden;
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+.take {
   display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 10px;
+  border-left: 2px solid transparent;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+  cursor: pointer;
+  transition: background .12s ease;
+}
+
+.take:last-child { border-bottom: none; }
+
+.take:hover { background: var(--panel-2); }
+
+.take.selected { background: var(--panel-3); }
+
+.take.current { border-left-color: var(--amber); background: var(--amber-dim); }
+
+.take .v {
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.take.current .v { color: var(--amber-bright); }
+
+.take .meta {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--ink-faint);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.take .tag {
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: .12em;
+  padding: 2px 6px;
+  border-radius: 2px;
+}
+
+.take .tag.pin { background: var(--amber); color: #181307; }
+
+.take .tag.latest { border: 1px solid var(--line-strong); color: var(--ink-faint); }
+
+/* ---------- manifest ---------- */
+
+.section-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
   gap: 8px;
 }
-.version-row {
-  display: grid;
-  grid-template-columns: 56px 1fr auto;
-  gap: 10px;
-  align-items: center;
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  padding: 8px;
-  background: #181818;
+
+.manifest-summary {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: .06em;
+  color: var(--ink-faint);
 }
+
+.manifest {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+.file-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+  cursor: pointer;
+  transition: background .12s ease;
+}
+
+.file-row:last-child { border-bottom: none; }
+
+.file-row:hover { background: var(--panel-2); }
+
+.file-row:hover .file-path { color: var(--amber-bright); }
+
+.file-dot {
+  flex-shrink: 0;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: hsl(var(--dh) 50% 58%);
+}
+
+.file-dot.neutral { background: var(--line-strong); }
+
+.file-path {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: color .12s ease;
+}
+
+.file-size {
+  flex-shrink: 0;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--ink-faint);
+}
+
+/* ---------- auth gate ---------- */
+
 .auth {
   position: fixed;
   inset: 0;
-  z-index: 5;
-  display: grid;
-  place-items: center;
-  background: rgba(10, 10, 10, .92);
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background:
+    radial-gradient(900px 600px at 50% 0%, rgba(242, 169, 60, .05), transparent 60%),
+    rgba(12, 11, 10, .92);
+  backdrop-filter: blur(6px);
 }
-.auth.hidden { display: none; }
-.auth-panel {
-  display: grid;
+
+.auth-card {
+  display: flex;
+  flex-direction: column;
   gap: 14px;
-  width: min(360px, calc(100vw - 32px));
-  padding: 24px;
-  border: 1px solid var(--line);
-  border-radius: 8px;
+  width: min(360px, calc(100vw - 48px));
+  padding: 30px 28px 28px;
   background: var(--panel);
+  border: 1px solid var(--line-strong);
+  border-top: 2px solid var(--amber);
+  border-radius: 6px;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, .6);
+  animation: rise .35s ease backwards;
 }
-@media (max-width: 980px) {
-  .shell { grid-template-columns: 220px 1fr; }
-  .detail { grid-column: 1 / -1; border-left: 0; border-top: 1px solid var(--line); }
+
+.auth-mark {
+  align-self: flex-start;
+  padding: 4px 12px 3px;
+  background: var(--amber);
+  color: #181307;
+  font-weight: 700;
+  font-size: 18px;
+  letter-spacing: .26em;
+  border-radius: 2px;
 }
+
+.auth-card h1 { margin: 2px 0 0; font-size: 17px; font-weight: 600; letter-spacing: .03em; }
+
+.auth-note {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+
+.auth-card input {
+  background: var(--bg);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 13px;
+  padding: 9px 12px;
+}
+
+.auth-card input:focus { border-color: var(--amber); outline: none; }
 "#;
 
 const APP_JS: &str = r#"const state = {
   token: sessionStorage.getItem('adsToken') || '',
   profile: '',
+  allAssets: [],
   assets: [],
+  category: '',
+  department: '',
   selected: null,
   versions: [],
-  selectedVersion: ''
+  selectedVersion: '',
+  manifestCache: new Map()
 };
 
 const $ = (id) => document.getElementById(id);
-const status = (text) => { $('status').textContent = text || ''; };
 const esc = (value) => String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+// Versions are plain integers on the wire (schema v8); v### is display-only sugar.
+const fmtVersion = (version) => (version === null || version === undefined || version === '') ? '-' : 'v' + String(version).padStart(3, '0');
+
+// Department badge hues: fixed palette for the canonical departments, stable
+// hash fallback for custom names. The amber zone (~38) is reserved for the
+// app accent, so fx sits at red instead.
+const DEPT_HUES = {model: 210, lookdev: 268, texture: 175, textures: 175, tex: 175, rig: 330, anim: 110, layout: 75, fx: 8};
+function deptHue(name) {
+  const key = String(name || '').toLowerCase();
+  if (key in DEPT_HUES) return DEPT_HUES[key];
+  let hash = 0;
+  for (const ch of key) hash = (hash * 31 + ch.charCodeAt(0)) >>> 0;
+  return hash % 360;
+}
+
+let statusTimer = null;
+function status(text, kind) {
+  const node = $('status');
+  node.textContent = text || '';
+  node.className = 'status' + (kind ? ' ' + kind : '');
+  clearTimeout(statusTimer);
+  if (text && kind === 'ok') {
+    statusTimer = setTimeout(() => { node.textContent = ''; node.className = 'status'; }, 4000);
+  }
+}
+
+function led(stateName) {
+  $('connectionLed').className = 'led' + (stateName ? ' ' + stateName : '');
+}
+
+function humanBytes(bytes) {
+  if (!Number.isFinite(bytes)) return '-';
+  if (bytes < 1024) return bytes + ' B';
+  const units = ['KB', 'MB', 'GB', 'TB'];
+  let value = bytes;
+  let unit = '';
+  for (const next of units) {
+    value /= 1024;
+    unit = next;
+    if (value < 1024) break;
+  }
+  return value.toFixed(value < 10 ? 1 : 0) + ' ' + unit;
+}
 
 async function copyText(text) {
   try {
@@ -5569,6 +6408,7 @@ async function api(path, options = {}) {
   const res = await fetch(path, {...options, headers});
   if (res.status === 401) {
     sessionStorage.removeItem('adsToken');
+    led('err');
     $('auth').classList.remove('hidden');
   }
   if (!res.ok) {
@@ -5590,6 +6430,7 @@ function qs(params) {
 async function init() {
   if (!state.token) {
     $('auth').classList.remove('hidden');
+    led('');
     return;
   }
   $('auth').classList.add('hidden');
@@ -5597,54 +6438,72 @@ async function init() {
   const select = $('profileSelect');
   select.innerHTML = data.profiles.map(p => `<option value="${esc(p.name)}">${esc(p.name)}</option>`).join('');
   state.profile = select.value || data.profiles[0]?.name || '';
+  led('on');
   await loadAssets();
 }
 
 async function loadAssets() {
   if (!state.profile) return;
-  status('Loading');
-  const params = {
-    profile: state.profile,
-    q: $('searchInput').value,
-    category: $('categoryFilter').value,
-    department: $('departmentFilter').value
-  };
+  status('Scanning store…');
+  const params = {profile: state.profile, q: $('searchInput').value};
   const data = await api(`/api/assets?${qs(params)}`);
-  state.assets = data.assets;
-  renderFilters(data.assets);
-  renderAssets();
+  state.allAssets = data.assets;
   status('');
+  applyFilters();
 }
 
-function renderFilters(assets) {
-  const currentCategory = $('categoryFilter').value;
-  const currentDepartment = $('departmentFilter').value;
-  const categories = [...new Set(assets.map(a => a.category))].sort();
-  const departments = [...new Set(assets.map(a => a.department))].sort();
-  $('categoryFilter').innerHTML = '<option value="">All categories</option>' + categories.map(v => `<option value="${esc(v)}">${esc(v)}</option>`).join('');
-  $('departmentFilter').innerHTML = '<option value="">All departments</option>' + departments.map(v => `<option value="${esc(v)}">${esc(v)}</option>`).join('');
-  $('categoryFilter').value = categories.includes(currentCategory) ? currentCategory : '';
-  $('departmentFilter').value = departments.includes(currentDepartment) ? currentDepartment : '';
+function applyFilters() {
+  if (state.category && !state.allAssets.some(a => a.category === state.category)) state.category = '';
+  if (state.department && !state.allAssets.some(a => a.department === state.department)) state.department = '';
+  state.assets = state.allAssets.filter(a =>
+    (!state.category || a.category === state.category) &&
+    (!state.department || a.department === state.department));
+  renderRails();
+  renderGrid();
 }
 
-function renderAssets() {
-  $('assetCount').textContent = `${state.assets.length} assets`;
+function railItems(values, selected, withDot) {
+  const counts = new Map();
+  values.forEach(v => counts.set(v, (counts.get(v) || 0) + 1));
+  const keys = [...counts.keys()].sort();
+  const label = (key) => withDot
+    ? `<span class="rail-label"><span class="dept-dot" style="--dh:${deptHue(key)}"></span>${esc(key)}</span>`
+    : `<span class="rail-label">${esc(key)}</span>`;
+  const all = `<li class="rail-item${selected === '' ? ' active' : ''}" data-value=""><span class="rail-label">All</span><span class="n">${values.length}</span></li>`;
+  return all + keys.map(key =>
+    `<li class="rail-item${selected === key ? ' active' : ''}" data-value="${esc(key)}">${label(key)}<span class="n">${counts.get(key)}</span></li>`
+  ).join('');
+}
+
+function renderRails() {
+  $('categoryList').innerHTML = railItems(state.allAssets.map(a => a.category), state.category, false);
+  $('departmentList').innerHTML = railItems(state.allAssets.map(a => a.department), state.department, true);
+  $('categoryList').querySelectorAll('.rail-item').forEach(item => {
+    item.addEventListener('click', () => { state.category = item.dataset.value; applyFilters(); });
+  });
+  $('departmentList').querySelectorAll('.rail-item').forEach(item => {
+    item.addEventListener('click', () => { state.department = item.dataset.value; applyFilters(); });
+  });
+}
+
+function renderGrid() {
+  const count = state.assets.length;
+  $('assetCount').textContent = `${count} ASSET${count === 1 ? '' : 'S'}`;
+  $('gridEmpty').classList.toggle('hidden', count > 0);
   $('assetGrid').innerHTML = state.assets.map(asset => {
     const key = assetKey(asset);
     const active = state.selected && assetKey(state.selected) === key ? ' active' : '';
-    const thumb = asset.thumbnail_url
-      ? `<img src="${esc(asset.thumbnail_url)}" alt="">`
-      : `<span>${esc(asset.asset_code)}</span>`;
-    return `<article class="asset-card${active}" data-key="${esc(key)}">
-      <div class="thumb">${thumb}</div>
-      <div class="asset-meta">
-        <div class="asset-name"><span>${esc(asset.asset_code)}</span><span>${esc(asset.current || '-')}</span></div>
-        <div class="asset-sub">${esc(asset.category)} / ${esc(asset.department)}</div>
-        <div class="asset-sub">${asset.version_count} versions, latest ${esc(asset.latest || '-')}</div>
+    const thumb = asset.thumbnail_url ? `<img src="${esc(asset.thumbnail_url)}" alt="" loading="lazy" onerror="this.remove()">` : '';
+    return `<article class="card${active}" data-key="${esc(key)}">
+      <div class="thumb">${thumb}<span class="dept-badge" style="--dh:${deptHue(asset.department)}">${esc(asset.department)}</span></div>
+      <div class="card-meta">
+        <div class="card-name"><span>${esc(asset.asset_code)}</span><span class="ver">${fmtVersion(asset.current)}</span></div>
+        <div class="card-sub">${esc(asset.category)}</div>
+        <div class="card-sub">${asset.version_count} versions · latest ${fmtVersion(asset.latest)}</div>
       </div>
     </article>`;
   }).join('');
-  document.querySelectorAll('.asset-card').forEach(card => {
+  document.querySelectorAll('.card').forEach(card => {
     card.addEventListener('click', () => {
       const asset = state.assets.find(item => assetKey(item) === card.dataset.key);
       if (asset) selectAsset(asset).catch(showError);
@@ -5652,14 +6511,24 @@ function renderAssets() {
   });
 }
 
+function setActiveCard(key) {
+  document.querySelectorAll('.card.active').forEach(card => card.classList.remove('active'));
+  const card = document.querySelector(`.card[data-key="${CSS.escape(key)}"]`);
+  if (card) card.classList.add('active');
+}
+
 async function selectAsset(asset) {
   state.selected = asset;
   state.selectedVersion = asset.current || asset.latest || '';
-  renderAssets();
+  // Class swap instead of re-rendering the grid: with thousands of cards a
+  // full rebuild costs ~80ms per click and reloads thumbnails.
+  setActiveCard(assetKey(asset));
   const params = {profile: state.profile, category: asset.category, asset_code: asset.asset_code, department: asset.department};
   const data = await api(`/api/versions?${qs(params)}`);
   state.versions = data.versions;
+  state.lastCurrentStatus = data.current_status;
   renderDetail(asset, data);
+  await loadManifest($('versionSelect').value);
 }
 
 function renderDetail(asset, data) {
@@ -5668,15 +6537,100 @@ function renderDetail(asset, data) {
   $('detailTitle').textContent = asset.asset_code;
   $('detailSubtitle').textContent = asset.category;
   $('detailDepartment').textContent = asset.department;
-  $('detailPreview').innerHTML = asset.thumbnail_url ? `<img src="${esc(asset.thumbnail_url)}" alt="">` : '<span>No thumbnail URL</span>';
-  const options = data.versions.map(v => `<option value="${esc(v.version)}">${esc(v.version)}</option>`).join('');
+  $('detailDepartment').style.setProperty('--dh', deptHue(asset.department));
+  $('detailPreview').innerHTML = asset.thumbnail_url ? `<img src="${esc(asset.thumbnail_url)}" alt="" onerror="this.remove()">` : '<span>NO THUMBNAIL</span>';
+  const options = data.versions.map(v => `<option value="${esc(v.version)}">${fmtVersion(v.version)}</option>`).join('');
   $('versionSelect').innerHTML = options;
-  $('versionSelect').value = state.selectedVersion || data.current_status.current || data.current_status.latest || '';
+  $('versionSelect').value = String(state.selectedVersion || data.current_status.current || data.current_status.latest || '');
   updateAssetUriField();
-  $('versionList').innerHTML = data.versions.map(v => {
-    const marker = v.version === data.current_status.current ? 'Current' : '';
-    return `<div class="version-row"><strong>${esc(v.version)}</strong><span>${v.file_count} files / ${v.total_bytes} bytes</span><span>${marker}</span></div>`;
+  renderTakeLog(data);
+}
+
+function renderTakeLog(data) {
+  const selected = $('versionSelect').value;
+  const currentStatus = data.current_status || {};
+  $('versionList').innerHTML = data.versions.slice().reverse().map(v => {
+    const isCurrent = v.version === currentStatus.current;
+    const isLatest = v.version === currentStatus.latest;
+    const isSelected = String(v.version) === selected;
+    const date = (v.created_at || '').slice(0, 10);
+    const tag = isCurrent
+      ? '<span class="tag pin">PIN</span>'
+      : (isLatest ? '<span class="tag latest">LATEST</span>' : '');
+    return `<div class="take${isCurrent ? ' current' : ''}${isSelected ? ' selected' : ''}" data-version="${esc(v.version)}">
+      <span class="v">${fmtVersion(v.version)}</span>
+      <span class="meta">${v.file_count} files · ${humanBytes(v.total_bytes)}${date ? ' · ' + esc(date) : ''}</span>
+      ${tag}
+    </div>`;
   }).join('');
+  $('versionList').querySelectorAll('.take').forEach(row => {
+    row.addEventListener('click', () => {
+      $('versionSelect').value = row.dataset.version;
+      state.selectedVersion = row.dataset.version;
+      updateAssetUriField();
+      renderTakeLog(data);
+      loadManifest(row.dataset.version).catch(showError);
+    });
+  });
+}
+
+const USD_EXTENSIONS = ['usd', 'usda', 'usdc', 'usdz'];
+const TEXTURE_EXTENSIONS = ['tx', 'rat', 'exr', 'tif', 'tiff', 'png', 'jpg', 'jpeg', 'tga', 'bmp', 'hdr', 'pic', 'tex'];
+
+function fileKindHue(path) {
+  const ext = String(path).split('.').pop().toLowerCase();
+  if (USD_EXTENSIONS.includes(ext)) return 38;
+  if (TEXTURE_EXTENSIONS.includes(ext)) return 175;
+  return null;
+}
+
+async function loadManifest(version) {
+  const asset = state.selected;
+  if (!asset || version === '' || version === null || version === undefined) return;
+  const cacheKey = `${state.profile}/${assetKey(asset)}@${version}`;
+  let info = state.manifestCache.get(cacheKey);
+  if (!info) {
+    const params = {profile: state.profile, category: asset.category, asset_code: asset.asset_code, department: asset.department, version};
+    info = await api(`/api/version?${qs(params)}`);
+    state.manifestCache.set(cacheKey, info);
+  }
+  renderManifest(info, version);
+}
+
+function renderManifest(info, version) {
+  const entries = (info.manifest && info.manifest.entries) || [];
+  const total = entries.reduce((sum, entry) => sum + entry.size, 0);
+  $('manifestSummary').textContent = entries.length
+    ? `${entries.length} file${entries.length === 1 ? '' : 's'} · ${humanBytes(total)}`
+    : 'empty';
+  $('manifestList').innerHTML = entries.map(entry => {
+    const hue = fileKindHue(entry.relative_path);
+    const dot = hue === null
+      ? '<span class="file-dot neutral"></span>'
+      : `<span class="file-dot" style="--dh:${hue}"></span>`;
+    return `<div class="file-row" data-path="${esc(entry.relative_path)}" title="sha256 ${esc(entry.sha256)} — click to copy ads:// URI">
+      ${dot}
+      <span class="file-path">${esc(entry.relative_path)}</span>
+      <span class="file-size">${humanBytes(entry.size)}</span>
+    </div>`;
+  }).join('');
+  $('manifestList').querySelectorAll('.file-row').forEach(row => {
+    row.addEventListener('click', async () => {
+      const asset = state.selected;
+      if (!asset) return;
+      const uri = `ads://${asset.category}/${asset.asset_code}/${asset.department}/${row.dataset.path}?v=${encodeURIComponent(version)}`;
+      const copied = await copyText(uri);
+      status(copied ? `Copied ${uri}` : `Clipboard blocked. ${uri}`, copied ? 'ok' : 'err');
+    });
+  });
+}
+
+async function refreshSelection() {
+  await loadAssets();
+  const asset = state.selected;
+  if (!asset) return;
+  const refreshed = state.assets.find(item => assetKey(item) === assetKey(asset));
+  if (refreshed) await selectAsset(refreshed);
 }
 
 async function setCurrent() {
@@ -5684,26 +6638,25 @@ async function setCurrent() {
   if (!asset) return;
   const version = $('versionSelect').value;
   await api('/api/current', {method: 'PUT', body: JSON.stringify({profile: state.profile, category: asset.category, asset_code: asset.asset_code, department: asset.department, version})});
-  await loadAssets();
-  const refreshed = state.assets.find(item => assetKey(item) === assetKey(asset));
-  if (refreshed) await selectAsset(refreshed);
+  await refreshSelection();
+  status(`Pinned current to ${fmtVersion(version)}`, 'ok');
 }
 
 async function resetCurrent() {
   const asset = state.selected;
   if (!asset) return;
   await api('/api/current', {method: 'PUT', body: JSON.stringify({profile: state.profile, category: asset.category, asset_code: asset.asset_code, department: asset.department, reset: true})});
-  await loadAssets();
-  const refreshed = state.assets.find(item => assetKey(item) === assetKey(asset));
-  if (refreshed) await selectAsset(refreshed);
+  await refreshSelection();
+  status('Current follows latest', 'ok');
 }
 
 async function pullToWorkspace() {
   const asset = state.selected;
   if (!asset) return;
   const version = $('versionSelect').value;
+  status('Pulling…');
   await api('/api/pull', {method: 'POST', body: JSON.stringify({profile: state.profile, category: asset.category, asset_code: asset.asset_code, department: asset.department, version, force: $('forcePull').checked})});
-  status('Pulled to workspace');
+  status(`Pulled ${fmtVersion(version)} to workspace`, 'ok');
 }
 
 async function copyThumbUrl() {
@@ -5712,7 +6665,7 @@ async function copyThumbUrl() {
   const version = $('versionSelect').value;
   const url = await api(`/api/thumbnail-url?${qs({profile: state.profile, category: asset.category, asset_code: asset.asset_code, department: asset.department, version})}`);
   const copied = await copyText(url);
-  status(copied ? 'Thumbnail URL copied' : `Clipboard blocked. Thumbnail URL: ${url}`);
+  status(copied ? 'Thumbnail URL copied' : `Clipboard blocked. Thumbnail URL: ${url}`, copied ? 'ok' : 'err');
 }
 
 function assetUri(asset, version) {
@@ -5732,7 +6685,7 @@ async function copyAssetUri() {
   updateAssetUriField();
   const uri = $('assetUriInput').value;
   const copied = await copyText(uri);
-  status(copied ? `ADS URI copied: ${uri}` : `Clipboard blocked. ADS URI: ${uri}`);
+  status(copied ? 'ADS URI copied' : `Clipboard blocked. ADS URI: ${uri}`, copied ? 'ok' : 'err');
 }
 
 async function uploadThumbnail() {
@@ -5746,10 +6699,10 @@ async function uploadThumbnail() {
   form.set('department', asset.department);
   form.set('version', $('versionSelect').value);
   form.set('file', file);
+  status('Uploading thumbnail…');
   await api('/api/thumbnails', {method: 'POST', body: form});
-  await loadAssets();
-  const refreshed = state.assets.find(item => assetKey(item) === assetKey(asset));
-  if (refreshed) await selectAsset(refreshed);
+  await refreshSelection();
+  status('Thumbnail uploaded', 'ok');
 }
 
 function assetKey(asset) {
@@ -5757,8 +6710,14 @@ function assetKey(asset) {
 }
 
 function showError(error) {
-  status(error.message || String(error));
+  status(error.message || String(error), 'err');
 }
+
+let searchTimer = null;
+$('searchInput').addEventListener('input', () => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => loadAssets().catch(showError), 250);
+});
 
 $('authForm').addEventListener('submit', event => {
   event.preventDefault();
@@ -5766,16 +6725,25 @@ $('authForm').addEventListener('submit', event => {
   sessionStorage.setItem('adsToken', state.token);
   init().catch(showError);
 });
-$('profileSelect').addEventListener('change', () => { state.profile = $('profileSelect').value; loadAssets().catch(showError); });
-$('searchInput').addEventListener('input', () => loadAssets().catch(showError));
-$('categoryFilter').addEventListener('change', () => loadAssets().catch(showError));
-$('departmentFilter').addEventListener('change', () => loadAssets().catch(showError));
+$('profileSelect').addEventListener('change', () => {
+  state.profile = $('profileSelect').value;
+  state.category = '';
+  state.department = '';
+  loadAssets().catch(showError);
+});
 $('refreshButton').addEventListener('click', () => loadAssets().catch(showError));
 $('logoutButton').addEventListener('click', () => { sessionStorage.removeItem('adsToken'); location.reload(); });
 $('setCurrentButton').addEventListener('click', () => setCurrent().catch(showError));
 $('resetCurrentButton').addEventListener('click', () => resetCurrent().catch(showError));
 $('pullButton').addEventListener('click', () => pullToWorkspace().catch(showError));
-$('versionSelect').addEventListener('change', updateAssetUriField);
+$('versionSelect').addEventListener('change', () => {
+  state.selectedVersion = $('versionSelect').value;
+  updateAssetUriField();
+  if (state.selected) {
+    renderTakeLog({versions: state.versions, current_status: state.lastCurrentStatus || {}});
+    loadManifest(state.selectedVersion).catch(showError);
+  }
+});
 $('copyAssetUriButton').addEventListener('click', () => copyAssetUri().catch(showError));
 $('copyThumbUrlButton').addEventListener('click', () => copyThumbUrl().catch(showError));
 $('thumbnailInput').addEventListener('change', () => uploadThumbnail().catch(showError));
@@ -6158,6 +7126,20 @@ fn normalized_extension(path: &str) -> Option<String> {
         .map(|extension| extension.to_ascii_lowercase())
 }
 
+fn manifest_view_root(workspace: &Path, manifest_hash: &str) -> PathBuf {
+    workspace
+        .join(CACHE_DIR)
+        .join(MANIFESTS_DIR)
+        .join(manifest_hash)
+}
+
+fn manifest_view_marker(workspace: &Path, manifest_hash: &str) -> PathBuf {
+    workspace
+        .join(CACHE_DIR)
+        .join(MANIFESTS_DIR)
+        .join(format!("{manifest_hash}.complete"))
+}
+
 fn cache_object_path(workspace: &Path, entry: &ManifestEntry) -> PathBuf {
     let prefix = entry.sha256.get(0..2).unwrap_or("00");
     let mut file_name = entry.sha256.clone();
@@ -6477,7 +7459,7 @@ fn key_version(department_key: &DepartmentKey, version: VersionId) -> String {
         department_key.asset_key.category,
         department_key.asset_key.asset_code,
         department_key.department,
-        version
+        version.key_encode()
     )
 }
 
@@ -6505,7 +7487,7 @@ fn key_thumbnail(department_key: &DepartmentKey, version: VersionId) -> String {
         department_key.asset_key.category,
         department_key.asset_key.asset_code,
         department_key.department,
-        version
+        version.key_encode()
     )
 }
 
@@ -6538,8 +7520,28 @@ mod tests {
         assert_eq!(version.to_string(), "v001");
         assert_eq!(version.next().to_string(), "v002");
         assert_eq!(VersionId::from_str("v1000").unwrap().to_string(), "v1000");
-        assert!(VersionId::from_str("001").is_err());
+        // Lenient parse: bare integers and zero-padded digits are canonical v8 forms.
+        assert_eq!(VersionId::from_str("12").unwrap(), VersionId(12));
+        assert_eq!(VersionId::from_str("001").unwrap(), VersionId(1));
         assert!(VersionId::from_str("v000").is_err());
+        assert!(VersionId::from_str("0").is_err());
+        assert!(VersionId::from_str("").is_err());
+        assert!(VersionId::from_str("v").is_err());
+        assert!(VersionId::from_str("v1a").is_err());
+        // JSON canonical form is a number; both number and string deserialize.
+        assert_eq!(serde_json::to_string(&VersionId(12)).unwrap(), "12");
+        assert_eq!(
+            serde_json::from_str::<VersionId>("12").unwrap(),
+            VersionId(12)
+        );
+        assert_eq!(
+            serde_json::from_str::<VersionId>("\"v012\"").unwrap(),
+            VersionId(12)
+        );
+        // Fixed-width key encoding keeps lexicographic order numeric past v999.
+        assert_eq!(VersionId(999).key_encode(), "0000000999");
+        assert_eq!(VersionId(1000).key_encode(), "0000001000");
+        assert!(VersionId(999).key_encode() < VersionId(1000).key_encode());
     }
 
     #[test]
@@ -6873,7 +7875,7 @@ mod tests {
         assert_eq!(assets["assets"][0]["category"], "prop");
         assert_eq!(assets["assets"][0]["asset_code"], "crate");
         assert_eq!(assets["assets"][0]["department"], "model");
-        assert_eq!(assets["assets"][0]["current"], "v002");
+        assert_eq!(assets["assets"][0]["current"], 2);
         assert!(
             assets["assets"][0]["thumbnail_url"]
                 .as_str()
@@ -6909,7 +7911,7 @@ mod tests {
             .unwrap();
         assert_eq!(version_info.status(), StatusCode::OK);
         let version_info = response_json(version_info).await;
-        assert_eq!(version_info["version"]["version"], "v002");
+        assert_eq!(version_info["version"]["version"], 2);
         assert_eq!(
             version_info["manifest"]["entries"][0]["relative_path"],
             "crate.usd"
@@ -6947,7 +7949,7 @@ mod tests {
             .unwrap();
         assert_eq!(set_current.status(), StatusCode::OK);
         let set_current = response_json(set_current).await;
-        assert_eq!(set_current["current"], "v001");
+        assert_eq!(set_current["current"], 1);
         assert_eq!(set_current["explicit"], true);
 
         fs::remove_dir_all(version_folder(&workspace, &department_key, VersionId(1))).unwrap();
@@ -7128,7 +8130,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(import.status(), StatusCode::OK);
-        assert_eq!(response_json(import).await["version"], "v001");
+        assert_eq!(response_json(import).await["version"], 1);
 
         let fetched = app
             .clone()
@@ -7183,13 +8185,16 @@ mod tests {
             workspace.to_path_buf(),
         )
         .unwrap();
-        Arc::new(WebState::from(ServeConfig {
-            bind: "127.0.0.1:0".parse().unwrap(),
-            auth_token: "secret".to_string(),
-            profiles: BTreeMap::from([(profile.name.clone(), profile)]),
-            max_upload_bytes: 10 * 1024 * 1024,
-            max_object_upload_bytes: 1024 * 1024 * 1024,
-        }))
+        Arc::new(
+            WebState::try_new(ServeConfig {
+                bind: "127.0.0.1:0".parse().unwrap(),
+                auth_token: "secret".to_string(),
+                profiles: BTreeMap::from([(profile.name.clone(), profile)]),
+                max_upload_bytes: 10 * 1024 * 1024,
+                max_object_upload_bytes: 1024 * 1024 * 1024,
+            })
+            .unwrap(),
+        )
     }
 
     fn api_request(method: &str, uri: &str, token: &str, body: Body) -> Request<Body> {

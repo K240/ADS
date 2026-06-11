@@ -12,7 +12,7 @@ class AdsPathMapperTests(unittest.TestCase):
             r"D:\workspace\char\hero\model\v003\geo\hero_body.usd"
         )
 
-        self.assertEqual(uri, "ads://char/hero/model/geo/hero_body.usd?v=v003")
+        self.assertEqual(uri, "ads://char/hero/model/geo/hero_body.usd?v=3")
 
     def test_nested_category_maps_to_ads_uri(self):
         mapper = AdsPathMapper(workspace_root=r"D:\workspace")
@@ -23,7 +23,7 @@ class AdsPathMapperTests(unittest.TestCase):
 
         self.assertEqual(
             uri,
-            "ads://assets/characters/main/hero/texture/maps/body.1001.tx?v=v012",
+            "ads://assets/characters/main/hero/texture/maps/body.1001.tx?v=12",
         )
 
     def test_public_path_maps_to_ads_uri(self):
@@ -34,7 +34,7 @@ class AdsPathMapperTests(unittest.TestCase):
 
         uri = mapper.to_ads_uri(r"D:\public\prop\crate\model\v001\crate.usd")
 
-        self.assertEqual(uri, "ads://prop/crate/model/crate.usd?v=v001")
+        self.assertEqual(uri, "ads://prop/crate/model/crate.usd?v=1")
 
     def test_workspace_save_path_can_be_redirected_to_public_root(self):
         mapper = AdsPathMapper(

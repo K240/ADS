@@ -38,6 +38,26 @@ class AdsCliTests(unittest.TestCase):
         self.assertEqual(args[args.index("--asset-code") + 1], "hero")
         self.assertEqual(args[args.index("--department") + 1], "model")
 
+    def test_restore_accepts_integer_version(self):
+        completed = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="restored\n",
+            stderr="",
+        )
+        with patch("ads.client.subprocess.run", return_value=completed) as run:
+            AdsCli("ads.exe").restore(
+                store="D:\\store",
+                workspace="D:\\workspace",
+                category="char",
+                asset_code="hero",
+                department="model",
+                version=2,
+            )
+
+        args = run.call_args.args[0]
+        self.assertEqual(args[args.index("--version") + 1], "2")
+
     def test_run_json_parses_cli_json(self):
         completed = subprocess.CompletedProcess(
             args=[],
