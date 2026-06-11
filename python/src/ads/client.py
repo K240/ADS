@@ -106,30 +106,6 @@ class AdsCli:
             ]
         )
 
-    def new_version(
-        self,
-        *,
-        store: str | os.PathLike[str],
-        workspace: str | os.PathLike[str] | None = None,
-        category: str,
-        asset_code: str,
-        department: str,
-    ) -> str:
-        return self.run_text(
-            [
-                "new-version",
-                "--store",
-                _path(store),
-                *_workspace_args(workspace),
-                "--category",
-                category,
-                "--asset-code",
-                asset_code,
-                "--department",
-                department,
-            ]
-        )
-
     def add(
         self,
         *,
@@ -181,107 +157,144 @@ class AdsCli:
             args += ["--version", version]
         return self.run_json(args)
 
-    def pull(
+    def wip_add(
         self,
         *,
         store: str | os.PathLike[str],
-        workspace: str | os.PathLike[str] | None = None,
         category: str,
         asset_code: str,
         department: str,
-        latest: bool = False,
-        force: bool = False,
-    ) -> str:
-        args = [
-            "pull",
-            "--store",
-            _path(store),
-            *_workspace_args(workspace),
-            "--category",
-            category,
-            "--asset-code",
-            asset_code,
-            "--department",
-            department,
-        ]
-        if latest:
-            args.append("--latest")
-        if force:
-            args.append("--force")
-        return self.run_text(args)
-
-    def restore(
-        self,
-        *,
-        store: str | os.PathLike[str],
-        workspace: str | os.PathLike[str] | None = None,
-        category: str,
-        asset_code: str,
-        department: str,
-        version: int | str,
-        force: bool = False,
-    ) -> str:
-        args = [
-            "restore",
-            "--store",
-            _path(store),
-            *_workspace_args(workspace),
-            "--category",
-            category,
-            "--asset-code",
-            asset_code,
-            "--department",
-            department,
-            "--version",
-            version,
-        ]
-        if force:
-            args.append("--force")
-        return self.run_text(args)
-
-    def publish_register(
-        self,
-        *,
-        store: str | os.PathLike[str],
-        public_root: str | os.PathLike[str],
-        category: str,
-        asset_code: str,
-        department: str,
-        version: int | str,
+        source: str | os.PathLike[str],
     ) -> str:
         return self.run_text(
-            _publish_args(
-                "register",
-                store,
-                public_root,
+            [
+                "wip",
+                "add",
+                "--store",
+                _path(store),
+                "--category",
                 category,
+                "--asset-code",
                 asset_code,
+                "--department",
                 department,
-                version,
-            )
+                "--source",
+                _path(source),
+            ]
         )
+
+    def wip_list(
+        self,
+        *,
+        store: str | os.PathLike[str],
+        category: str,
+        asset_code: str,
+        department: str,
+    ) -> list[JsonObject]:
+        text = self.run_text(
+            [
+                "wip",
+                "list",
+                "--store",
+                _path(store),
+                "--category",
+                category,
+                "--asset-code",
+                asset_code,
+                "--department",
+                department,
+            ]
+        )
+        data = json.loads(text)
+        if not isinstance(data, list):
+            raise ValueError("ADS wip list did not return a JSON array")
+        return data
+
+    def publish_promote(
+        self,
+        *,
+        store: str | os.PathLike[str],
+        category: str,
+        asset_code: str,
+        department: str,
+        wip_seq: int | None = None,
+        no_validate: bool = False,
+    ) -> str:
+        args = [
+            "publish",
+            "promote",
+            "--store",
+            _path(store),
+            "--category",
+            category,
+            "--asset-code",
+            asset_code,
+            "--department",
+            department,
+        ]
+        if wip_seq is not None:
+            args += ["--wip-seq", wip_seq]
+        if no_validate:
+            args.append("--no-validate")
+        return self.run_text(args)
+
+    def gc(
+        self,
+        *,
+        store: str | os.PathLike[str],
+        retention: int | None = None,
+        grace_hours: int | None = None,
+        dry_run: bool = False,
+    ) -> JsonObject:
+        args = ["gc", "--store", _path(store)]
+        if retention is not None:
+            args += ["--retention", retention]
+        if grace_hours is not None:
+            args += ["--grace-hours", grace_hours]
+        if dry_run:
+            args.append("--dry-run")
+        return self.run_json(args)
 
     def publish_validate(
         self,
         *,
-        store: str | os.PathLike[str],
-        public_root: str | os.PathLike[str],
-        category: str,
-        asset_code: str,
-        department: str,
-        version: int | str,
+        store: str | os.PathLike[str] | None = None,
+        category: str | None = None,
+        asset_code: str | None = None,
+        department: str | None = None,
+        version: int | str | None = None,
+        latest: bool = False,
+        wip: bool = False,
+        wip_seq: int | None = None,
+        source: str | os.PathLike[str] | None = None,
     ) -> str:
-        return self.run_text(
-            _publish_args(
-                "validate",
-                store,
-                public_root,
-                category,
-                asset_code,
-                department,
-                version,
+        args: list[str | int | os.PathLike[str]] = ["publish", "validate"]
+        if source is not None:
+            args += ["--source", _path(source)]
+            return self.run_text(args)
+        if store is None or not category or not asset_code or not department:
+            raise ValueError(
+                "publish_validate requires store/category/asset_code/department, or source"
             )
-        )
+        args += [
+            "--store",
+            _path(store),
+            "--category",
+            category,
+            "--asset-code",
+            asset_code,
+            "--department",
+            department,
+        ]
+        if version is not None:
+            args += ["--version", version]
+        if latest:
+            args.append("--latest")
+        if wip:
+            args.append("--wip")
+        if wip_seq is not None:
+            args += ["--wip-seq", wip_seq]
+        return self.run_text(args)
 
     def fetch(
         self,
@@ -1026,33 +1039,6 @@ def _current_args(
         asset_code,
         "--department",
         department,
-    ]
-
-
-def _publish_args(
-    action: str,
-    store: str | os.PathLike[str],
-    public_root: str | os.PathLike[str],
-    category: str,
-    asset_code: str,
-    department: str,
-    version: int | str,
-) -> list[str]:
-    return [
-        "publish",
-        action,
-        "--store",
-        _path(store),
-        "--public-root",
-        _path(public_root),
-        "--category",
-        category,
-        "--asset-code",
-        asset_code,
-        "--department",
-        department,
-        "--version",
-        version,
     ]
 
 

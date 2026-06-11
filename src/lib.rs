@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{BufReader, Read};
@@ -59,12 +59,13 @@ enum Commands {
         #[arg(long = "remote-base-url")]
         remote_base_url: Option<String>,
     },
-    /// Register a standard workspace version folder.
+    /// Register a version from a source folder.
     Add {
         /// Store root path.
         #[arg(long)]
         store: PathBuf,
-        /// Workspace root. Defaults to the current directory.
+        /// Workspace root, used together with --version to locate the
+        /// conventional <category>/<asset-code>/<department>/v### folder.
         #[arg(long)]
         workspace: Option<PathBuf>,
         /// Asset category.
@@ -76,27 +77,14 @@ enum Commands {
         /// Work department such as model, rig, anim, fx, or lookdev.
         #[arg(long)]
         department: String,
-        /// Version folder to register, for example v001.
+        /// Version number, for example 3 or v003. Defaults to the next
+        /// version when --source is used.
         #[arg(long)]
-        version: VersionId,
-    },
-    /// Create the next editable version folder.
-    NewVersion {
-        /// Store root path.
+        version: Option<VersionId>,
+        /// Arbitrary source folder to register (schema v8: no standard
+        /// workspace layout is required).
         #[arg(long)]
-        store: PathBuf,
-        /// Workspace root. Defaults to the current directory.
-        #[arg(long)]
-        workspace: Option<PathBuf>,
-        /// Asset category.
-        #[arg(long)]
-        category: String,
-        /// Asset code.
-        #[arg(long = "asset-code")]
-        asset_code: String,
-        /// Work department such as model, rig, anim, fx, or lookdev.
-        #[arg(long)]
-        department: String,
+        source: Option<PathBuf>,
     },
     /// Asset-level operations.
     Asset {
@@ -172,18 +160,33 @@ enum Commands {
         /// Destination folder.
         dest: PathBuf,
     },
-    /// Pull the current workspace version folder from the store.
-    Pull(WorkspacePullArgs),
-    /// Restore a specific version into its standard workspace version folder.
-    Restore(WorkspaceRestoreArgs),
+    /// WIP micro-version stream operations (schema v8).
+    Wip {
+        #[command(subcommand)]
+        command: WipCommands,
+    },
+    /// Garbage-collect unreferenced objects and expired WIP versions.
+    Gc {
+        /// Store root path.
+        #[arg(long)]
+        store: PathBuf,
+        /// Newest WIP micro-versions to keep per department.
+        #[arg(long, default_value_t = 20)]
+        retention: usize,
+        /// Grace period in hours: unreferenced objects newer than this are kept.
+        #[arg(long = "grace-hours", default_value_t = 24)]
+        grace_hours: u64,
+        /// Report what would be deleted without deleting anything.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+    },
     /// Fetch a version and missing objects from a remote ADS server into a local store.
     Fetch(FetchArgs),
     /// Sync remote assets and missing objects into a local store.
     Sync(SyncArgs),
     /// Push a local version and missing objects to a remote ADS server.
     Push(PushArgs),
-    /// Deprecated alias for `pull` / `restore`.
-    #[command(hide = true)]
+    /// Seed the department work folder with a version's content.
     Materialize {
         /// Store root path.
         #[arg(long)]
@@ -200,13 +203,13 @@ enum Commands {
         /// Work department such as model, rig, anim, fx, or lookdev.
         #[arg(long)]
         department: String,
-        /// Version to restore. Defaults to the current version.
+        /// Version to materialize. Defaults to the current version.
         #[arg(long)]
         version: Option<VersionId>,
-        /// Restore the latest version instead of the current version.
+        /// Materialize the latest version instead of the current version.
         #[arg(long)]
         latest: bool,
-        /// Replace a different existing version folder.
+        /// Replace a work folder whose content differs.
         #[arg(long)]
         force: bool,
     },
@@ -271,56 +274,6 @@ enum Commands {
         #[arg(long)]
         store: PathBuf,
     },
-}
-
-#[derive(Args, Debug)]
-struct WorkspacePullArgs {
-    /// Store root path.
-    #[arg(long)]
-    store: PathBuf,
-    /// Workspace root. Defaults to the current directory.
-    #[arg(long)]
-    workspace: Option<PathBuf>,
-    /// Asset category.
-    #[arg(long)]
-    category: String,
-    /// Asset code.
-    #[arg(long = "asset-code")]
-    asset_code: String,
-    /// Work department such as model, rig, anim, fx, or lookdev.
-    #[arg(long)]
-    department: String,
-    /// Pull the latest version instead of the current version.
-    #[arg(long)]
-    latest: bool,
-    /// Replace a different existing version folder.
-    #[arg(long)]
-    force: bool,
-}
-
-#[derive(Args, Debug)]
-struct WorkspaceRestoreArgs {
-    /// Store root path.
-    #[arg(long)]
-    store: PathBuf,
-    /// Workspace root. Defaults to the current directory.
-    #[arg(long)]
-    workspace: Option<PathBuf>,
-    /// Asset category.
-    #[arg(long)]
-    category: String,
-    /// Asset code.
-    #[arg(long = "asset-code")]
-    asset_code: String,
-    /// Work department such as model, rig, anim, fx, or lookdev.
-    #[arg(long)]
-    department: String,
-    /// Version to restore, for example v001.
-    #[arg(long)]
-    version: VersionId,
-    /// Replace a different existing version folder.
-    #[arg(long)]
-    force: bool,
 }
 
 #[derive(Args, Debug)]
@@ -398,7 +351,7 @@ struct SyncArgs {
     /// Restore synced current/latest versions into the local workspace.
     #[arg(long)]
     materialize: bool,
-    /// Replace different existing workspace version folders when materializing.
+    /// Replace work folders whose content differs when materializing.
     #[arg(long)]
     force: bool,
 }
@@ -439,32 +392,95 @@ struct PushArgs {
 
 #[derive(Subcommand, Debug)]
 enum PublishCommands {
-    /// Register a public version folder into the store.
-    Register(PublishVersionArgs),
-    /// Validate that a public version folder only uses managed references.
-    Validate(PublishVersionArgs),
+    /// Validate the publish reference policy for a version, the WIP head, or
+    /// a source folder.
+    Validate {
+        /// Store root path (required unless --source is used).
+        #[arg(long)]
+        store: Option<PathBuf>,
+        /// Asset category.
+        #[arg(long)]
+        category: Option<String>,
+        /// Asset code.
+        #[arg(long = "asset-code")]
+        asset_code: Option<String>,
+        /// Work department such as model, rig, anim, fx, or lookdev.
+        #[arg(long)]
+        department: Option<String>,
+        /// Publish version to validate. Defaults to the current version.
+        #[arg(long)]
+        version: Option<VersionId>,
+        /// Validate the latest version instead of the current version.
+        #[arg(long)]
+        latest: bool,
+        /// Validate the WIP head instead of a publish version.
+        #[arg(long)]
+        wip: bool,
+        /// Validate a specific WIP sequence.
+        #[arg(long = "wip-seq")]
+        wip_seq: Option<u64>,
+        /// Validate an arbitrary source folder before registration.
+        #[arg(long)]
+        source: Option<PathBuf>,
+    },
+    /// Promote a WIP micro-version to the next publish version (metadata only).
+    Promote {
+        /// Store root path.
+        #[arg(long)]
+        store: PathBuf,
+        /// Asset category.
+        #[arg(long)]
+        category: String,
+        /// Asset code.
+        #[arg(long = "asset-code")]
+        asset_code: String,
+        /// Work department such as model, rig, anim, fx, or lookdev.
+        #[arg(long)]
+        department: String,
+        /// WIP sequence to promote. Defaults to the WIP head.
+        #[arg(long = "wip-seq")]
+        wip_seq: Option<u64>,
+        /// Skip the publish reference validation gate.
+        #[arg(long = "no-validate")]
+        no_validate: bool,
+    },
 }
 
-#[derive(Args, Debug)]
-struct PublishVersionArgs {
-    /// Store root path.
-    #[arg(long)]
-    store: PathBuf,
-    /// Public root. The version folder is <public-root>/<category>/<asset-code>/<department>/<version>.
-    #[arg(long = "public-root")]
-    public_root: PathBuf,
-    /// Asset category.
-    #[arg(long)]
-    category: String,
-    /// Asset code.
-    #[arg(long = "asset-code")]
-    asset_code: String,
-    /// Work department such as model, rig, anim, fx, or lookdev.
-    #[arg(long)]
-    department: String,
-    /// Version folder to register or validate, for example v001.
-    #[arg(long)]
-    version: VersionId,
+#[derive(Subcommand, Debug)]
+enum WipCommands {
+    /// Register a WIP micro-version from a source folder.
+    Add {
+        /// Store root path.
+        #[arg(long)]
+        store: PathBuf,
+        /// Asset category.
+        #[arg(long)]
+        category: String,
+        /// Asset code.
+        #[arg(long = "asset-code")]
+        asset_code: String,
+        /// Work department such as model, rig, anim, fx, or lookdev.
+        #[arg(long)]
+        department: String,
+        /// Source folder whose contents become the new WIP head.
+        #[arg(long)]
+        source: PathBuf,
+    },
+    /// List WIP micro-versions for a department.
+    List {
+        /// Store root path.
+        #[arg(long)]
+        store: PathBuf,
+        /// Asset category.
+        #[arg(long)]
+        category: String,
+        /// Asset code.
+        #[arg(long = "asset-code")]
+        asset_code: String,
+        /// Work department such as model, rig, anim, fx, or lookdev.
+        #[arg(long)]
+        department: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -724,12 +740,29 @@ where
             asset_code,
             department,
             version,
+            source,
         } => {
             let asset_key = AssetKey::new(category, asset_code)?;
             let department_key = DepartmentKey::new(asset_key, department)?;
-            let workspace = workspace_root(workspace)?;
             let store = Store::open(&store)?;
-            let outcome = store.add_version_folder(&workspace, &department_key, version)?;
+            let outcome = match source {
+                Some(source) => {
+                    let version = match version {
+                        Some(version) => version,
+                        None => store.next_version(&department_key)?,
+                    };
+                    store.add_version_source(&source, &department_key, version)?
+                }
+                None => {
+                    let version = version.ok_or_else(|| {
+                        anyhow!(
+                            "either --source or --version (with a workspace version folder) is required"
+                        )
+                    })?;
+                    let workspace = workspace_root(workspace)?;
+                    store.add_version_folder(&workspace, &department_key, version)?
+                }
+            };
             if outcome.created {
                 println!(
                     "created {} {}/{}/{} files={} bytes={} manifest={}",
@@ -754,38 +787,61 @@ where
                 );
             }
         }
-        Commands::NewVersion {
-            store,
-            workspace,
-            category,
-            asset_code,
-            department,
-        } => {
-            let asset_key = AssetKey::new(category, asset_code)?;
-            let department_key = DepartmentKey::new(asset_key, department)?;
-            let workspace = workspace_root(workspace)?;
-            let store = Store::open(&store)?;
-            let outcome = store.new_version_folder(&workspace, &department_key)?;
-            if let Some(from_version) = outcome.from_version {
+        Commands::Wip { command } => match command {
+            WipCommands::Add {
+                store,
+                category,
+                asset_code,
+                department,
+                source,
+            } => {
+                let asset_key = AssetKey::new(category, asset_code)?;
+                let department_key = DepartmentKey::new(asset_key, department)?;
+                let store = Store::open(&store)?;
+                let source_path = source.display().to_string();
+                let outcome = store.add_wip_from_source(&source, &department_key, source_path)?;
                 println!(
-                    "created {} {}/{}/{} from {} at {}",
-                    outcome.version,
+                    "{} wip seq={} {}/{}/{} files={} bytes={} manifest={}",
+                    if outcome.created {
+                        "registered"
+                    } else {
+                        "unchanged"
+                    },
+                    outcome.seq,
                     department_key.asset_key.category,
                     department_key.asset_key.asset_code,
                     department_key.department,
-                    from_version,
-                    outcome.path.display()
-                );
-            } else {
-                println!(
-                    "created {} {}/{}/{} at {}",
-                    outcome.version,
-                    department_key.asset_key.category,
-                    department_key.asset_key.asset_code,
-                    department_key.department,
-                    outcome.path.display()
+                    outcome.file_count,
+                    outcome.total_bytes,
+                    outcome.manifest_hash
                 );
             }
+            WipCommands::List {
+                store,
+                category,
+                asset_code,
+                department,
+            } => {
+                let asset_key = AssetKey::new(category, asset_code)?;
+                let department_key = DepartmentKey::new(asset_key, department)?;
+                let store = Store::open(&store)?;
+                let records = store.list_wips(&department_key)?;
+                println!("{}", serde_json::to_string_pretty(&records)?);
+            }
+        },
+        Commands::Gc {
+            store,
+            retention,
+            grace_hours,
+            dry_run,
+        } => {
+            let store = Store::open(&store)?;
+            let outcome = store.gc(
+                retention,
+                std::time::Duration::from_secs(grace_hours * 3600),
+                dry_run,
+            )?;
+            println!("{}", serde_json::to_string_pretty(&outcome)?);
         }
         Commands::Asset { command } => match command {
             AssetCommands::Create {
@@ -1138,35 +1194,6 @@ where
                 dest.display()
             );
         }
-        Commands::Pull(args) => {
-            let asset_key = AssetKey::new(args.category, args.asset_code)?;
-            let department_key = DepartmentKey::new(asset_key, args.department)?;
-            let selector = if args.latest {
-                VersionSelector::Latest
-            } else {
-                VersionSelector::Current
-            };
-            restore_standard_workspace_version(
-                &args.store,
-                args.workspace,
-                department_key,
-                selector,
-                args.force,
-                WorkspaceRestoreWords::new("pulled", "already pulled"),
-            )?;
-        }
-        Commands::Restore(args) => {
-            let asset_key = AssetKey::new(args.category, args.asset_code)?;
-            let department_key = DepartmentKey::new(asset_key, args.department)?;
-            restore_standard_workspace_version(
-                &args.store,
-                args.workspace,
-                department_key,
-                VersionSelector::Version(args.version),
-                args.force,
-                WorkspaceRestoreWords::new("restored", "already restored"),
-            )?;
-        }
         Commands::Fetch(args) => {
             if args.latest && args.version.is_some() {
                 bail!("--latest and --version cannot be used together");
@@ -1457,22 +1484,47 @@ where
             runtime.block_on(serve_web(config))?;
         }
         Commands::Publish { command } => match command {
-            PublishCommands::Register(args) => {
-                let asset_key = AssetKey::new(args.category, args.asset_code)?;
-                let department_key = DepartmentKey::new(asset_key, args.department)?;
-                let store = Store::open(&args.store)?;
-                let outcome = store.register_public_version(
-                    &args.public_root,
-                    &department_key,
-                    args.version,
-                )?;
-                let action = if outcome.created {
-                    "registered"
-                } else {
-                    "reused"
+            PublishCommands::Promote {
+                store,
+                category,
+                asset_code,
+                department,
+                wip_seq,
+                no_validate,
+            } => {
+                let asset_key = AssetKey::new(category, asset_code)?;
+                let department_key = DepartmentKey::new(asset_key, department)?;
+                let store = Store::open(&store)?;
+                let wip = match wip_seq {
+                    Some(seq) => store.get_wip(&department_key, seq)?,
+                    None => store.wip_head(&department_key)?.ok_or_else(|| {
+                        anyhow!(
+                            "no wip versions to promote for {}/{}/{}",
+                            department_key.asset_key.category,
+                            department_key.asset_key.asset_code,
+                            department_key.department
+                        )
+                    })?,
                 };
+                if !no_validate {
+                    let manifest = store.get_manifest(&wip.manifest_hash)?;
+                    let report = validate_manifest_references(
+                        &store,
+                        format!(
+                            "wip seq {} of {}/{}/{}",
+                            wip.seq,
+                            department_key.asset_key.category,
+                            department_key.asset_key.asset_code,
+                            department_key.department
+                        ),
+                        &manifest,
+                    )?;
+                    print_publish_validate_report(&report, "promote validation gate")?;
+                }
+                let outcome = store.promote_wip(&department_key, Some(wip.seq))?;
                 println!(
-                    "{action} {} {}/{}/{} files={} bytes={} manifest={}",
+                    "{} {} {}/{}/{} files={} bytes={} manifest={}",
+                    if outcome.created { "promoted" } else { "reused" },
                     outcome.version,
                     department_key.asset_key.category,
                     department_key.asset_key.asset_code,
@@ -1482,35 +1534,77 @@ where
                     outcome.manifest_hash
                 );
             }
-            PublishCommands::Validate(args) => {
-                let asset_key = AssetKey::new(args.category, args.asset_code)?;
-                let department_key = DepartmentKey::new(asset_key, args.department)?;
-                let report =
-                    validate_public_version(&args.public_root, &department_key, args.version)?;
-                if report.errors.is_empty() {
-                    println!(
-                        "ok files_scanned={} references_checked={} warnings={}",
-                        report.files_scanned,
-                        report.references_checked,
-                        report.warnings.len()
-                    );
-                    for warning in report.warnings {
-                        eprintln!("warning: {warning}");
+            PublishCommands::Validate {
+                store,
+                category,
+                asset_code,
+                department,
+                version,
+                latest,
+                wip,
+                wip_seq,
+                source,
+            } => {
+                let report = if let Some(source) = source {
+                    if store.is_some() || wip || wip_seq.is_some() || version.is_some() || latest {
+                        bail!("--source cannot be combined with store target options");
                     }
+                    validate_source_references(&source)?
                 } else {
-                    for warning in &report.warnings {
-                        eprintln!("warning: {warning}");
-                    }
-                    for error in &report.errors {
-                        eprintln!("error: {error}");
-                    }
-                    bail!(
-                        "publish validation failed: {} error(s), files_scanned={}, references_checked={}",
-                        report.errors.len(),
-                        report.files_scanned,
-                        report.references_checked
-                    );
-                }
+                    let store_path = store
+                        .ok_or_else(|| anyhow!("--store is required unless --source is used"))?;
+                    let (Some(category), Some(asset_code), Some(department)) =
+                        (category, asset_code, department)
+                    else {
+                        bail!(
+                            "--category, --asset-code, and --department are required unless --source is used"
+                        );
+                    };
+                    let asset_key = AssetKey::new(category, asset_code)?;
+                    let department_key = DepartmentKey::new(asset_key, department)?;
+                    let store = Store::open(&store_path)?;
+                    let (target, manifest_hash) = if wip || wip_seq.is_some() {
+                        let record = match wip_seq {
+                            Some(seq) => store.get_wip(&department_key, seq)?,
+                            None => store.wip_head(&department_key)?.ok_or_else(|| {
+                                anyhow!(
+                                    "department has no wip versions: {}/{}/{}",
+                                    department_key.asset_key.category,
+                                    department_key.asset_key.asset_code,
+                                    department_key.department
+                                )
+                            })?,
+                        };
+                        (format!("wip seq {}", record.seq), record.manifest_hash)
+                    } else {
+                        let selector = if latest {
+                            VersionSelector::Latest
+                        } else {
+                            version.map_or(VersionSelector::Current, VersionSelector::Version)
+                        };
+                        let resolved = store
+                            .selected_version(&department_key, selector)?
+                            .ok_or_else(|| {
+                                anyhow!(
+                                    "department has no selected version: {}/{}/{}",
+                                    department_key.asset_key.category,
+                                    department_key.asset_key.asset_code,
+                                    department_key.department
+                                )
+                            })?;
+                        let record = store.get_version(&department_key, resolved)?;
+                        (format!("version {resolved}"), record.manifest_hash)
+                    };
+                    let manifest = store.get_manifest(&manifest_hash)?;
+                    validate_manifest_references(&store, target, &manifest)?
+                };
+                print_publish_validate_report(&report, "publish validation")?;
+                println!(
+                    "ok files_scanned={} references_checked={} warnings={}",
+                    report.files_scanned,
+                    report.references_checked,
+                    report.warnings.len()
+                );
             }
         },
         Commands::Verify { store } => {
@@ -1542,33 +1636,94 @@ where
     Ok(())
 }
 
-fn validate_public_version(
-    public_root: &Path,
-    department_key: &DepartmentKey,
-    version: VersionId,
+/// Prints validation warnings to stderr and fails when the report carries
+/// errors.
+fn print_publish_validate_report(report: &PublishValidateReport, context: &str) -> Result<()> {
+    for warning in &report.warnings {
+        eprintln!("warning: {warning}");
+    }
+    if !report.errors.is_empty() {
+        for error in &report.errors {
+            eprintln!("error: {error}");
+        }
+        bail!(
+            "{context} failed for {}: {} error(s), files_scanned={}, references_checked={}",
+            report.target,
+            report.errors.len(),
+            report.files_scanned,
+            report.references_checked
+        );
+    }
+    Ok(())
+}
+
+/// Validates the publish reference policy (schema v8) over a manifest stored
+/// in the content-addressed store. Cross-asset references must use ads://;
+/// intra-version references may be relative as long as they resolve to
+/// another file of the same manifest, because the manifest view preserves the
+/// relative layout. Absolute paths, file:// URIs, and references escaping or
+/// missing from the version are errors. Binary USD layers cannot be scanned
+/// and produce warnings.
+fn validate_manifest_references(
+    store: &Store,
+    target: String,
+    manifest: &Manifest,
 ) -> Result<PublishValidateReport> {
-    let root = version_folder(public_root, department_key, version);
-    let root = root
+    let mut report = PublishValidateReport {
+        target,
+        files_scanned: 0,
+        references_checked: 0,
+        warnings: Vec::new(),
+        errors: Vec::new(),
+    };
+    let entry_paths: BTreeSet<String> = manifest
+        .entries
+        .iter()
+        .map(|entry| entry.relative_path.clone())
+        .collect();
+
+    for entry in &manifest.entries {
+        if !is_usd_layer_path(Path::new(&entry.relative_path)) {
+            continue;
+        }
+        report.files_scanned += 1;
+        let path = object_path(&store.root, &entry.sha256);
+        let bytes = fs::read(&path).with_context(|| {
+            format!(
+                "failed to read object for {}: {}",
+                entry.relative_path,
+                path.display()
+            )
+        })?;
+        scan_usd_text(&mut report, &entry_paths, &entry.relative_path, bytes);
+    }
+
+    Ok(report)
+}
+
+/// Validates the same publish reference policy over an arbitrary source
+/// folder, before registration.
+fn validate_source_references(source: &Path) -> Result<PublishValidateReport> {
+    let root = source
         .canonicalize()
-        .with_context(|| format!("public version folder does not exist: {}", root.display()))?;
+        .with_context(|| format!("source folder does not exist: {}", source.display()))?;
     if !root.is_dir() {
-        bail!("public version path is not a folder: {}", root.display());
+        bail!("source path is not a folder: {}", root.display());
     }
 
     let mut report = PublishValidateReport {
-        root: root.clone(),
+        target: root.display().to_string(),
         files_scanned: 0,
         references_checked: 0,
         warnings: Vec::new(),
         errors: Vec::new(),
     };
 
+    let mut entry_paths = BTreeSet::new();
+    let mut usd_files = Vec::new();
     for entry in WalkDir::new(&root).follow_links(false) {
         let entry = entry.with_context(|| format!("failed to walk {}", root.display()))?;
-        if entry.path() == root {
-            continue;
-        }
-        if entry.file_type().is_dir() {
+        if entry.path() == root || entry.file_type().is_dir() {
             continue;
         }
         let rel_path = entry
@@ -1577,33 +1732,54 @@ fn validate_public_version(
             .with_context(|| format!("failed to relativize {}", entry.path().display()))?;
         let rel_path = normalize_relative_path(rel_path)?;
         if entry.file_type().is_symlink() {
-            report.errors.push(format!(
-                "{rel_path} is a symlink; public publish does not allow symlinks"
-            ));
+            report
+                .errors
+                .push(format!("{rel_path} is a symlink; publish does not allow symlinks"));
             continue;
         }
-        if !entry.file_type().is_file() || !is_usd_layer_path(entry.path()) {
+        if !entry.file_type().is_file() {
             continue;
         }
+        if is_usd_layer_path(entry.path()) {
+            usd_files.push((rel_path.clone(), entry.path().to_path_buf()));
+        }
+        entry_paths.insert(rel_path);
+    }
+
+    for (rel_path, path) in usd_files {
         report.files_scanned += 1;
-        let bytes = fs::read(entry.path())
-            .with_context(|| format!("failed to read {}", entry.path().display()))?;
-        let Ok(text) = String::from_utf8(bytes) else {
-            report.warnings.push(format!(
-                "{rel_path} is not UTF-8 text; binary USD reference validation was skipped"
-            ));
-            continue;
-        };
-        for reference in extract_usd_asset_references(&text) {
-            report.references_checked += 1;
-            validate_public_reference(&mut report, &rel_path, &reference);
-        }
+        let bytes =
+            fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
+        scan_usd_text(&mut report, &entry_paths, &rel_path, bytes);
     }
 
     Ok(report)
 }
 
-fn validate_public_reference(report: &mut PublishValidateReport, rel_path: &str, reference: &str) {
+fn scan_usd_text(
+    report: &mut PublishValidateReport,
+    entry_paths: &BTreeSet<String>,
+    rel_path: &str,
+    bytes: Vec<u8>,
+) {
+    let Ok(text) = String::from_utf8(bytes) else {
+        report.warnings.push(format!(
+            "{rel_path} is not UTF-8 text; binary USD reference validation was skipped"
+        ));
+        return;
+    };
+    for reference in extract_usd_asset_references(&text) {
+        report.references_checked += 1;
+        validate_publish_reference(report, entry_paths, rel_path, &reference);
+    }
+}
+
+fn validate_publish_reference(
+    report: &mut PublishValidateReport,
+    entry_paths: &BTreeSet<String>,
+    rel_path: &str,
+    reference: &str,
+) {
     let reference = reference.trim();
     if reference.is_empty() || reference.starts_with("ads://") {
         return;
@@ -1614,17 +1790,51 @@ fn validate_public_reference(report: &mut PublishValidateReport, rel_path: &str,
         ));
         return;
     }
+    if reference.starts_with("file://") {
+        report.errors.push(format!(
+            "{rel_path} contains unmanaged file URI reference `{reference}`; expected ads://"
+        ));
+        return;
+    }
+    if is_absolute_asset_path(reference) {
+        report.errors.push(format!(
+            "{rel_path} contains unmanaged absolute path reference `{reference}`; expected ads://"
+        ));
+        return;
+    }
+    match resolve_version_relative_reference(rel_path, reference) {
+        Some(resolved) if entry_paths.contains(&resolved) => {}
+        Some(resolved) => report.errors.push(format!(
+            "{rel_path} references `{reference}`, which is missing from the version (resolved to `{resolved}`)"
+        )),
+        None => report.errors.push(format!(
+            "{rel_path} references `{reference}`, which escapes the version root"
+        )),
+    }
+}
 
-    let reference_kind = if reference.starts_with("file://") {
-        "file URI"
-    } else if is_absolute_asset_path(reference) {
-        "absolute path"
-    } else {
-        "relative path"
-    };
-    report.errors.push(format!(
-        "{rel_path} contains unmanaged {reference_kind} reference `{reference}`; expected ads://"
-    ));
+/// Lexically resolves a relative USD reference against the referencing
+/// layer's directory within the version. Returns None when the reference
+/// escapes the version root.
+fn resolve_version_relative_reference(from: &str, reference: &str) -> Option<String> {
+    let mut parts: Vec<String> = from.split('/').map(str::to_string).collect();
+    parts.pop();
+    let normalized = reference.replace('\\', "/");
+    for component in normalized.split('/') {
+        match component {
+            "" | "." => continue,
+            ".." => {
+                if parts.pop().is_none() {
+                    return None;
+                }
+            }
+            other => parts.push(other.to_string()),
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(parts.join("/"))
 }
 
 fn extract_usd_asset_references(text: &str) -> Vec<String> {
@@ -1688,21 +1898,6 @@ impl WorkspaceRestoreWords {
     const fn new(done: &'static str, unchanged: &'static str) -> Self {
         Self { done, unchanged }
     }
-}
-
-fn restore_standard_workspace_version(
-    store: &Path,
-    workspace: Option<PathBuf>,
-    department_key: DepartmentKey,
-    selector: VersionSelector,
-    force: bool,
-    words: WorkspaceRestoreWords,
-) -> Result<()> {
-    let workspace = workspace_root(workspace)?;
-    let store = Store::open(store)?;
-    let outcome = store.materialize(&workspace, &department_key, selector, force)?;
-    print_workspace_restore_outcome(&department_key, outcome, words);
-    Ok(())
 }
 
 fn print_workspace_restore_outcome(
@@ -2041,6 +2236,9 @@ impl AssetPath {
 pub enum VersionSelector {
     Current,
     Latest,
+    /// Head of the local WIP micro-version stream (schema v8). Local-only:
+    /// never pushed, never cached by resolvers.
+    Wip,
     Version(VersionId),
 }
 
@@ -2051,6 +2249,9 @@ impl VersionSelector {
         }
         if value == "latest" {
             return Some(Self::Latest);
+        }
+        if value == "wip" {
+            return Some(Self::Wip);
         }
         VersionId::from_str(value).ok().map(Self::Version)
     }
@@ -2075,7 +2276,9 @@ enum AssetFileKind {
 pub struct ResolveOutcome {
     pub location: String,
     pub source: ResolveSource,
-    pub version: VersionId,
+    /// None for WIP resolutions: micro-versions carry no publish number.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<VersionId>,
     pub sha256: String,
 }
 
@@ -2095,6 +2298,10 @@ pub struct VersionRecord {
     pub source_path: String,
     pub file_count: u64,
     pub total_bytes: u64,
+    /// WIP sequence this version was promoted from, when published via
+    /// `publish promote`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promoted_from: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2138,16 +2345,42 @@ pub struct AddOutcome {
     pub total_bytes: u64,
 }
 
-#[derive(Clone, Debug, Serialize)]
-pub struct CreateAssetOutcome {
-    pub asset: AssetRecord,
-    pub path: PathBuf,
+/// One registered write of a department's WIP stream (schema v8). Shares the
+/// manifest/object machinery with publish versions but lives in a separate,
+/// local-only, garbage-collected key space.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WipRecord {
+    pub department_key: DepartmentKey,
+    pub seq: u64,
+    pub manifest_hash: String,
+    pub created_at: String,
+    pub source_path: String,
+    pub file_count: u64,
+    pub total_bytes: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub struct NewVersionOutcome {
-    pub version: VersionId,
-    pub from_version: Option<VersionId>,
+pub struct WipOutcome {
+    pub created: bool,
+    pub seq: u64,
+    pub manifest_hash: String,
+    pub file_count: u64,
+    pub total_bytes: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct GcOutcome {
+    pub dry_run: bool,
+    pub retained_objects: u64,
+    pub deleted_objects: u64,
+    pub deleted_bytes: u64,
+    pub pruned_wips: u64,
+    pub pruned_manifests: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CreateAssetOutcome {
+    pub asset: AssetRecord,
     pub path: PathBuf,
 }
 
@@ -2160,7 +2393,7 @@ pub struct MaterializeOutcome {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct PublishValidateReport {
-    pub root: PathBuf,
+    pub target: String,
     pub files_scanned: u64,
     pub references_checked: u64,
     pub warnings: Vec<String>,
@@ -2588,29 +2821,6 @@ impl Store {
         Ok(CreateAssetOutcome { asset, path })
     }
 
-    pub fn new_version_folder(
-        &self,
-        workspace: &Path,
-        department_key: &DepartmentKey,
-    ) -> Result<NewVersionOutcome> {
-        let latest = self.latest_version(department_key)?;
-        let version = latest.map_or(VersionId(1), VersionId::next);
-        let path = version_folder(workspace, department_key, version);
-        self.prepare_checkout_dest(&path, false)?;
-
-        if let Some(from_version) = latest {
-            let record = self.get_version(department_key, from_version)?;
-            let manifest = self.get_manifest(&record.manifest_hash)?;
-            self.restore_manifest_to_dest(&manifest, &path)?;
-        }
-
-        Ok(NewVersionOutcome {
-            version,
-            from_version: latest,
-            path,
-        })
-    }
-
     pub fn add_version_folder(
         &self,
         workspace: &Path,
@@ -2626,19 +2836,26 @@ impl Store {
         )
     }
 
-    pub fn register_public_version(
+    /// Registers a version from an arbitrary source folder (schema v8: the
+    /// standard workspace layout is no longer required).
+    pub fn add_version_source(
         &self,
-        public_root: &Path,
+        source: &Path,
         department_key: &DepartmentKey,
         version: VersionId,
     ) -> Result<AddOutcome> {
-        let source = version_folder(public_root, department_key, version);
         self.add_version_from_source(
-            &source,
+            source,
             department_key,
             version,
-            version_workspace_relative_path(department_key, version),
+            source.display().to_string(),
         )
+    }
+
+    pub fn next_version(&self, department_key: &DepartmentKey) -> Result<VersionId> {
+        Ok(self
+            .latest_version(department_key)?
+            .map_or(VersionId(1), VersionId::next))
     }
 
     pub fn import_version_info(&self, info: &VersionInfo) -> Result<()> {
@@ -2721,6 +2938,345 @@ impl Store {
         Ok(())
     }
 
+    fn wip_head_seq(&self, department_key: &DepartmentKey) -> Result<Option<u64>> {
+        self.db
+            .get(key_wip_head(department_key))?
+            .map(|value| {
+                let value = std::str::from_utf8(&value).context("wip head is not UTF-8")?;
+                value.parse::<u64>().context("invalid wip head sequence")
+            })
+            .transpose()
+    }
+
+    pub fn get_wip(&self, department_key: &DepartmentKey, seq: u64) -> Result<WipRecord> {
+        let value = self.db.get(key_wip(department_key, seq))?.ok_or_else(|| {
+            anyhow!(
+                "wip not found: {}/{}/{} seq {}",
+                department_key.asset_key.category,
+                department_key.asset_key.asset_code,
+                department_key.department,
+                seq
+            )
+        })?;
+        serde_json::from_slice(&value).context("failed to decode wip record")
+    }
+
+    pub fn wip_head(&self, department_key: &DepartmentKey) -> Result<Option<WipRecord>> {
+        match self.wip_head_seq(department_key)? {
+            Some(seq) => Ok(Some(self.get_wip(department_key, seq)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn list_wips(&self, department_key: &DepartmentKey) -> Result<Vec<WipRecord>> {
+        let prefix = format!(
+            "wip/{}/{}/{}/",
+            department_key.asset_key.category,
+            department_key.asset_key.asset_code,
+            department_key.department
+        );
+        let mut records = Vec::new();
+        for item in self
+            .db
+            .iterator(IteratorMode::From(prefix.as_bytes(), Direction::Forward))
+        {
+            let (key, value) = item?;
+            if !key.starts_with(prefix.as_bytes()) {
+                break;
+            }
+            let record: WipRecord = serde_json::from_slice(&value)
+                .with_context(|| format!("failed to decode {}", String::from_utf8_lossy(&key)))?;
+            if record.department_key != *department_key {
+                continue;
+            }
+            records.push(record);
+        }
+        records.sort_by_key(|record| record.seq);
+        Ok(records)
+    }
+
+    /// Registers one write of the WIP stream from an arbitrary source folder.
+    /// Re-registering unchanged content returns the existing head instead of
+    /// growing the stream.
+    pub fn add_wip_from_source(
+        &self,
+        source: &Path,
+        department_key: &DepartmentKey,
+        source_path: String,
+    ) -> Result<WipOutcome> {
+        let source = source
+            .canonicalize()
+            .with_context(|| format!("wip source folder does not exist: {}", source.display()))?;
+        if !source.is_dir() {
+            bail!("wip source path is not a folder: {}", source.display());
+        }
+
+        let manifest = self.build_manifest(&source)?;
+        let manifest_hash = manifest.canonical_hash()?;
+
+        if let Some(head) = self.wip_head(department_key)? {
+            if head.manifest_hash == manifest_hash {
+                return Ok(WipOutcome {
+                    created: false,
+                    seq: head.seq,
+                    manifest_hash,
+                    file_count: head.file_count,
+                    total_bytes: head.total_bytes,
+                });
+            }
+        }
+
+        let seq = self.wip_head_seq(department_key)?.unwrap_or(0) + 1;
+        let record = WipRecord {
+            department_key: department_key.clone(),
+            seq,
+            manifest_hash: manifest_hash.clone(),
+            created_at: Utc::now().to_rfc3339(),
+            source_path,
+            file_count: manifest.entries.len() as u64,
+            total_bytes: manifest.total_bytes(),
+        };
+        let mut batch = WriteBatch::default();
+        batch.put(
+            key_manifest(&manifest_hash),
+            serde_json::to_vec(&manifest).context("failed to serialize manifest")?,
+        );
+        batch.put(
+            key_wip(department_key, seq),
+            serde_json::to_vec(&record).context("failed to serialize wip record")?,
+        );
+        batch.put(key_wip_head(department_key), seq.to_string().as_bytes());
+        self.db.write(batch)?;
+
+        Ok(WipOutcome {
+            created: true,
+            seq,
+            manifest_hash,
+            file_count: record.file_count,
+            total_bytes: record.total_bytes,
+        })
+    }
+
+    /// Promotes a WIP micro-version to the next publish version. Metadata
+    /// only: the manifest and objects are already in the store, so no file
+    /// content is copied.
+    pub fn promote_wip(
+        &self,
+        department_key: &DepartmentKey,
+        wip_seq: Option<u64>,
+    ) -> Result<AddOutcome> {
+        let wip = match wip_seq {
+            Some(seq) => self.get_wip(department_key, seq)?,
+            None => self.wip_head(department_key)?.ok_or_else(|| {
+                anyhow!(
+                    "no wip versions to promote for {}/{}/{}",
+                    department_key.asset_key.category,
+                    department_key.asset_key.asset_code,
+                    department_key.department
+                )
+            })?,
+        };
+
+        if let Some(existing) = self.existing_manifest_version(department_key, &wip.manifest_hash)?
+        {
+            let record = self.get_version(department_key, existing)?;
+            return Ok(AddOutcome {
+                created: false,
+                version: existing,
+                manifest_hash: wip.manifest_hash,
+                file_count: record.file_count,
+                total_bytes: record.total_bytes,
+            });
+        }
+
+        let version = self
+            .latest_version(department_key)?
+            .map_or(VersionId(1), VersionId::next);
+        let now = Utc::now().to_rfc3339();
+        let record = VersionRecord {
+            department_key: department_key.clone(),
+            version,
+            manifest_hash: wip.manifest_hash.clone(),
+            created_at: now.clone(),
+            source_path: wip.source_path.clone(),
+            file_count: wip.file_count,
+            total_bytes: wip.total_bytes,
+            promoted_from: Some(wip.seq),
+        };
+        let previous_asset = self.asset_record(&department_key.asset_key)?;
+        let mut latest_versions = previous_asset
+            .as_ref()
+            .map(|asset| asset.latest_versions.clone())
+            .unwrap_or_default();
+        latest_versions.insert(department_key.department.clone(), version);
+        let asset = AssetRecord {
+            asset_key: department_key.asset_key.clone(),
+            created_at: previous_asset.map(|asset| asset.created_at).unwrap_or(now),
+            latest_versions,
+        };
+
+        let mut batch = WriteBatch::default();
+        batch.put(
+            key_version(department_key, version),
+            serde_json::to_vec(&record).context("failed to serialize version record")?,
+        );
+        batch.put(
+            key_asset(&department_key.asset_key),
+            serde_json::to_vec(&asset).context("failed to serialize asset record")?,
+        );
+        batch.put(key_latest(department_key), version.0.to_string().as_bytes());
+        batch.put(
+            key_manifest_index(department_key, &wip.manifest_hash),
+            version.0.to_string().as_bytes(),
+        );
+        self.db.write(batch)?;
+
+        Ok(AddOutcome {
+            created: true,
+            version,
+            manifest_hash: wip.manifest_hash,
+            file_count: wip.file_count,
+            total_bytes: wip.total_bytes,
+        })
+    }
+
+    /// Mark-and-sweep garbage collection (schema v8 obligation: the WIP
+    /// stream creates objects on every registered write).
+    ///
+    /// Roots are every publish version manifest, every thumbnail object, and
+    /// the newest `wip_retention` micro-versions per department. WIP records
+    /// past retention are pruned together with manifests referenced only by
+    /// them. Unreferenced objects are deleted once older than `grace`
+    /// (modification time), protecting writes that are racing the sweep.
+    pub fn gc(
+        &self,
+        wip_retention: usize,
+        grace: std::time::Duration,
+        dry_run: bool,
+    ) -> Result<GcOutcome> {
+        let mut referenced_manifests: BTreeSet<String> = BTreeSet::new();
+        let mut referenced_objects: BTreeSet<String> = BTreeSet::new();
+        let mut wips_by_department: BTreeMap<String, Vec<(u64, String)>> = BTreeMap::new();
+        let mut wip_heads: BTreeMap<String, DepartmentKey> = BTreeMap::new();
+        let mut all_manifest_hashes: Vec<String> = Vec::new();
+
+        for item in self.db.iterator(IteratorMode::Start) {
+            let (key, value) = item?;
+            if key.starts_with(b"version/") {
+                let record: VersionRecord = serde_json::from_slice(&value).with_context(|| {
+                    format!("failed to decode {}", String::from_utf8_lossy(&key))
+                })?;
+                referenced_manifests.insert(record.manifest_hash);
+            } else if key.starts_with(b"thumbnail/") {
+                let record: ThumbnailRecord = serde_json::from_slice(&value).with_context(
+                    || format!("failed to decode {}", String::from_utf8_lossy(&key)),
+                )?;
+                referenced_objects.insert(record.sha256);
+            } else if key.starts_with(b"wip/") {
+                let record: WipRecord = serde_json::from_slice(&value).with_context(|| {
+                    format!("failed to decode {}", String::from_utf8_lossy(&key))
+                })?;
+                let department = format!(
+                    "{}/{}/{}",
+                    record.department_key.asset_key.category,
+                    record.department_key.asset_key.asset_code,
+                    record.department_key.department
+                );
+                wip_heads.insert(department.clone(), record.department_key.clone());
+                wips_by_department
+                    .entry(department)
+                    .or_default()
+                    .push((record.seq, record.manifest_hash));
+            } else if key.starts_with(b"manifest/") {
+                let hash = String::from_utf8_lossy(&key["manifest/".len()..]).to_string();
+                all_manifest_hashes.push(hash);
+            }
+        }
+
+        let mut pruned_wips = 0u64;
+        let mut prune_batch = WriteBatch::default();
+        for (department, mut wips) in wips_by_department {
+            wips.sort_by_key(|(seq, _)| std::cmp::Reverse(*seq));
+            let department_key = &wip_heads[&department];
+            for (index, (seq, manifest_hash)) in wips.into_iter().enumerate() {
+                if index < wip_retention {
+                    referenced_manifests.insert(manifest_hash);
+                } else {
+                    pruned_wips += 1;
+                    prune_batch.delete(key_wip(department_key, seq));
+                }
+            }
+            if wip_retention == 0 {
+                prune_batch.delete(key_wip_head(department_key));
+            }
+        }
+
+        let mut pruned_manifests = 0u64;
+        for hash in all_manifest_hashes {
+            if !referenced_manifests.contains(&hash) {
+                pruned_manifests += 1;
+                prune_batch.delete(key_manifest(&hash));
+            }
+        }
+        if !dry_run {
+            self.db.write(prune_batch)?;
+        }
+
+        for hash in &referenced_manifests {
+            let manifest = self.get_manifest(hash)?;
+            for entry in manifest.entries {
+                referenced_objects.insert(entry.sha256);
+            }
+        }
+
+        let mut retained_objects = 0u64;
+        let mut deleted_objects = 0u64;
+        let mut deleted_bytes = 0u64;
+        let now = std::time::SystemTime::now();
+        let objects_root = self.root.join(OBJECTS_DIR).join(SHA256_DIR);
+        if objects_root.exists() {
+            for entry in WalkDir::new(&objects_root).follow_links(false) {
+                let entry = entry
+                    .with_context(|| format!("failed to walk {}", objects_root.display()))?;
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+                let sha = entry.file_name().to_string_lossy().to_string();
+                if referenced_objects.contains(&sha) {
+                    retained_objects += 1;
+                    continue;
+                }
+                let metadata = entry
+                    .metadata()
+                    .with_context(|| format!("failed to stat {}", entry.path().display()))?;
+                let age = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|modified| now.duration_since(modified).ok());
+                if age.is_none_or(|age| age < grace) {
+                    retained_objects += 1;
+                    continue;
+                }
+                deleted_objects += 1;
+                deleted_bytes += metadata.len();
+                if !dry_run {
+                    fs::remove_file(entry.path()).with_context(|| {
+                        format!("failed to delete object {}", entry.path().display())
+                    })?;
+                }
+            }
+        }
+
+        Ok(GcOutcome {
+            dry_run,
+            retained_objects,
+            deleted_objects,
+            deleted_bytes,
+            pruned_wips,
+            pruned_manifests,
+        })
+    }
+
     fn add_version_from_source(
         &self,
         source: &Path,
@@ -2790,6 +3346,7 @@ impl Store {
             source_path,
             file_count: manifest.entries.len() as u64,
             total_bytes: manifest.total_bytes(),
+            promoted_from: None,
         };
         let previous_asset = self.asset_record(&department_key.asset_key)?;
         let mut latest_versions = previous_asset
@@ -2982,6 +3539,11 @@ impl Store {
         Ok(record)
     }
 
+    /// Materializes a version into the department work folder
+    /// `<workspace>/<category>/<asset_code>/<department>` — the same root the
+    /// WIP staging processor redirects from, so a pull seeds the artist's
+    /// working area for the wip-add/promote loop. Schema v8: no v### folder
+    /// is created; explicit destinations use `checkout` instead.
     pub fn materialize(
         &self,
         workspace: &Path,
@@ -3001,7 +3563,7 @@ impl Store {
             })?;
         let record = self.get_version(department_key, version)?;
         let manifest = self.get_manifest(&record.manifest_hash)?;
-        let path = version_folder(workspace, department_key, version);
+        let path = department_folder(workspace, department_key);
 
         if path.exists() && (path.is_file() || !is_empty_dir(&path)?) {
             if path.is_dir() && self.folder_matches_manifest(&path, &record.manifest_hash)? {
@@ -3013,7 +3575,7 @@ impl Store {
             }
             if !force {
                 bail!(
-                    "version folder exists and is not empty: {}; pass --force to replace it",
+                    "work folder exists and is not empty: {}; pass --force to replace it",
                     path.display()
                 );
             }
@@ -3037,6 +3599,9 @@ impl Store {
         remote_base_url_override: Option<&str>,
     ) -> Result<ResolveOutcome> {
         let asset_path = self.resolve_asset_path_components(asset_path)?;
+        if asset_path.version == VersionSelector::Wip {
+            return self.resolve_wip_asset_path(workspace, &asset_path, mode);
+        }
         let version = self
             .selected_version(&asset_path.department_key, asset_path.version)?
             .ok_or_else(|| {
@@ -3080,7 +3645,7 @@ impl Store {
                     return Ok(ResolveOutcome {
                         location: cache_path.display().to_string(),
                         source: ResolveSource::Cache,
-                        version,
+                        version: Some(version),
                         sha256: entry.sha256.clone(),
                     });
                 }
@@ -3090,14 +3655,14 @@ impl Store {
                 Ok(ResolveOutcome {
                     location: view_path.display().to_string(),
                     source: ResolveSource::Cache,
-                    version,
+                    version: Some(version),
                     sha256: entry.sha256.clone(),
                 })
             }
             ResolveMode::Remote => Ok(ResolveOutcome {
                 location: self.resolve_remote_url(entry, remote_base_url_override)?,
                 source: ResolveSource::Remote,
-                version,
+                version: Some(version),
                 sha256: entry.sha256.clone(),
             }),
             ResolveMode::Auto => {
@@ -3106,7 +3671,7 @@ impl Store {
                     return Ok(ResolveOutcome {
                         location: cache_path.display().to_string(),
                         source: ResolveSource::Cache,
-                        version,
+                        version: Some(version),
                         sha256: entry.sha256.clone(),
                     });
                 }
@@ -3116,19 +3681,76 @@ impl Store {
                         Ok(ResolveOutcome {
                             location: view_path.display().to_string(),
                             source: ResolveSource::Cache,
-                            version,
+                            version: Some(version),
                             sha256: entry.sha256.clone(),
                         })
                     }
                     Err(_) => Ok(ResolveOutcome {
                         location: self.resolve_remote_url(entry, remote_base_url_override)?,
                         source: ResolveSource::Remote,
-                        version,
+                        version: Some(version),
                         sha256: entry.sha256.clone(),
                     }),
                 }
             }
         }
+    }
+
+    /// Resolves `?v=wip` to the department's WIP head. Local-only: remote
+    /// mode is rejected and there is no remote fallback in auto mode.
+    fn resolve_wip_asset_path(
+        &self,
+        workspace: &Path,
+        asset_path: &ResolvedAssetPath,
+        mode: ResolveMode,
+    ) -> Result<ResolveOutcome> {
+        if mode == ResolveMode::Remote {
+            bail!("wip versions are local-only and cannot resolve in remote mode");
+        }
+        let wip = self.wip_head(&asset_path.department_key)?.ok_or_else(|| {
+            anyhow!(
+                "department has no wip versions: {}/{}/{}",
+                asset_path.department_key.asset_key.category,
+                asset_path.department_key.asset_key.asset_code,
+                asset_path.department_key.department
+            )
+        })?;
+        let manifest = self.get_manifest(&wip.manifest_hash)?;
+        let entry = manifest
+            .entries
+            .iter()
+            .find(|entry| entry.relative_path == asset_path.relative_path)
+            .ok_or_else(|| {
+                anyhow!(
+                    "path not found in {}/{}/{} wip seq {}: {}",
+                    asset_path.department_key.asset_key.category,
+                    asset_path.department_key.asset_key.asset_code,
+                    asset_path.department_key.department,
+                    wip.seq,
+                    asset_path.relative_path
+                )
+            })?;
+        let asset_file_kind = asset_file_kind(
+            &asset_path.department_key.department,
+            &asset_path.relative_path,
+        );
+        if asset_file_kind == AssetFileKind::Texture {
+            let cache_path = self.ensure_cache_object(workspace, entry)?;
+            return Ok(ResolveOutcome {
+                location: cache_path.display().to_string(),
+                source: ResolveSource::Cache,
+                version: None,
+                sha256: entry.sha256.clone(),
+            });
+        }
+        let view_root = self.ensure_manifest_view(workspace, &wip.manifest_hash, &manifest)?;
+        let view_path = safe_join(&view_root, &asset_path.relative_path)?;
+        Ok(ResolveOutcome {
+            location: view_path.display().to_string(),
+            source: ResolveSource::Cache,
+            version: None,
+            sha256: entry.sha256.clone(),
+        })
     }
 
     pub fn current_status_for_department(
@@ -3733,7 +4355,7 @@ impl Store {
                 for department_key in
                     self.department_keys_by_asset_code_department(asset_code, department)?
                 {
-                    if self.selected_version(&department_key, version)?.is_some() {
+                    if self.selector_exists(&department_key, version)? {
                         candidates.push(ResolvedAssetPath {
                             department_key,
                             version,
@@ -3750,7 +4372,7 @@ impl Store {
                 else {
                     continue;
                 };
-                if self.selected_version(&department_key, version)?.is_some() {
+                if self.selector_exists(&department_key, version)? {
                     candidates.push(ResolvedAssetPath {
                         department_key,
                         version,
@@ -4052,9 +4674,26 @@ impl Store {
         match selector {
             VersionSelector::Current => self.current_version(department_key),
             VersionSelector::Latest => self.latest_version(department_key),
+            VersionSelector::Wip => bail!(
+                "the wip selector is only supported by resolve; publish-tier operations need a published version"
+            ),
             VersionSelector::Version(version) => Ok(self
                 .try_get_version(department_key, version)?
                 .map(|_| version)),
+        }
+    }
+
+    /// Whether the selector resolves to anything on this department. Unlike
+    /// `selected_version` this also understands the WIP stream, which has no
+    /// publish version number.
+    fn selector_exists(
+        &self,
+        department_key: &DepartmentKey,
+        selector: VersionSelector,
+    ) -> Result<bool> {
+        match selector {
+            VersionSelector::Wip => Ok(self.wip_head_seq(department_key)?.is_some()),
+            other => Ok(self.selected_version(department_key, other)?.is_some()),
         }
     }
 
@@ -4295,6 +4934,7 @@ impl RemoteClient {
         match selector {
             VersionSelector::Current => {}
             VersionSelector::Latest => query.push(("latest", "true".to_string())),
+            VersionSelector::Wip => bail!("wip versions are local-only and cannot be fetched"),
             VersionSelector::Version(version) => query.push(("version", version.0.to_string())),
         }
         self.get_json("/api/version", &query)
@@ -7463,6 +8103,25 @@ fn key_version(department_key: &DepartmentKey, version: VersionId) -> String {
     )
 }
 
+fn key_wip(department_key: &DepartmentKey, seq: u64) -> String {
+    format!(
+        "wip/{}/{}/{}/{:020}",
+        department_key.asset_key.category,
+        department_key.asset_key.asset_code,
+        department_key.department,
+        seq
+    )
+}
+
+fn key_wip_head(department_key: &DepartmentKey) -> String {
+    format!(
+        "wip_head/{}/{}/{}",
+        department_key.asset_key.category,
+        department_key.asset_key.asset_code,
+        department_key.department
+    )
+}
+
 fn key_latest(department_key: &DepartmentKey) -> String {
     format!(
         "latest/{}/{}/{}",
@@ -7621,22 +8280,52 @@ mod tests {
     }
 
     #[test]
-    fn publish_reference_validation_rejects_local_paths() {
+    fn publish_reference_validation_applies_v8_policy() {
         let mut report = PublishValidateReport {
-            root: PathBuf::from("public"),
+            target: "version 1".to_string(),
             files_scanned: 1,
             references_checked: 0,
             warnings: Vec::new(),
             errors: Vec::new(),
         };
+        let entry_paths: BTreeSet<String> = ["asset.usda", "geo/body.usd", "maps/d.tx"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
 
-        validate_public_reference(&mut report, "asset.usda", r"D:\workspace\asset.usd");
-        validate_public_reference(&mut report, "asset.usda", "file:///tmp/asset.usd");
-        validate_public_reference(&mut report, "asset.usda", "https://example.com/asset.usd");
+        // ads:// and manifest-internal relative references are accepted.
+        validate_publish_reference(
+            &mut report,
+            &entry_paths,
+            "asset.usda",
+            "ads://prop/crate/model/crate.usd?v=2",
+        );
+        validate_publish_reference(&mut report, &entry_paths, "asset.usda", "geo/body.usd");
+        validate_publish_reference(&mut report, &entry_paths, "geo/body.usd", "../maps/d.tx");
+        assert!(report.errors.is_empty());
 
-        assert_eq!(report.errors.len(), 2);
+        // Absolute paths, file URIs, missing siblings, and escapes are errors.
+        validate_publish_reference(
+            &mut report,
+            &entry_paths,
+            "asset.usda",
+            r"D:\workspace\asset.usd",
+        );
+        validate_publish_reference(&mut report, &entry_paths, "asset.usda", "file:///tmp/a.usd");
+        validate_publish_reference(&mut report, &entry_paths, "asset.usda", "geo/missing.usd");
+        validate_publish_reference(&mut report, &entry_paths, "asset.usda", "../outside.usd");
+        validate_publish_reference(
+            &mut report,
+            &entry_paths,
+            "asset.usda",
+            "https://example.com/asset.usd",
+        );
+
+        assert_eq!(report.errors.len(), 4);
         assert!(report.errors[0].contains("absolute path"));
         assert!(report.errors[1].contains("file URI"));
+        assert!(report.errors[2].contains("missing from the version"));
+        assert!(report.errors[3].contains("escapes the version root"));
         assert_eq!(report.warnings.len(), 1);
     }
 
@@ -7724,9 +8413,7 @@ mod tests {
         let store = Store::init(&store_path).unwrap();
         let key = AssetKey::new("char".to_string(), "hero".to_string()).unwrap();
         let department_key = DepartmentKey::new(key, "model".to_string()).unwrap();
-        store
-            .new_version_folder(&workspace, &department_key)
-            .unwrap();
+        fs::create_dir_all(version_folder(&workspace, &department_key, VersionId(1))).unwrap();
         fs::write(
             version_folder(&workspace, &department_key, VersionId(1)).join("asset.usd"),
             "usd content",
@@ -7814,9 +8501,7 @@ mod tests {
             "model".to_string(),
         )
         .unwrap();
-        store
-            .new_version_folder(&workspace, &department_key)
-            .unwrap();
+        fs::create_dir_all(version_folder(&workspace, &department_key, VersionId(1))).unwrap();
         fs::write(
             version_folder(&workspace, &department_key, VersionId(1)).join("crate.usd"),
             "v1",
@@ -7825,9 +8510,7 @@ mod tests {
         store
             .add_version_folder(&workspace, &department_key, VersionId(1))
             .unwrap();
-        store
-            .new_version_folder(&workspace, &department_key)
-            .unwrap();
+        fs::create_dir_all(version_folder(&workspace, &department_key, VersionId(2))).unwrap();
         fs::write(
             version_folder(&workspace, &department_key, VersionId(2)).join("crate.usd"),
             "v2",
@@ -7846,9 +8529,12 @@ mod tests {
             "model".to_string(),
         )
         .unwrap();
-        store
-            .new_version_folder(&workspace, &nested_department_key)
-            .unwrap();
+        fs::create_dir_all(version_folder(
+            &workspace,
+            &nested_department_key,
+            VersionId(1),
+        ))
+        .unwrap();
         fs::write(
             version_folder(&workspace, &nested_department_key, VersionId(1)).join("truck.usd"),
             "truck-v1",
@@ -7952,7 +8638,9 @@ mod tests {
         assert_eq!(set_current["current"], 1);
         assert_eq!(set_current["explicit"], true);
 
-        fs::remove_dir_all(version_folder(&workspace, &department_key, VersionId(1))).unwrap();
+        // Schema v8: pull seeds the department work folder (no v### name),
+        // the same root the WIP staging processor redirects from.
+        fs::remove_dir_all(department_folder(&workspace, &department_key)).unwrap();
         let pull = app
             .oneshot(api_request(
                 "POST",
@@ -7966,10 +8654,8 @@ mod tests {
             .unwrap();
         assert_eq!(pull.status(), StatusCode::OK);
         assert_eq!(
-            fs::read_to_string(
-                version_folder(&workspace, &department_key, VersionId(1)).join("crate.usd")
-            )
-            .unwrap(),
+            fs::read_to_string(department_folder(&workspace, &department_key).join("crate.usd"))
+                .unwrap(),
             "v1"
         );
     }
@@ -7988,9 +8674,7 @@ mod tests {
             "model".to_string(),
         )
         .unwrap();
-        store
-            .new_version_folder(&workspace, &department_key)
-            .unwrap();
+        fs::create_dir_all(version_folder(&workspace, &department_key, VersionId(1))).unwrap();
         fs::write(
             version_folder(&workspace, &department_key, VersionId(1)).join("crate.usd"),
             "v1",
@@ -8110,6 +8794,7 @@ mod tests {
                 source_path: "prop/crate/model/v001".to_string(),
                 file_count: 1,
                 total_bytes: object_bytes.len() as u64,
+                promoted_from: None,
             },
             manifest,
         };

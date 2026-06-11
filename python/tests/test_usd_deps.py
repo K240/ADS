@@ -15,20 +15,16 @@ from ads.usd_deps import (
 class FakeAds:
     def __init__(self):
         self.calls = []
+        self.materialized = set()
 
     def resolve(self, asset_path, *, store, workspace=None, mode="local", remote_base_url=None):
         self.calls.append(("resolve", asset_path, store, workspace, mode))
-        if "hero" in asset_path:
-            return "D:/workspace/char/hero/model/v002/hero.usd"
-        raise AdsCommandError(["ads", "resolve"], 1, "", "missing local file")
-
-    def restore(self, **kwargs):
-        self.calls.append(("restore", kwargs))
-        return "restored"
-
-    def pull(self, **kwargs):
-        self.calls.append(("pull", kwargs))
-        return "pulled"
+        if "hero" in asset_path or asset_path in self.materialized:
+            return "D:/workspace/.ads-cache/manifests/abc123/hero.usd"
+        # Schema v8: execute warms the view cache via resolve, so the fake
+        # succeeds on the second attempt for any path.
+        self.materialized.add(asset_path)
+        raise AdsCommandError(["ads", "resolve"], 1, "", "missing local objects")
 
 
 class UsdDepsTests(unittest.TestCase):
@@ -117,12 +113,13 @@ def Xform "root" (
         self.assertEqual(len(plan.dependencies), 2)
         self.assertEqual(plan.dependencies[0].action, "none")
         self.assertTrue(plan.dependencies[0].present)
-        self.assertEqual(plan.dependencies[1].action, "restore")
+        self.assertEqual(plan.dependencies[1].action, "materialize")
         self.assertFalse(plan.dependencies[1].present)
         self.assertEqual(plan.pull_urls, ["ads://prop/crate/model/crate.usd?v=v003"])
 
-    def test_execute_pull_plan_restores_explicit_version(self):
-        # The canonical v8 pin form is a bare integer; v### stays accepted.
+    def test_execute_pull_plan_materializes_via_resolve(self):
+        # Schema v8: executing the plan warms the manifest view cache with a
+        # plain local resolve; the canonical pin form is a bare integer.
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / "root.usda"
             root.write_text(
@@ -139,11 +136,16 @@ def Xform "root" (
 
             fake = FakeAds()
             plan = build_pull_plan(root, store="D:/store", workspace="D:/workspace", ads=fake)
+            self.assertEqual(plan.dependencies[0].action, "materialize")
             execute_pull_plan(plan, store="D:/store", workspace="D:/workspace", ads=fake)
 
-        restore_calls = [call for call in fake.calls if call[0] == "restore"]
-        self.assertEqual(len(restore_calls), 1)
-        self.assertEqual(restore_calls[0][1]["version"], "3")
+        item = plan.dependencies[0]
+        self.assertEqual(item.action, "none")
+        self.assertTrue(item.present)
+        self.assertIn(".ads-cache/manifests", item.local_path)
+        resolve_calls = [call for call in fake.calls if call[0] == "resolve"]
+        self.assertEqual(len(resolve_calls), 2)
+        self.assertEqual(resolve_calls[1][1], "ads://prop/crate/model/crate.usd?v=3")
 
 
 if __name__ == "__main__":

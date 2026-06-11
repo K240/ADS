@@ -20,25 +20,36 @@ ads.asset_create(
     category="char",
     asset_code="hero",
 )
-ads.new_version(
+```
+
+Register WIP writes and promote them to a publish version (schema v8):
+
+```python
+ads.wip_add(
     store=r"D:\store",
-    workspace=r"D:\workspace",
+    category="char",
+    asset_code="hero",
+    department="model",
+    source=r"D:\workspace\.ads-staging\run1\char\hero\model",
+)
+ads.publish_promote(
+    store=r"D:\store",
     category="char",
     asset_code="hero",
     department="model",
 )
 ```
 
-Register a version folder:
+Register a version directly from any source folder (the version number is
+auto-assigned when omitted):
 
 ```python
 ads.add(
     store=r"D:\store",
-    workspace=r"D:\workspace",
     category="char",
     asset_code="hero",
     department="model",
-    version="v001",
+    source=r"D:\delivery\hero_model_fix",
 )
 ```
 
@@ -52,37 +63,32 @@ path = ads.resolve(
 )
 ```
 
-Pull the current workspace version:
+Materialize a version into an explicit folder when real files are needed
+outside the resolver (local resolution itself needs no pull step):
 
 ```python
-ads.pull(
+ads.checkout(
     store=r"D:\store",
-    workspace=r"D:\workspace",
     category="char",
     asset_code="hero",
     department="model",
+    dest=r"D:\temp\hero_model",
 )
 ```
 
-Register a public USD ROP output folder:
+Validate the publish reference policy (run automatically by
+`publish_promote`; cross-asset references must be `ads://`, intra-version
+relative references are allowed):
 
 ```python
 ads.publish_validate(
     store=r"D:\store",
-    public_root=r"D:\public",
     category="char",
     asset_code="hero",
     department="model",
-    version="v003",
+    wip=True,
 )
-ads.publish_register(
-    store=r"D:\store",
-    public_root=r"D:\public",
-    category="char",
-    asset_code="hero",
-    department="model",
-    version="v003",
-)
+ads.publish_validate(source=r"D:\delivery\hero_model_fix")
 ```
 
 Fetch a remote version into a local store:
@@ -209,23 +215,28 @@ uv run ads-deps D:\shots\shot010\shot.usda `
 
 Inside Houdini, run it with `hython -m ads.usd_deps` and set `PYTHONPATH` to `python/src` so the utility can use OpenUSD's dependency APIs for binary `.usd/.usdc` files.
 
-## Houdini USD ROP Output Processor
+## Houdini WIP Staging
 
-`ads.houdini_output.AdsPathMapper` is the pure Python mapping layer used by the Houdini `ADS Managed Publish` output processor.
+`ads.houdini_wip.WipStaging` is the pure Python layer used by the Houdini
+`ADS WIP Staging` output processor
+(`houdini/husdplugins/outputprocessors/adswipstaging.py`). It redirects saves
+under the department work folder to a unique staging run, and
+`commit_staged()` registers the result as a WIP micro-version from a ROP
+post-render script. See `houdini/README.md` for the ROP wiring.
 
 ```python
-from ads.houdini_output import AdsPathMapper
+from ads.houdini_wip import WipStaging
 
-mapper = AdsPathMapper(
+staging = WipStaging(
     workspace_root=r"D:\workspace",
-    public_root=r"D:\public",
+    category="char",
+    asset_code="hero",
+    department="model",
 )
 
-mapper.to_ads_uri(r"D:\public\char\hero\model\v003\hero.usd")
-# ads://char/hero/model/hero.usd?v=v003
+staging.redirect(r"D:\workspace\char\hero\model\hero.usd")
+# D:/workspace/.ads-staging/<run-id>/char/hero/model/hero.usd
 ```
-
-The Houdini plugin lives under `houdini/husdplugins/outputprocessors/adspublish.py`. It rewrites ADS-managed references emitted by Solaris USD ROPs to version-pinned `ads://` URIs, and can redirect save paths from the workspace root to a public root.
 
 ## Development
 

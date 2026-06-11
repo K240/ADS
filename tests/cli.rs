@@ -17,8 +17,7 @@ fn new_version_add_list_info_checkout_flow() {
     let checkout = temp.path().join("checkout");
 
     assert!(ads().arg("init").arg(&store).status().unwrap().success());
-    let created = new_version(&store, &workspace, "char", "hero");
-    assert!(created.status.success(), "{}", stderr(&created));
+    new_version(&store, &workspace, "char", "hero");
     let v001 = version_folder(&workspace, "char", "hero", "v001");
     assert!(v001.is_dir());
 
@@ -76,46 +75,6 @@ fn new_version_add_list_info_checkout_flow() {
 }
 
 #[test]
-fn new_version_copies_latest_into_next_version_folder() {
-    let temp = TempDir::new().unwrap();
-    let store = temp.path().join("store");
-    let workspace = temp.path().join("workspace");
-    assert!(ads().arg("init").arg(&store).status().unwrap().success());
-
-    assert!(
-        new_version(&store, &workspace, "prop", "crate")
-            .status
-            .success()
-    );
-    fs::write(
-        version_folder(&workspace, "prop", "crate", "v001").join("model.usd"),
-        "v1",
-    )
-    .unwrap();
-    add_asset(&store, &workspace, "prop", "crate", "v001");
-
-    let created = new_version(&store, &workspace, "prop", "crate");
-    assert!(created.status.success(), "{}", stderr(&created));
-    let v002_file = version_folder(&workspace, "prop", "crate", "v002").join("model.usd");
-    assert_eq!(fs::read_to_string(v002_file).unwrap(), "v1");
-}
-
-#[test]
-fn new_version_refuses_existing_non_empty_version_folder() {
-    let temp = TempDir::new().unwrap();
-    let store = temp.path().join("store");
-    let workspace = temp.path().join("workspace");
-    let v001 = version_folder(&workspace, "prop", "crate", "v001");
-    fs::create_dir_all(&v001).unwrap();
-    fs::write(v001.join("old.txt"), "old").unwrap();
-
-    assert!(ads().arg("init").arg(&store).status().unwrap().success());
-    let created = new_version(&store, &workspace, "prop", "crate");
-    assert!(!created.status.success());
-    assert!(stderr(&created).contains("not empty"));
-}
-
-#[test]
 fn add_uses_version_folders_and_protects_registered_versions() {
     let temp = TempDir::new().unwrap();
     let store = temp.path().join("store");
@@ -141,11 +100,7 @@ fn add_uses_version_folders_and_protects_registered_versions() {
     assert!(!missing.status.success());
     assert!(stderr(&missing).contains("version folder does not exist"));
 
-    assert!(
-        new_version(&store, &workspace, "prop", "crate")
-            .status
-            .success()
-    );
+    new_version(&store, &workspace, "prop", "crate");
     let v001 = version_folder(&workspace, "prop", "crate", "v001");
     fs::write(v001.join("model.usd"), "v1").unwrap();
 
@@ -159,8 +114,7 @@ fn add_uses_version_folders_and_protects_registered_versions() {
     assert!(!changed_registered.status.success());
     assert!(stderr(&changed_registered).contains("different content"));
 
-    let created = new_version(&store, &workspace, "prop", "crate");
-    assert!(created.status.success(), "{}", stderr(&created));
+    new_version(&store, &workspace, "prop", "crate");
     let v002 = version_folder(&workspace, "prop", "crate", "v002");
     fs::write(v002.join("model.usd"), "v2").unwrap();
     let third = add_asset(&store, &workspace, "prop", "crate", "v002");
@@ -190,8 +144,7 @@ fn nested_category_paths_create_expected_folders_and_resolve() {
     let category = "assets/characters/main";
 
     assert!(ads().arg("init").arg(&store).status().unwrap().success());
-    let created = new_version(&store, &workspace, category, "hero");
-    assert!(created.status.success(), "{}", stderr(&created));
+    new_version(&store, &workspace, category, "hero");
     let v001 = version_folder(&workspace, category, "hero", "v001");
     assert!(v001.is_dir());
     fs::create_dir(v001.join("geo")).unwrap();
@@ -234,16 +187,8 @@ fn departments_have_independent_version_sequences() {
 
     assert!(ads().arg("init").arg(&store).status().unwrap().success());
 
-    assert!(
-        new_version_department(&store, &workspace, "char", "hero", "model")
-            .status
-            .success()
-    );
-    assert!(
-        new_version_department(&store, &workspace, "char", "hero", "anim")
-            .status
-            .success()
-    );
+    new_version_department(&store, &workspace, "char", "hero", "model");
+    new_version_department(&store, &workspace, "char", "hero", "anim");
     let model_v001 = department_version_folder(&workspace, "char", "hero", "model", "v001");
     let anim_v001 = department_version_folder(&workspace, "char", "hero", "anim", "v001");
     fs::write(model_v001.join("model.usd"), "model v1").unwrap();
@@ -254,8 +199,7 @@ fn departments_have_independent_version_sequences() {
     assert!(model_add.contains("created v001 char/hero/model"));
     assert!(anim_add.contains("created v001 char/hero/anim"));
 
-    let model_next = new_version_department(&store, &workspace, "char", "hero", "model");
-    assert!(model_next.status.success(), "{}", stderr(&model_next));
+    new_version_department(&store, &workspace, "char", "hero", "model");
     assert!(department_version_folder(&workspace, "char", "hero", "model", "v002").is_dir());
     assert!(!department_version_folder(&workspace, "char", "hero", "anim", "v002").exists());
 
@@ -306,23 +250,18 @@ fn asset_create_and_asset_log_work_before_versions_exist() {
     assert!(!duplicate.status.success());
     assert!(stderr(&duplicate).contains("already exists"));
 
-    let new_version = new_version(&store, &workspace, "env/city", "street");
-    assert!(new_version.status.success(), "{}", stderr(&new_version));
+    new_version(&store, &workspace, "env/city", "street");
     assert!(version_folder(&workspace, "env/city", "street", "v001").is_dir());
 }
 
 #[test]
-fn pull_restores_latest_and_requires_force_for_different_content() {
+fn checkout_materializes_current_latest_and_respects_force() {
     let temp = TempDir::new().unwrap();
     let store = temp.path().join("store");
     let workspace = temp.path().join("workspace");
     assert!(ads().arg("init").arg(&store).status().unwrap().success());
 
-    assert!(
-        new_version(&store, &workspace, "prop", "crate")
-            .status
-            .success()
-    );
+    new_version(&store, &workspace, "prop", "crate");
     fs::write(
         version_folder(&workspace, "prop", "crate", "v001").join("model.usd"),
         "v1",
@@ -330,105 +269,185 @@ fn pull_restores_latest_and_requires_force_for_different_content() {
     .unwrap();
     add_asset(&store, &workspace, "prop", "crate", "v001");
 
-    assert!(
-        new_version(&store, &workspace, "prop", "crate")
-            .status
-            .success()
-    );
-    let v002 = version_folder(&workspace, "prop", "crate", "v002");
-    fs::write(v002.join("model.usd"), "v2").unwrap();
+    new_version(&store, &workspace, "prop", "crate");
+    fs::write(
+        version_folder(&workspace, "prop", "crate", "v002").join("model.usd"),
+        "v2",
+    )
+    .unwrap();
     add_asset(&store, &workspace, "prop", "crate", "v002");
 
-    fs::remove_dir_all(&v002).unwrap();
-    let pulled = pull_latest(&store, &workspace, false);
-    assert!(pulled.status.success(), "{}", stderr(&pulled));
-    assert_eq!(fs::read_to_string(v002.join("model.usd")).unwrap(), "v2");
+    let dest = temp.path().join("out");
+    let current = checkout_asset(&store, "prop", "crate", &dest, false);
+    assert!(current.status.success(), "{}", stderr(&current));
+    assert_eq!(fs::read_to_string(dest.join("model.usd")).unwrap(), "v2");
 
-    let same = pull_latest(&store, &workspace, false);
-    assert!(same.status.success(), "{}", stderr(&same));
-    assert!(stdout(&same).contains("already pulled"));
-
-    fs::write(v002.join("model.usd"), "local edits").unwrap();
-    let blocked = pull_latest(&store, &workspace, false);
+    fs::write(dest.join("model.usd"), "local edits").unwrap();
+    let blocked = checkout_asset(&store, "prop", "crate", &dest, false);
     assert!(!blocked.status.success());
     assert!(stderr(&blocked).contains("not empty"));
-
-    let forced = pull_latest(&store, &workspace, true);
+    let forced = checkout_asset(&store, "prop", "crate", &dest, true);
     assert!(forced.status.success(), "{}", stderr(&forced));
-    assert_eq!(fs::read_to_string(v002.join("model.usd")).unwrap(), "v2");
+    assert_eq!(fs::read_to_string(dest.join("model.usd")).unwrap(), "v2");
 
-    let v001 = version_folder(&workspace, "prop", "crate", "v001");
-    fs::remove_dir_all(&v001).unwrap();
-    let restored = restore_version(&store, &workspace, "v001", false);
-    assert!(restored.status.success(), "{}", stderr(&restored));
-    assert!(stdout(&restored).contains("restored v001"));
-    assert_eq!(fs::read_to_string(v001.join("model.usd")).unwrap(), "v1");
+    let pinned_dest = temp.path().join("out-v1");
+    let pinned = checkout_version(&store, "1", &pinned_dest);
+    assert!(pinned.status.success(), "{}", stderr(&pinned));
+    assert_eq!(
+        fs::read_to_string(pinned_dest.join("model.usd")).unwrap(),
+        "v1"
+    );
 }
 
 #[test]
-fn publish_register_adds_public_version_folder() {
+fn wip_stream_promotes_resolves_and_gc_prunes() {
     let temp = TempDir::new().unwrap();
     let store = temp.path().join("store");
-    let public = temp.path().join("public");
+    let workspace = temp.path().join("workspace");
+    let staging = temp.path().join("staging");
     assert!(ads().arg("init").arg(&store).status().unwrap().success());
 
-    let v001 = department_version_folder(&public, "prop", "crate", "model", "v001");
-    fs::create_dir_all(v001.join("geo")).unwrap();
+    // Three writes into the WIP stream; the unchanged middle write is deduped.
+    fs::create_dir_all(&staging).unwrap();
+    fs::write(staging.join("hero.usd"), "wip-1").unwrap();
+    let first = wip_add(&store, &staging);
+    assert!(first.status.success(), "{}", stderr(&first));
+    assert!(stdout(&first).contains("registered wip seq=1"));
+
+    let unchanged = wip_add(&store, &staging);
+    assert!(unchanged.status.success(), "{}", stderr(&unchanged));
+    assert!(stdout(&unchanged).contains("unchanged wip seq=1"));
+
+    fs::write(staging.join("hero.usd"), "wip-2").unwrap();
+    let second = wip_add(&store, &staging);
+    assert!(second.status.success(), "{}", stderr(&second));
+    assert!(stdout(&second).contains("registered wip seq=2"));
+
+    // ?v=wip resolves the head through the manifest view (local-only).
+    let wip_resolved = resolve_asset(
+        &store,
+        &workspace,
+        "local",
+        None,
+        "ads://char/hero/model/hero.usd?v=wip",
+    );
+    assert!(wip_resolved.status.success(), "{}", stderr(&wip_resolved));
+    assert_view_resolution(&workspace, &wip_resolved, "hero.usd", "wip-2");
+
+    let remote_blocked = resolve_asset(
+        &store,
+        &workspace,
+        "remote",
+        None,
+        "ads://char/hero/model/hero.usd?v=wip",
+    );
+    assert!(!remote_blocked.status.success());
+    assert!(stderr(&remote_blocked).contains("local-only"));
+
+    // Promotion assigns the next publish version without copying files.
+    let promoted = publish_promote(&store, false);
+    assert!(promoted.status.success(), "{}", stderr(&promoted));
+    assert!(stdout(&promoted).contains("promoted v001"));
+    let promoted_again = publish_promote(&store, false);
+    assert!(promoted_again.status.success(), "{}", stderr(&promoted_again));
+    assert!(stdout(&promoted_again).contains("reused v001"));
+    let resolved = resolve_asset(
+        &store,
+        &workspace,
+        "local",
+        None,
+        "ads://char/hero/model/hero.usd",
+    );
+    assert!(resolved.status.success(), "{}", stderr(&resolved));
+    assert_view_resolution(&workspace, &resolved, "hero.usd", "wip-2");
+
+    // GC with retention 1: the dry run reports without deleting, the real
+    // run prunes the old micro-version and its now-orphaned object.
+    let dry = gc_run(&store, 1, 0, true);
+    assert!(dry.status.success(), "{}", stderr(&dry));
+    assert!(stdout(&dry).contains("\"pruned_wips\": 1"));
+    assert!(stdout(&dry).contains("\"deleted_objects\": 1"));
+    let wips = wip_list(&store);
+    assert_eq!(stdout(&wips).matches("\"seq\"").count(), 2);
+
+    let swept = gc_run(&store, 1, 0, false);
+    assert!(swept.status.success(), "{}", stderr(&swept));
+    assert!(stdout(&swept).contains("\"pruned_wips\": 1"));
+    let wips = wip_list(&store);
+    assert_eq!(stdout(&wips).matches("\"seq\"").count(), 1);
+
+    // The promoted version still resolves after the sweep: its objects are roots.
+    let after = resolve_asset(
+        &store,
+        &workspace,
+        "local",
+        None,
+        "ads://char/hero/model/hero.usd?v=1",
+    );
+    assert!(after.status.success(), "{}", stderr(&after));
+}
+
+#[test]
+fn publish_validate_accepts_ads_and_manifest_internal_references() {
+    let temp = TempDir::new().unwrap();
+    let store = temp.path().join("store");
+    let staging = temp.path().join("staging");
+    assert!(ads().arg("init").arg(&store).status().unwrap().success());
+
+    // ads:// for cross-asset references, relative for siblings of the same
+    // version: both are valid under the v8 policy.
+    fs::create_dir_all(staging.join("geo")).unwrap();
     fs::write(
-        v001.join("crate.usda"),
-        r#"def "Crate" (references = @ads://prop/crate/model/geo/body.usd?v=v001@) {}"#,
+        staging.join("hero.usda"),
+        r#"def "Hero" (references = [@ads://prop/crate/model/crate.usd?v=2@, @geo/body.usd@]) {}"#,
     )
     .unwrap();
-    fs::write(v001.join("geo").join("body.usd"), "body").unwrap();
+    fs::write(staging.join("geo").join("body.usd"), "body").unwrap();
 
-    let validate = publish_validate(&store, &public, "prop", "crate", "model", "v001");
-    assert!(validate.status.success(), "{}", stderr(&validate));
-    assert!(stdout(&validate).contains("references_checked=1"));
+    let source_check = publish_validate_source(&staging);
+    assert!(source_check.status.success(), "{}", stderr(&source_check));
+    assert!(stdout(&source_check).contains("references_checked=2"));
 
-    let registered = publish_register(&store, &public, "prop", "crate", "model", "v001");
+    let registered = wip_add(&store, &staging);
     assert!(registered.status.success(), "{}", stderr(&registered));
-    assert!(stdout(&registered).contains("registered v001 prop/crate/model"));
+    let promoted = publish_promote(&store, false);
+    assert!(promoted.status.success(), "{}", stderr(&promoted));
+    assert!(stdout(&promoted).contains("promoted v001"));
 
-    let info = ads()
-        .arg("info")
-        .arg("--store")
-        .arg(&store)
-        .arg("--category")
-        .arg("prop")
-        .arg("--asset-code")
-        .arg("crate")
-        .arg("--department")
-        .arg("model")
-        .arg("--version")
-        .arg("v001")
-        .output()
-        .unwrap();
-    assert!(info.status.success(), "{}", stderr(&info));
-    let info_stdout = stdout(&info);
-    assert!(info_stdout.contains("crate.usda"));
-    assert!(info_stdout.contains("geo/body.usd"));
+    let validate = publish_validate_version(&store, "1");
+    assert!(validate.status.success(), "{}", stderr(&validate));
+    assert!(stdout(&validate).contains("references_checked=2"));
 }
 
 #[test]
-fn publish_validate_rejects_unmanaged_relative_references() {
+fn promote_gate_rejects_escaping_and_absolute_references() {
     let temp = TempDir::new().unwrap();
     let store = temp.path().join("store");
-    let public = temp.path().join("public");
+    let staging = temp.path().join("staging");
     assert!(ads().arg("init").arg(&store).status().unwrap().success());
 
-    let v001 = department_version_folder(&public, "prop", "crate", "model", "v001");
-    fs::create_dir_all(&v001).unwrap();
+    fs::create_dir_all(&staging).unwrap();
     fs::write(
-        v001.join("crate.usda"),
-        r#"def "Crate" (references = @../texture/v001/body.1001.tx@) {}"#,
+        staging.join("hero.usda"),
+        r#"def "Hero" (references = [@../outside/body.usd@, @D:/abs/tex.tx@]) {}"#,
     )
     .unwrap();
 
-    let validate = publish_validate(&store, &public, "prop", "crate", "model", "v001");
-    assert!(!validate.status.success());
-    let err = stderr(&validate);
-    assert!(err.contains("unmanaged relative path"));
-    assert!(err.contains("../texture/v001/body.1001.tx"));
+    let registered = wip_add(&store, &staging);
+    assert!(registered.status.success(), "{}", stderr(&registered));
+
+    // The default promote gate refuses to publish unmanaged references.
+    let blocked = publish_promote(&store, false);
+    assert!(!blocked.status.success());
+    let err = stderr(&blocked);
+    assert!(err.contains("escapes the version root"));
+    assert!(err.contains("absolute path"));
+    assert!(err.contains("promote validation gate failed"));
+
+    // --no-validate bypasses the gate explicitly.
+    let forced = publish_promote(&store, true);
+    assert!(forced.status.success(), "{}", stderr(&forced));
+    assert!(stdout(&forced).contains("promoted v001"));
 }
 
 #[test]
@@ -438,11 +457,7 @@ fn current_pointer_defaults_to_latest_and_can_be_pinned() {
     let workspace = temp.path().join("workspace");
     assert!(ads().arg("init").arg(&store).status().unwrap().success());
 
-    assert!(
-        new_version(&store, &workspace, "prop", "crate")
-            .status
-            .success()
-    );
+    new_version(&store, &workspace, "prop", "crate");
     fs::write(
         version_folder(&workspace, "prop", "crate", "v001").join("crate.usd"),
         "v1",
@@ -450,11 +465,7 @@ fn current_pointer_defaults_to_latest_and_can_be_pinned() {
     .unwrap();
     add_asset(&store, &workspace, "prop", "crate", "v001");
 
-    assert!(
-        new_version(&store, &workspace, "prop", "crate")
-            .status
-            .success()
-    );
+    new_version(&store, &workspace, "prop", "crate");
     fs::write(
         version_folder(&workspace, "prop", "crate", "v002").join("crate.usd"),
         "v2",
@@ -462,16 +473,15 @@ fn current_pointer_defaults_to_latest_and_can_be_pinned() {
     .unwrap();
     add_asset(&store, &workspace, "prop", "crate", "v002");
 
-    fs::remove_dir_all(version_folder(&workspace, "prop", "crate", "v002")).unwrap();
-    let materialized_default = pull_current(&store, &workspace, false);
+    let default_dest = temp.path().join("out-default");
+    let materialized_default = checkout_asset(&store, "prop", "crate", &default_dest, false);
     assert!(
         materialized_default.status.success(),
         "{}",
         stderr(&materialized_default)
     );
     assert_eq!(
-        fs::read_to_string(version_folder(&workspace, "prop", "crate", "v002").join("crate.usd"))
-            .unwrap(),
+        fs::read_to_string(default_dest.join("crate.usd")).unwrap(),
         "v2"
     );
 
@@ -497,16 +507,15 @@ fn current_pointer_defaults_to_latest_and_can_be_pinned() {
     assert!(get.status.success(), "{}", stderr(&get));
     assert_eq!(stdout(&get).trim(), "v001");
 
-    fs::remove_dir_all(version_folder(&workspace, "prop", "crate", "v001")).unwrap();
-    let materialized_pinned = pull_current(&store, &workspace, false);
+    let pinned_dest = temp.path().join("out-pinned");
+    let materialized_pinned = checkout_asset(&store, "prop", "crate", &pinned_dest, false);
     assert!(
         materialized_pinned.status.success(),
         "{}",
         stderr(&materialized_pinned)
     );
     assert_eq!(
-        fs::read_to_string(version_folder(&workspace, "prop", "crate", "v001").join("crate.usd"))
-            .unwrap(),
+        fs::read_to_string(pinned_dest.join("crate.usd")).unwrap(),
         "v1"
     );
 
@@ -560,11 +569,7 @@ fn resolve_supports_local_remote_auto_and_latest_asset_paths() {
     let workspace = temp.path().join("workspace");
     assert!(ads().arg("init").arg(&store).status().unwrap().success());
 
-    assert!(
-        new_version(&store, &workspace, "prop", "crate")
-            .status
-            .success()
-    );
+    new_version(&store, &workspace, "prop", "crate");
     fs::write(
         version_folder(&workspace, "prop", "crate", "v001").join("model.usd"),
         "v1",
@@ -600,11 +605,7 @@ fn resolve_supports_local_remote_auto_and_latest_asset_paths() {
         )
     );
 
-    assert!(
-        new_version(&store, &workspace, "prop", "crate")
-            .status
-            .success()
-    );
+    new_version(&store, &workspace, "prop", "crate");
     fs::write(
         version_folder(&workspace, "prop", "crate", "v002").join("model.usd"),
         "v2",
@@ -652,11 +653,7 @@ fn resolve_textures_to_hash_cache_path() {
     let workspace = temp.path().join("workspace");
     assert!(ads().arg("init").arg(&store).status().unwrap().success());
 
-    assert!(
-        new_version_department(&store, &workspace, "prop", "crate", "texture")
-            .status
-            .success()
-    );
+    new_version_department(&store, &workspace, "prop", "crate", "texture");
     let texture_v001 = department_version_folder(&workspace, "prop", "crate", "texture", "v001");
     fs::create_dir(texture_v001.join("maps")).unwrap();
     fs::write(
@@ -692,20 +689,12 @@ fn resolving_updated_texture_name_uses_new_hash_cache_file() {
     let workspace = temp.path().join("workspace");
     assert!(ads().arg("init").arg(&store).status().unwrap().success());
 
-    assert!(
-        new_version_department(&store, &workspace, "prop", "crate", "texture")
-            .status
-            .success()
-    );
+    new_version_department(&store, &workspace, "prop", "crate", "texture");
     let v001 = department_version_folder(&workspace, "prop", "crate", "texture", "v001");
     fs::write(v001.join("body_diffuse.1001.tx"), "texture v1").unwrap();
     add_asset_department(&store, &workspace, "prop", "crate", "texture", "v001");
 
-    assert!(
-        new_version_department(&store, &workspace, "prop", "crate", "texture")
-            .status
-            .success()
-    );
+    new_version_department(&store, &workspace, "prop", "crate", "texture");
     let v002 = department_version_folder(&workspace, "prop", "crate", "texture", "v002");
     fs::write(v002.join("body_diffuse.1001.tx"), "texture v2").unwrap();
     add_asset_department(&store, &workspace, "prop", "crate", "texture", "v002");
@@ -756,11 +745,7 @@ fn resolve_accepts_simplified_uri_current_and_query_version() {
     let workspace = temp.path().join("workspace");
     assert!(ads().arg("init").arg(&store).status().unwrap().success());
 
-    assert!(
-        new_version(&store, &workspace, "prop", "crate")
-            .status
-            .success()
-    );
+    new_version(&store, &workspace, "prop", "crate");
     fs::write(
         version_folder(&workspace, "prop", "crate", "v001").join("crate.usd"),
         "v1",
@@ -768,11 +753,7 @@ fn resolve_accepts_simplified_uri_current_and_query_version() {
     .unwrap();
     add_asset(&store, &workspace, "prop", "crate", "v001");
 
-    assert!(
-        new_version(&store, &workspace, "prop", "crate")
-            .status
-            .success()
-    );
+    new_version(&store, &workspace, "prop", "crate");
     fs::write(
         version_folder(&workspace, "prop", "crate", "v002").join("crate.usd"),
         "v2",
@@ -872,11 +853,7 @@ fn resolve_materializes_manifest_view_with_sibling_files_and_integer_pin() {
     let workspace = temp.path().join("workspace");
     assert!(ads().arg("init").arg(&store).status().unwrap().success());
 
-    assert!(
-        new_version(&store, &workspace, "char", "hero")
-            .status
-            .success()
-    );
+    new_version(&store, &workspace, "char", "hero");
     let v001 = version_folder(&workspace, "char", "hero", "v001");
     fs::create_dir(v001.join("geo")).unwrap();
     fs::write(v001.join("hero.usd"), "root layer").unwrap();
@@ -911,11 +888,7 @@ fn thumbnails_are_version_metadata_and_use_object_store() {
     let thumb = temp.path().join("thumb.png");
     assert!(ads().arg("init").arg(&store).status().unwrap().success());
 
-    assert!(
-        new_version(&store, &workspace, "prop", "crate")
-            .status
-            .success()
-    );
+    new_version(&store, &workspace, "prop", "crate");
     fs::write(
         version_folder(&workspace, "prop", "crate", "v001").join("model.usd"),
         "v1",
@@ -1017,11 +990,7 @@ fn verify_detects_missing_thumbnail_object() {
     let thumb = temp.path().join("thumb.png");
 
     assert!(ads().arg("init").arg(&store).status().unwrap().success());
-    assert!(
-        new_version(&store, &workspace, "prop", "crate")
-            .status
-            .success()
-    );
+    new_version(&store, &workspace, "prop", "crate");
     fs::write(
         version_folder(&workspace, "prop", "crate", "v001").join("model.usd"),
         "v1",
@@ -1069,11 +1038,7 @@ fn thumbnail_url_uses_configured_or_overridden_remote_base_url() {
             .success()
     );
 
-    assert!(
-        new_version(&store, &workspace, "prop", "crate")
-            .status
-            .success()
-    );
+    new_version(&store, &workspace, "prop", "crate");
     fs::write(
         version_folder(&workspace, "prop", "crate", "v001").join("model.usd"),
         "v1",
@@ -1131,11 +1096,7 @@ fn set_remote_config_is_used_by_auto_resolve_when_local_object_is_missing() {
             .success()
     );
 
-    assert!(
-        new_version(&store, &workspace, "char", "hero")
-            .status
-            .success()
-    );
+    new_version(&store, &workspace, "char", "hero");
     fs::write(
         version_folder(&workspace, "char", "hero", "v001").join("model.usd"),
         "hero",
@@ -1206,11 +1167,7 @@ fn checkout_refuses_non_empty_destination_unless_forced() {
     fs::write(checkout.join("old.txt"), "old").unwrap();
 
     assert!(ads().arg("init").arg(&store).status().unwrap().success());
-    assert!(
-        new_version(&store, &workspace, "prop", "crate")
-            .status
-            .success()
-    );
+    new_version(&store, &workspace, "prop", "crate");
     fs::write(
         version_folder(&workspace, "prop", "crate", "v001").join("model.usd"),
         "asset",
@@ -1238,11 +1195,7 @@ fn verify_detects_missing_object() {
     let workspace = temp.path().join("workspace");
 
     assert!(ads().arg("init").arg(&store).status().unwrap().success());
-    assert!(
-        new_version(&store, &workspace, "prop", "crate")
-            .status
-            .success()
-    );
+    new_version(&store, &workspace, "prop", "crate");
     fs::write(
         version_folder(&workspace, "prop", "crate", "v001").join("model.usd"),
         "asset",
@@ -1264,31 +1217,31 @@ fn verify_detects_missing_object() {
     assert!(stderr(&verify).contains("object missing"));
 }
 
-fn new_version(store: &Path, workspace: &Path, category: &str, asset_code: &str) -> Output {
+fn new_version(store: &Path, workspace: &Path, category: &str, asset_code: &str) -> PathBuf {
     new_version_department(store, workspace, category, asset_code, "model")
 }
 
+/// Creates the next conventional v### working folder directly: schema v8
+/// removed the new-version command, so workspaces are plain scratch space.
 fn new_version_department(
-    store: &Path,
+    _store: &Path,
     workspace: &Path,
     category: &str,
     asset_code: &str,
     department: &str,
-) -> Output {
-    ads()
-        .arg("new-version")
-        .arg("--store")
-        .arg(store)
-        .arg("--workspace")
-        .arg(workspace)
-        .arg("--category")
-        .arg(category)
-        .arg("--asset-code")
-        .arg(asset_code)
-        .arg("--department")
-        .arg(department)
-        .output()
-        .unwrap()
+) -> PathBuf {
+    let mut department_dir = workspace.to_path_buf();
+    for part in category.split('/') {
+        department_dir.push(part);
+    }
+    department_dir.push(asset_code);
+    department_dir.push(department);
+    let next = (1..)
+        .find(|n| !department_dir.join(format!("v{n:03}")).exists())
+        .unwrap();
+    let path = department_dir.join(format!("v{next:03}"));
+    fs::create_dir_all(&path).unwrap();
+    path
 }
 
 fn asset_create(store: &Path, workspace: &Path, category: &str, asset_code: &str) -> Output {
@@ -1370,55 +1323,80 @@ fn add_asset_output(
         .unwrap()
 }
 
-fn pull_latest(store: &Path, workspace: &Path, force: bool) -> Output {
-    let mut command = ads();
-    command
-        .arg("pull")
+fn wip_add(store: &Path, source: &Path) -> Output {
+    ads()
+        .arg("wip")
+        .arg("add")
         .arg("--store")
         .arg(store)
-        .arg("--workspace")
-        .arg(workspace)
         .arg("--category")
-        .arg("prop")
+        .arg("char")
         .arg("--asset-code")
-        .arg("crate")
+        .arg("hero")
         .arg("--department")
         .arg("model")
-        .arg("--latest");
-    if force {
-        command.arg("--force");
-    }
-    command.output().unwrap()
+        .arg("--source")
+        .arg(source)
+        .output()
+        .unwrap()
 }
 
-fn pull_current(store: &Path, workspace: &Path, force: bool) -> Output {
-    let mut command = ads();
-    command
-        .arg("pull")
+fn wip_list(store: &Path) -> Output {
+    ads()
+        .arg("wip")
+        .arg("list")
         .arg("--store")
         .arg(store)
-        .arg("--workspace")
-        .arg(workspace)
         .arg("--category")
-        .arg("prop")
+        .arg("char")
         .arg("--asset-code")
-        .arg("crate")
+        .arg("hero")
+        .arg("--department")
+        .arg("model")
+        .output()
+        .unwrap()
+}
+
+fn publish_promote(store: &Path, no_validate: bool) -> Output {
+    let mut command = ads();
+    command
+        .arg("publish")
+        .arg("promote")
+        .arg("--store")
+        .arg(store)
+        .arg("--category")
+        .arg("char")
+        .arg("--asset-code")
+        .arg("hero")
         .arg("--department")
         .arg("model");
-    if force {
-        command.arg("--force");
+    if no_validate {
+        command.arg("--no-validate");
     }
     command.output().unwrap()
 }
 
-fn restore_version(store: &Path, workspace: &Path, version: &str, force: bool) -> Output {
+fn gc_run(store: &Path, retention: usize, grace_hours: u64, dry_run: bool) -> Output {
     let mut command = ads();
     command
-        .arg("restore")
+        .arg("gc")
         .arg("--store")
         .arg(store)
-        .arg("--workspace")
-        .arg(workspace)
+        .arg("--retention")
+        .arg(retention.to_string())
+        .arg("--grace-hours")
+        .arg(grace_hours.to_string());
+    if dry_run {
+        command.arg("--dry-run");
+    }
+    command.output().unwrap()
+}
+
+fn checkout_version(store: &Path, version: &str, dest: &Path) -> Output {
+    ads()
+        .arg("checkout")
+        .arg("--store")
+        .arg(store)
         .arg("--category")
         .arg("prop")
         .arg("--asset-code")
@@ -1426,75 +1404,36 @@ fn restore_version(store: &Path, workspace: &Path, version: &str, force: bool) -
         .arg("--department")
         .arg("model")
         .arg("--version")
-        .arg(version);
-    if force {
-        command.arg("--force");
-    }
-    command.output().unwrap()
+        .arg(version)
+        .arg(dest)
+        .output()
+        .unwrap()
 }
 
-fn publish_register(
-    store: &Path,
-    public_root: &Path,
-    category: &str,
-    asset_code: &str,
-    department: &str,
-    version: &str,
-) -> Output {
-    publish_command(
-        "register",
-        store,
-        public_root,
-        category,
-        asset_code,
-        department,
-        version,
-    )
-}
-
-fn publish_validate(
-    store: &Path,
-    public_root: &Path,
-    category: &str,
-    asset_code: &str,
-    department: &str,
-    version: &str,
-) -> Output {
-    publish_command(
-        "validate",
-        store,
-        public_root,
-        category,
-        asset_code,
-        department,
-        version,
-    )
-}
-
-fn publish_command(
-    subcommand: &str,
-    store: &Path,
-    public_root: &Path,
-    category: &str,
-    asset_code: &str,
-    department: &str,
-    version: &str,
-) -> Output {
+fn publish_validate_version(store: &Path, version: &str) -> Output {
     ads()
         .arg("publish")
-        .arg(subcommand)
+        .arg("validate")
         .arg("--store")
         .arg(store)
-        .arg("--public-root")
-        .arg(public_root)
         .arg("--category")
-        .arg(category)
+        .arg("char")
         .arg("--asset-code")
-        .arg(asset_code)
+        .arg("hero")
         .arg("--department")
-        .arg(department)
+        .arg("model")
         .arg("--version")
         .arg(version)
+        .output()
+        .unwrap()
+}
+
+fn publish_validate_source(source: &Path) -> Output {
+    ads()
+        .arg("publish")
+        .arg("validate")
+        .arg("--source")
+        .arg(source)
         .output()
         .unwrap()
 }
@@ -1666,9 +1605,7 @@ fn checkout_asset(
         .arg("--asset-code")
         .arg(asset_code)
         .arg("--department")
-        .arg("model")
-        .arg("--version")
-        .arg("v001");
+        .arg("model");
     if force {
         command.arg("--force");
     }

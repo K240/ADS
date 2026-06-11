@@ -1,8 +1,14 @@
 # ADS仕様改訂: WIP / Publishモデル
 
-対象: ADS schema version 8(改訂提案)
+対象: ADS schema version 8
 作成日: 2026-06-11
-Status: Draft(実装着手前レビュー用)
+Status: Implemented(2026-06-11、全3段階実装済み)
+
+実装ノート: 以下の緩和策・周辺項目は本体実装から意図的に切り離し、未実装のまま残しています。
+
+- (path, mtime, size) → sha256 のハッシュ高速化サイドテーブル
+- department別のWIP自動登録ポリシー(off設定)
+- ArNoticeによるstage自動refresh(現状は手動reload)
 
 ## 背景
 
@@ -223,7 +229,13 @@ ads publish promote `
   次のpublish番号を採番し、version recordを作成する。
 - objectsは登録済みのため**ファイルコピーは発生しない**。メタデータ書き込みのみで
   アトミックに完了する。
-- `publish validate`(`ads://` 参照の検査)は従来通り昇格前の検査として機能する。
+- `publish validate` は昇格前の検査として `publish promote` にデフォルトで配線される
+  (`--no-validate` で回避可)。検証対象はstore内のmanifest(version / WIP head /
+  WIP seq指定)または `--source` の任意フォルダ。参照ポリシーはv8で改訂:
+  他アセット参照は `ads://`、**同一manifest内に解決できる相対参照は許可**
+  (manifest viewが相対レイアウトを保持するため)。絶対パス・`file://`・
+  manifest外/不在ファイルへの参照はエラー。public root機構と
+  `publish register` は廃止(直接登録は `add --source`)。
 - `fetch` / `sync` / `push` の対象はpublish層のみ。
 
 ## GC仕様(必須機能への昇格)
@@ -261,7 +273,8 @@ API:
 
 ## Houdini統合
 
-- **ADS Managed Publish**: 参照書き換えの出力を `?v=12` 形式へ変更する。
+- **ADS Managed Publish**: 撤去(versionフォルダ廃止によりv###パス解析が成立しないため)。
+  公開経路はWIP staging + promoteに一本化。
 - **WIP作業セッション**: Resolver環境変数にwipセレクタ指定を追加し、
   作業者自身のマシンでのみ `ads://...` がwip headへ解決されるようにする。
   他のマシン・production参照は従来通りcurrentを見る。

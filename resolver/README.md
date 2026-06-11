@@ -28,7 +28,7 @@ $env:ADS_RESOLVER_MODE = "local"
 $env:PXR_PLUGINPATH_NAME = "D:\work\apps\ads\resolver\build\houdini\resources"
 ```
 
-`ADS_RESOLVER_MODE` defaults to `local`. Use `ads pull` before opening a stage when the version folder is not present in the workspace.
+`ADS_RESOLVER_MODE` defaults to `local`. Resolution materializes the immutable manifest view from the store on demand (schema v8), so no pull step is needed before opening a stage; the local store just needs the objects.
 
 For native remote direct reads, point the resolver at an ADS Web/API server:
 
@@ -67,7 +67,9 @@ Resolve caching follows the schema v8 policy: explicit version pins (`?v=12`
 or `?v=v012`) are immutable and cached for the whole session, while
 `current` / `latest` resolutions expire after `ADS_RESOLVER_CACHE_TTL_SECONDS`
 (default 30, `0` disables caching for mutable selectors) so pointer switches
-on the server become visible without restarting Houdini.
+on the server become visible without restarting Houdini. `?v=wip` resolutions
+are never cached: the WIP head moves on every registered write. WIP is
+local-only and does not resolve in remote mode.
 
 Remote direct read buffers the full response into memory through `ArInMemoryAsset`. This avoids creating workspace version files, but it is not a streaming or range-read implementation.
 

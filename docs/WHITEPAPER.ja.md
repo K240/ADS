@@ -5,32 +5,25 @@
 作成日: 2026-05-26  
 最終更新: 2026-06-11
 
-対象実装: ADS schema version 7
-次期設計: ADS schema version 8(WIP/Publishモデル、`docs/SPEC_WIP_PUBLISH.ja.md`)
+対象実装: ADS schema version 8(WIP/Publishモデル、`docs/SPEC_WIP_PUBLISH.ja.md`)
+実務手順: `docs/WORKFLOW.ja.md`(作業フローマニュアル)
 
 ## Executive Summary
 
 ADSは、DCCツール、特にUSDを扱う制作環境向けの軽量なアセットバージョニングシステムです。Rust製の単一バイナリとして提供され、ローカルファイルシステム上にRocksDBベースのメタデータDBとcontent-addressed object storeを構築します。
 
-中心となる考え方は、作業用ファイルを常に物理的なversionフォルダに分離し、正規履歴はobject storeとmetadataに保持することです。
+中心となる考え方は、すべての書き出しを一意なパスへ分離し(Never Overwrite)、正規履歴をcontent-addressed object storeとmetadataに保持することです。versionは2層に分かれます。
 
 ```text
-<workspace>/<category>/<asset_code>/<department>/<version>
+WIP層     書き出し1回 = 1 micro-version(local限定、GC対象)
+Publish層 整数番号を持つ公開version(current/latest、remote push対象)
 ```
 
-例:
-
-```text
-D:\workspace\char\hero\model\v001
-D:\workspace\char\hero\model\v002
-D:\workspace\char\hero\anim\v001
-```
-
-USDファイルはアプリケーションが開いている間にファイルロックや書き込み競合を起こすことがあります。ADSは同一パスを更新し続けるのではなく、`v001`, `v002` のように物理パスを分けることで、既存versionを不変に近い状態で扱い、編集開始時には次のversionフォルダを作成します。
+USDファイル、特にusdcはアプリケーションが開いている間ロックされ、上書きできないことがあります。ADSは同一パスを更新し続けるのではなく、書き出しごとに一意なstagingパスへ書いてWIP micro-versionとして登録するため、ロック問題は構造的に発生しません。publishはWIPへの番号付与(メタデータ昇格)であり、ファイルコピーを伴いません。
 
 また、USD AssetResolverを前提にした論理パスもサポートします。制作データ内では `ads://hero/model/hero.usd` のような短いURIを使い、実際にどのversion、どのローカルパス、どのObjectStorage URLへ解決するかはADS側で吸収する設計です。現状実装ではHoudini 21.0.700向けC++ `ArResolver` pluginにより、local workspace解決とremote object direct readの両方を検証済みです。
 
-なお、設計改訂としてschema version 8(WIP/Publishモデル)への移行を決定しています。versionフォルダはworkspace契約から外れ、頻繁なローカル書き出しはWIP micro-versionとして自動登録され、publishはコピーゼロのメタデータ昇格になります。本書の大部分は現行実装(schema version 7)の記述です。改訂の決定内容は「設計改訂(schema version 8)」の章および `docs/SPEC_WIP_PUBLISH.ja.md` を参照してください。
+schema version 8(WIP/Publishモデル)への移行は実装済みです。versionフォルダはworkspace契約から外れ、頻繁なローカル書き出しはWIP micro-versionとして登録され、publishはコピーゼロのメタデータ昇格(`publish promote`)になりました。決定の経緯と詳細仕様は「設計改訂(schema version 8)」の章および `docs/SPEC_WIP_PUBLISH.ja.md` を参照してください。
 
 ## 背景と課題
 
@@ -50,7 +43,7 @@ ADSはこの問題に対して、次の前提を置きます。
 
 ## 設計原則
 
-以下はschema version 7(現行実装)の設計原則です。schema version 8での改訂内容は次章「設計改訂(schema version 8)」を参照してください。
+以下はschema version 7までの設計原則です。現行実装はschema version 8であり、次章「設計改訂(schema version 8)」の改訂後原則が適用されます。本章は設計の経緯として残しています。
 
 ### 1. Version Folder First
 
@@ -111,7 +104,7 @@ USD/Houdini環境では、ADS用C++ `ArResolver` pluginにより、`ads://` URI�
 
 ## 設計改訂(schema version 8)
 
-実装と運用の検証を経て、以下の3点を決定しました。詳細仕様は `docs/SPEC_WIP_PUBLISH.ja.md` にあります。
+実装と運用の検証を経て、以下の3点を決定し、実装済みです。詳細仕様は `docs/SPEC_WIP_PUBLISH.ja.md` にあります。
 
 ### 決定1: versionフォルダの廃止
 
@@ -151,7 +144,7 @@ Content Deduplication、Current By Default、Resolver-Oriented Accessは補助�
 
 ```mermaid
 flowchart LR
-    Artist["Artist / DCC / Houdini"] --> Workspace["Workspace\ncategory/asset/department/v###"]
+    Artist["Artist / DCC / Houdini"] --> Workspace["Workspace (scratch)\n.ads-cache views"]
     Workspace --> CLI["ads CLI"]
     CLI --> DB["RocksDB Metadata"]
     CLI --> Objects["Object Store\nobjects/sha256/prefix/hash"]
@@ -182,7 +175,7 @@ ADSの長期的な運用モデルは、制作環境のネットワーク条件�
 
 ```mermaid
 flowchart LR
-    DCC["DCC / Houdini"] --> Workspace["Local Workspace\nv### folders"]
+    DCC["DCC / Houdini"] --> Workspace["Local Workspace\nscratch + .ads-cache"]
     Workspace --> Client["ADS Client"]
     Client --> API["Central ADS API"]
     API --> RemoteDB["Remote Metadata DB"]
@@ -195,10 +188,10 @@ flowchart LR
 このモードでは、client側にRocksDBやobject storeを持ちません。
 
 - remote storeが唯一のsource of truth。
-- clientはworkspaceのversion folderだけを保持する。
+- clientはscratch workspaceと `.ads-cache` だけを保持する。
 - asset list、current/latest、manifest、thumbnailはcentral APIへ問い合わせる。
 - WebAppとHTTP APIは起動時に許可されたprofileのstore/workspaceだけを扱う。
-- `pull` / `restore` はprofileに紐づくworkspaceへ対象versionを展開する。
+- `/api/pull` / `/api/restore` は対象versionを部門workフォルダ(`<workspace>/<category>/<asset_code>/<department>`)へ展開する。WIP stagingの起点と同じ場所であり、v###フォルダは作られない。
 - Resolverは `ADS_RESOLVER_SERVER` とprofile/tokenを使ってcentral APIへ問い合わせ、remote object URLをnative HTTPで直接読む。
 - Windows版Resolverのremote modeはWinHTTPを使い、`ads.exe` や `curl.exe` を起動しない。
 
@@ -212,7 +205,7 @@ flowchart LR
 
 ```mermaid
 flowchart LR
-    DCC["DCC / Houdini"] --> Workspace["Local Workspace\nv### folders"]
+    DCC["DCC / Houdini"] --> Workspace["Local Workspace\nscratch + .ads-cache"]
     Workspace --> LocalStore["Local Store\ncache / mirror"]
     LocalStore --> RemoteAPI["Remote ADS API"]
     RemoteAPI --> RemoteDB["Remote Metadata DB"]
@@ -255,7 +248,7 @@ ads sync `
 
 完全な「local storeなしCLI client mode」は未実装ですが、Houdini Resolverのremote modeはlocal storeを必要とせず、central APIとremote object URLだけでUSD layerを開けます。
 
-local + remote storeでは、local storeを明示してpullし、remote storeとはsync/pushで接続します。
+local + remote storeでは、remote storeとはsync/pushで接続し、読み込みはResolverがlocal storeからmanifest viewへ実体化します。実体フォルダが必要な場合のみ `checkout` を使います。
 
 ```powershell
 ads sync `
@@ -267,12 +260,12 @@ ads sync `
   --asset-code hero `
   --department model
 
-ads pull `
+ads checkout `
   --store D:\local-store `
-  --workspace D:\workspace `
   --category char `
   --asset-code hero `
-  --department model
+  --department model `
+  D:\temp\hero_model
 ```
 
 この分離により、通常ユーザーには単純なremote store onlyを提供し、ネットワーク条件が厳しい現場だけlocal cacheを有効化できます。
@@ -365,7 +358,7 @@ objects/sha256/ab/abcdef...
 
 ## Workspace Workflow
 
-以下は現行実装(schema version 7)のワークフローです。schema version 8では `new-version` が廃止され、登録は任意パスから可能になり、`pull` / `restore` は `checkout` へ整理されます(`docs/SPEC_WIP_PUBLISH.ja.md`)。
+schema version 8では、workspaceは純粋な作業領域(scratch)です。ADSはworkspaceのレイアウトを要求せず、versionフォルダをload対象にも使いません。
 
 ### Store初期化
 
@@ -389,77 +382,61 @@ ads asset create `
   --asset-code hero
 ```
 
-### 新規version作成
+### WIP登録
+
+書き出し1回をWIP micro-versionとして登録します。書き込み先は毎回一意なstagingパスであるため、登録済みバイト列の上書きはどこにも発生しません。
 
 ```powershell
-ads new-version `
+ads wip add `
   --store D:\store `
-  --workspace D:\workspace `
+  --category char `
+  --asset-code hero `
+  --department model `
+  --source D:\workspace\.ads-staging\<run-id>\char\hero\model
+```
+
+同一内容の再登録は新しいmicro-versionを作らず、既存のwip headを返します。HoudiniではUSD ROPの `ADS WIP Staging` output processorが保存先をstagingへ振り替え、post-renderの `ads.houdini_wip.commit_staged()` が登録とstaging削除を行います。
+
+```powershell
+ads wip list `
+  --store D:\store `
   --category char `
   --asset-code hero `
   --department model
 ```
 
-新規asset/departmentの場合は `v001` の空フォルダを作ります。既存departmentの場合は次のversionを作成し、latest versionの内容をコピーして編集開始できる状態にします。
+WIPはlocal storeに閉じます。pushの対象外で、GCのretentionにより自動削除されます。
 
-### Version登録
+### Publish昇格
+
+```powershell
+ads publish promote `
+  --store D:\store `
+  --category char `
+  --asset-code hero `
+  --department model
+```
+
+wip head(`--wip-seq` で明示可)のmanifestへ次の整数versionを採番します。objectとmanifestは登録済みのため、**ファイルコピーは発生しません**。同一manifestが既存versionにある場合は既存versionを返します。
+
+### 任意パスからの直接登録
+
+WIPを経由しない登録には `add --source` を使います。`--version` を省略すると次の番号が自動採番されます。
 
 ```powershell
 ads add `
   --store D:\store `
-  --workspace D:\workspace `
   --category char `
   --asset-code hero `
   --department model `
-  --version v001
+  --source D:\delivery\hero_model_fix
 ```
 
-登録対象は必ず以下の標準versionフォルダです。
+従来の `--workspace` + `--version` によるversionフォルダ指定も、パス構築の省略記法として引き続き使えます(レイアウト要求ではありません)。
 
-```text
-D:\workspace\char\hero\model\v001
-```
+### 取り出し
 
-同一version番号に異なる内容を登録しようとした場合は失敗します。同一manifestが既存versionにある場合は、新規versionを作らず既存versionを返します。
-
-### Workspaceを更新する
-
-通常操作は `pull` です。
-
-```powershell
-ads pull `
-  --store D:\store `
-  --workspace D:\workspace `
-  --category char `
-  --asset-code hero `
-  --department model
-```
-
-`pull` はcurrentをworkspaceへ取得します。currentが未設定ならlatestを取得します。
-
-latestを明示する場合:
-
-```powershell
-ads pull ... --latest
-```
-
-既存フォルダが同一manifestなら何もしません。既存フォルダが異なる内容なら失敗し、`--force` 指定時のみ置き換えます。
-
-### 指定versionを復元する
-
-```powershell
-ads restore `
-  --store D:\store `
-  --workspace D:\workspace `
-  --category char `
-  --asset-code hero `
-  --department model `
-  --version v002
-```
-
-`restore` は明示versionを標準workspaceフォルダへ復元します。
-
-### 任意場所へ取り出す
+実体フォルダが必要な場合は `checkout` で明示の出力先へ実体化します。省略時はcurrent、`--latest` / `--version` で選択します。
 
 ```powershell
 ads checkout `
@@ -467,11 +444,36 @@ ads checkout `
   --category char `
   --asset-code hero `
   --department model `
-  --version v002 `
+  --version 2 `
   D:\temp\hero_model_v002
 ```
 
-`checkout` は標準workspace構造に縛られない低レベル復元コマンドです。
+USD/Houdiniの通常閲覧はResolverがmanifest viewキャッシュへ解決するため、閲覧目的のcheckoutは不要です。
+
+### Workフォルダへの種まき
+
+「このversionの内容から作業を始める」場合は、部門workフォルダ(`<workspace>/<category>/<asset_code>/<department>`、WIP stagingの起点と同じ場所)へ展開します。WebAppのPullボタン(`/api/pull` / `/api/restore`)と `ads materialize` がこれにあたり、**v###フォルダは作られません**。workフォルダの内容が対象versionと異なる場合はForce指定が必要で、編集中データの誤上書きを防ぎます。
+
+```powershell
+ads materialize `
+  --store D:\store `
+  --workspace D:\workspace `
+  --category char `
+  --asset-code hero `
+  --department model
+```
+
+旧 `pull` / `restore` CLIは廃止されました。
+
+### Garbage Collection
+
+WIPは書き出しごとにobjectを生むため、GCは必須機能です。
+
+```powershell
+ads gc --store D:\store --retention 20 --grace-hours 24 --dry-run
+```
+
+rootsは全publish versionのmanifest、thumbnail object、departmentごとのWIP直近N件(`--retention`、default 20)です。猶予期間(`--grace-hours`、default 24)内に作成されたobjectは並行書き込み保護のため削除されません。`--dry-run` で削除対象を確認できます。
 
 ## Current / Latest
 
@@ -494,9 +496,12 @@ ADSは次のようなURIを想定します。
 ```text
 ads://hero/model
 ads://hero/model/hero.usd
-ads://hero/model/hero.usd?v=v002
+ads://hero/model/hero.usd?v=2
+ads://hero/model/hero.usd?v=wip
 ads://char/hero/model/hero.usd
 ```
+
+versionセレクタは `?v=<整数>`(pin)、`current`(default)、`latest`、`wip`(local WIP head)です。`?v=v002` 形式も寛容パースで受理されます。
 
 categoryを省略した場合は、asset_codeとdepartmentから候補を解決します。categoryを明示したい場合は `ads://category/asset_code/department/path` の形式を使います。
 
@@ -512,13 +517,13 @@ ads resolve `
 
 mode:
 
-Texture系ファイルは、USD layerとは異なる解決ポリシーを使います。`.tx`, `.rat`, `.exr`, `.tif`, `.png`, `.jpg` などの予約拡張子、または `texture` / `textures` / `tex` department配下の非USDファイルはtextureとして扱います。`local` / `auto` resolveではworkspace上の論理パスではなく、DB上のmanifest entryからSHA-256を引き、`<workspace>/.ads-cache/sha256/<prefix>/<hash>.<ext>` へlocal cache化したパスを返します。USD layerである `.usd`, `.usda`, `.usdc`, `.usdz` は従来通りversion folder上の指定パスへ解決します。
+`local` / `auto` の解決先はworkspaceの不変キャッシュです。textureはflat blob cache(`<workspace>/.ads-cache/sha256/<prefix>/<hash>.<ext>`)へ、USD layer(`.usd`, `.usda`, `.usdc`, `.usdz`)と他のファイルはmanifest view(`<workspace>/.ads-cache/manifests/<manifest_hash>/<relative_path>`)へ解決します。viewはmanifest全体をblobへのhardlinkで実体化したフォルダ形状のキャッシュで、兄弟ファイルへの相対参照が保たれます。manifest hashが鍵であるため上書きは発生せず、workspaceのフォルダ配置に依存しません。
 
-同じ論理ファイル名のtextureを更新した場合も、versionごとにmanifest上のSHA-256が変わるため、cache上では別のhashファイルとして共存します。USD内の `ads://.../body_diffuse.1001.tx` 参照は安定したまま、`current` / `latest` / `?v=v001` の選択によって返るcache fileだけが変わります。`.ads-cache` は登録対象から除外されます。
+同じ論理ファイル名を更新した場合も、versionごとにmanifest hashとSHA-256が変わるため、cache上では別の実体として共存します。USD内の `ads://.../body_diffuse.1001.tx` 参照は安定したまま、`current` / `latest` / `?v=2` / `wip` の選択によって返るcache実体だけが変わります。`.ads-cache` と `.ads-staging` は登録対象から除外されます。
 
-- `local`: workspace上の実体ファイルへ解決
-- `remote`: object URLへ解決
-- `auto`: workspace上の実体ファイル、local store/cache、remote object URLの順に解決
+- `local`: store内容をmanifest view / texture cacheへ実体化して解決
+- `remote`: object URLへ解決(`wip` は不可)
+- `auto`: manifest view実体化を試み、object欠損時はremote object URLへフォールバック
 
 remote URLはstoreに設定できます。
 
@@ -638,12 +643,24 @@ Python APIは2つの入口を持ちます。
 from ads import AdsCli
 
 ads = AdsCli(r"D:\tools\ads.exe")
-ads.pull(
+ads.wip_add(
     store=r"D:\store",
-    workspace=r"D:\workspace",
     category="char",
     asset_code="hero",
     department="model",
+    source=r"D:\workspace\.ads-staging\run1\char\hero\model",
+)
+ads.publish_promote(
+    store=r"D:\store",
+    category="char",
+    asset_code="hero",
+    department="model",
+)
+location = ads.resolve(
+    "ads://char/hero/model/hero.usd",
+    store=r"D:\store",
+    workspace=r"D:\workspace",
+    mode="local",
 )
 ```
 
@@ -668,7 +685,7 @@ client.pull(
 
 USD stageはroot layerから多数のreferences、payloads、sublayersを辿ります。ユーザーが明示的に開くファイルはrootだけですが、実際には多くの依存ファイルが必要です。
 
-ADSでは、Resolverに副作用としてpullを実行させるのではなく、open前に依存関係を解析するpreflight utilityを使います。
+ADSでは、open前に依存関係を解析して manifest view キャッシュを事前に温めるpreflight utilityを提供します。schema version 8ではResolverが解決時にviewを実体化するためpreflightは必須ではありませんが、多数layerを一括で温めたい場合に使えます。
 
 ```powershell
 uv run ads-deps D:\shots\shot010\shot.usda `
@@ -676,7 +693,7 @@ uv run ads-deps D:\shots\shot010\shot.usda `
   --workspace D:\workspace
 ```
 
-`ads-deps` はOpenUSD Pythonが利用できる場合は `UsdUtils.ComputeAllDependencies` を使い、root USDから全依存を収集します。その中の `ads://` URIだけをpull/restore対象として抽出します。
+`ads-deps` はOpenUSD Pythonが利用できる場合は `UsdUtils.ComputeAllDependencies` を使い、root USDから全依存を収集します。その中の `ads://` URIだけを抽出し、`--execute` 時はlocal resolveでmanifest viewへ実体化します。
 
 ```powershell
 uv run ads-deps D:\shots\shot010\shot.usda `
@@ -685,13 +702,13 @@ uv run ads-deps D:\shots\shot010\shot.usda `
   --execute
 ```
 
-この運用により、Houdiniでstageを開く前に必要なADS version folderをworkspaceへ揃えられます。local modeのResolverはその後、既に存在するlocal fileへ高速に解決するだけです。remote modeではpreflight pullなしでもobject URLから直接読めますが、多数layerや大容量textureを扱う場合はpreflightでlocal化した方が安定するケースがあります。
+この運用により、Houdiniでstageを開く前に必要なmanifest viewをキャッシュへ揃えられます。local modeのResolverはその後、既に実体化済みのviewへ高速に解決するだけです。remote modeではpreflightなしでもobject URLから直接読めますが、多数layerや大容量textureを扱う場合はpreflightでlocal化した方が安定するケースがあります。
 
 ## C++ USD Resolver
 
 `ads://` URIをUSD composition arcから直接扱うためのC++ `ArResolver` pluginを提供します。
 
-Resolverはread-onlyです。ADS URIへの書き込みは行わず、作業者は明示的なworkspace version folderで編集し、`ads add` または `ads publish register` で登録します。
+Resolverはread-onlyです。ADS URIへの書き込みは行わず、作業者の書き出しはWIP staging経由で `ads wip add` により登録され、`ads publish promote` で公開されます。
 
 local modeでは、Resolverは `ads resolve` CLIへ委譲してworkspace上のローカルファイルパスまたはtexture cache pathへ解決し、USDの `ArFilesystemAsset` で開きます。
 
@@ -713,7 +730,7 @@ $env:ADS_RESOLVER_MODE = "local"
 $env:PXR_PLUGINPATH_NAME = "D:\path\to\ads\resolver\build\houdini\resources"
 ```
 
-`ADS_RESOLVER_MODE` のdefaultは `local` です。workspaceに対象versionが存在しない場合は、事前に `ads pull` を実行します。
+`ADS_RESOLVER_MODE` のdefaultは `local` です。解決時にstoreからmanifest viewが自動的に実体化されるため、事前のpull操作は不要です(local storeに対象objectが必要です)。
 
 remote modeでは、Resolverは `ads.exe` を呼び出さず、`ADS_RESOLVER_SERVER` で指定されたcentral ADS APIへ直接問い合わせます。`/api/resolve` が返すremote object URLをnative HTTP backendで取得し、USDへ `ArInMemoryAsset` として渡します。これはworkspaceにversion folderを生成しない読み取り経路です。
 
@@ -768,51 +785,39 @@ remote object URLは直接読めます。ただし現状は対象object全体を
 
 ## Houdini USD ROP Publish
 
-SolarisではUSD ROPを使ってUSD layerを書き出します。ADSでは、USD ROPのOutput Processorとして `ADS Managed Publish` を提供します。
+SolarisではUSD ROPを使ってUSD layerを書き出します。schema version 8の公開経路はWIP stagingとpromoteです。
 
 ```text
 Solaris LOP
   -> USD ROP
-  -> ADS Managed Publish output processor
-  -> public root
-  -> version-pinned ads:// references
+  -> ADS WIP Staging output processor(.ads-stagingへ振替)
+  -> post-render: ads.houdini_wip.commit_staged()(wip add)
+  -> ads publish promote(検証ゲート + メタデータ昇格)
 ```
 
-このOutput Processorは、`ADS_RESOLVER_WORKSPACE` 配下のsave pathを `ADS_OUTPUT_PUBLIC_ROOT` 配下へ写像できます。また、workspaceまたはpublic root配下の参照パスを `ads://category/asset_code/department/path?v=v###` へ変換します。
+旧 `ADS Managed Publish`(public rootへの写像とv###パス解析による参照書き換え)は、versionフォルダの廃止に伴い撤去されました。public root機構と `ads publish register` も廃止です(任意フォルダの直接登録は `ads add --source` が担います)。
 
-例:
+### 参照ポリシーと検証
 
-```text
-D:/workspace/char/hero/model/v003/geo/body.usd
-  -> ads://char/hero/model/geo/body.usd?v=v003
+publishされるUSDの参照規則は次の2つです。
 
-D:/public/char/hero/texture/v002/maps/body.1001.tx
-  -> ads://char/hero/texture/maps/body.1001.tx?v=v002
-```
+1. 他アセットへの参照は `ads://` URIを使う。
+2. 同一version内の参照は相対パスでよい。manifest viewが相対レイアウトを保持するため、兄弟ファイルへの相対参照は安全です。
 
-これにより、public出力先の物理パスが変わってもUSD内の参照はADS URIとして安定します。Resolverなしの外部納品ではなく、社内managed publishではこの方式をdefaultとします。
+絶対パス、`file://`、version外へ逃げる相対参照(`../` でmanifestの外)、manifest内に存在しないファイルへの参照はエラーです。binary USDは走査できないため警告として扱います。
 
-USD ROPで書き出したpublic version folderは、CLIから検証・登録できます。
+`publish promote` はこの検証をデフォルトで実行し、違反があれば昇格を拒否します(`--no-validate` で明示的に回避可能)。検証単体は対象を選んで実行できます。
 
 ```powershell
-ads publish validate `
-  --store D:\store `
-  --public-root D:\public `
-  --category char `
-  --asset-code hero `
-  --department model `
-  --version v003
+# 公開済みversionの検証(省略時はcurrent)
+ads publish validate --store D:\store --category char --asset-code hero --department model --version 3
 
-ads publish register `
-  --store D:\store `
-  --public-root D:\public `
-  --category char `
-  --asset-code hero `
-  --department model `
-  --version v003
+# WIP headの検証(昇格前チェック)
+ads publish validate --store D:\store --category char --asset-code hero --department model --wip
+
+# 登録前の任意フォルダの検証
+ads publish validate --source D:\delivery\hero_model_fix
 ```
-
-`validate` はtext USD内の `@...@` asset pathを検査し、`ads://` ではない相対パス、絶対パス、`file://` 参照が残っていれば失敗します。binary USDの完全検査はHoudini/OpenUSD側のpreflightに委ね、CLIでは警告として扱います。
 
 ## セキュリティモデル
 
@@ -891,16 +896,15 @@ cargo test
 - S3互換backendへの直接読み書きは未実装。
 - `--server` 指定によるremote fetch/sync/pushは実装済みだが、全CLIを透過的にremote store onlyで扱うclient modeは未実装。
 - local + remote storeの基本fetch/sync/pushは実装済み。conflict解決、差分push、object pruningは未実装。
-- object garbage collectionは未実装。
 - schema migrationは未実装。開発中storeは再作成前提。
-- WebAppからのasset作成、new-version、addは未実装。
+- WebAppからのasset作成や登録は未実装。
 - multi-user lock、review、approval、publish gateは未実装。
 - C++ USD Resolverのremote direct readはin-memory MVP。range request / streaming / retry policyは未実装。
 - Windows Resolver remote modeはWinHTTP native backendを実装済み。macOS/Linux向けnative library backendは未実装で、今後libcurl等のlibrary backendを追加する方針。
 
 これらは意図的に初期スコープ外としています。まずはversion folder、dedup store、Resolver向けURI、Web browserを最小構成で成立させることを優先しています。
 
-このうちversionフォルダ前提の運用に由来するもの(`new-version` のlatestコピー、`pull` の内容競合判定、preflight前提の運用)は、schema version 8(WIP/Publishモデル)への移行で解消されます。object GCとResolverキャッシュ無効化は同移行で必須機能に昇格します。
+versionフォルダ前提の運用に由来していた制約(`new-version` のlatestコピー、`pull` の内容競合判定、preflight前提の運用)は、schema version 8への移行で解消済みです。object GCとResolverキャッシュポリシー(pinned恒久 / current・latest TTL / wipキャッシュ禁止)も実装済みです。
 
 ## Roadmap
 
@@ -944,7 +948,7 @@ Status: complete for remote store MVP. Base remote read/fetch/sync/push is descr
 
 ### Phase 4: WIP / Publishモデル移行(schema version 8)
 
-設計確定済み。仕様は `docs/SPEC_WIP_PUBLISH.ja.md`。実装は独立リリース可能な3段階に分けます。
+Status: complete. 仕様は `docs/SPEC_WIP_PUBLISH.ja.md`。3段階すべて実装済みです。
 
 1. 読み込み側の切り離し: VersionId整数化、RocksDB key v8化(固定幅エンコード)、manifest viewキャッシュ、Resolver local解決の切り替え、Resolverキャッシュポリシー(pinned恒久 / current TTL / wipキャッシュ禁止)
 2. 書き込み側のWIP化: Output processorのstaging振り替え、WIP micro-version自動登録、wip head、`?v=wip` 解決、object garbage collection
@@ -962,19 +966,18 @@ Status: complete for remote store MVP. Base remote read/fetch/sync/push is descr
 
 ## 結論
 
-ADSは、USDを含むDCC制作環境で「ファイルを直接上書きし続ける運用」から離れ、version folder、content-addressed storage、Resolver-oriented accessを組み合わせるための小さな基盤です。
+ADSは、USDを含むDCC制作環境で「ファイルを直接上書きし続ける運用」から離れ、WIP stream、content-addressed storage、Resolver-oriented accessを組み合わせるための小さな基盤です。
 
-特に重要なのは、versionを単なる番号ではなく、物理パス、manifest、object store、current pointer、Resolver URIをつなぐ共通概念として扱う点です。
+特に重要なのは、versionを単なる番号ではなく、WIP micro-version、manifest、object store、current pointer、Resolver URIをつなぐ共通概念として扱う点です。書き出しは常に一意なパスへ行われ、登録済みバイト列の上書きはシステムのどこにも存在しません。
 
 この設計により、以下を同時に満たします。
 
-- USD/Houdiniで開ける実体フォルダを維持する。
-- version間の重複ファイルをdedupする。
-- latest/currentを使い分ける。
+- 頻繁なローカル書き出しをロックなしでWIPストリームに記録する。
+- publishをコピーゼロのメタデータ昇格として瞬時に行う。
+- version間・WIP間の重複ファイルをdedupする。
+- latest/current/wipを使い分ける。
 - ブラウザでassetを探索できる。
-- AssetResolverでlocal workspaceとremote object direct readを切り替えられる。
+- AssetResolverで不変キャッシュ(manifest view)とremote object direct readを切り替えられる。
 - 将来的にS3互換ObjectStorage、range read、production governanceへ拡張できる。
 
-ADSの初期版は完成した制作管理システムではなく、堅牢なasset versioning layerです。remote store MVPとHoudini integrationはすでに成立しており、今後はS3互換backend、range read、cache policy、production governanceを段階的に追加していく段階です。
-
-次の節目はschema version 8(WIP/Publishモデル)への移行です。versionフォルダが担っていた役割をWIPストリームとコピーゼロのpublish昇格へ引き継ぎ、当初の動機であったusdcロック問題をWIPイテレーションを含めて構造的に解消します。
+schema version 8により、当初の動機であったusdcロック問題はWIPイテレーションを含めて構造的に解消されました。remote store MVPとHoudini integrationも成立しており、今後はS3互換backend、range read、cache policy、production governance(Phase 5)を段階的に追加していく段階です。

@@ -9,49 +9,67 @@ from ads import AdsCli, AdsCommandError, AdsHttpClient
 
 
 class AdsCliTests(unittest.TestCase):
-    def test_pull_builds_expected_command(self):
+    def test_wip_add_builds_expected_command(self):
         completed = subprocess.CompletedProcess(
             args=[],
             returncode=0,
-            stdout="pulled v002 char/hero/model to D:\\workspace\\char\\hero\\model\\v002\n",
+            stdout="registered wip seq=3 char/hero/model files=2 bytes=10 manifest=abc\n",
             stderr="",
         )
         with patch("ads.client.subprocess.run", return_value=completed) as run:
-            text = AdsCli("ads.exe").pull(
+            text = AdsCli("ads.exe").wip_add(
                 store="D:\\store",
-                workspace="D:\\workspace",
                 category="char",
                 asset_code="hero",
                 department="model",
-                latest=True,
-                force=True,
+                source="D:\\workspace\\.ads-staging\\run1\\char\\hero\\model",
             )
 
-        self.assertIn("pulled v002", text)
+        self.assertIn("registered wip seq=3", text)
         run.assert_called_once()
         args = run.call_args.args[0]
         self.assertEqual(args[0], "ads.exe")
-        self.assertIn("pull", args)
-        self.assertIn("--latest", args)
-        self.assertIn("--force", args)
+        self.assertEqual(args[1:3], ["wip", "add"])
         self.assertEqual(args[args.index("--category") + 1], "char")
         self.assertEqual(args[args.index("--asset-code") + 1], "hero")
         self.assertEqual(args[args.index("--department") + 1], "model")
+        self.assertIn("--source", args)
 
-    def test_restore_accepts_integer_version(self):
+    def test_publish_promote_accepts_integer_wip_seq(self):
         completed = subprocess.CompletedProcess(
             args=[],
             returncode=0,
-            stdout="restored\n",
+            stdout="promoted v003 char/hero/model files=2 bytes=10 manifest=abc\n",
             stderr="",
         )
         with patch("ads.client.subprocess.run", return_value=completed) as run:
-            AdsCli("ads.exe").restore(
+            text = AdsCli("ads.exe").publish_promote(
                 store="D:\\store",
-                workspace="D:\\workspace",
                 category="char",
                 asset_code="hero",
                 department="model",
+                wip_seq=7,
+            )
+
+        self.assertIn("promoted v003", text)
+        args = run.call_args.args[0]
+        self.assertEqual(args[1:3], ["publish", "promote"])
+        self.assertEqual(args[args.index("--wip-seq") + 1], "7")
+
+    def test_checkout_accepts_integer_version(self):
+        completed = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="checked out\n",
+            stderr="",
+        )
+        with patch("ads.client.subprocess.run", return_value=completed) as run:
+            AdsCli("ads.exe").checkout(
+                store="D:\\store",
+                category="char",
+                asset_code="hero",
+                department="model",
+                dest="D:\\temp\\out",
                 version=2,
             )
 
@@ -74,29 +92,34 @@ class AdsCliTests(unittest.TestCase):
 
         self.assertEqual(data["asset"]["asset_key"]["asset_code"], "hero")
 
-    def test_publish_register_builds_expected_command(self):
+    def test_publish_validate_builds_store_and_source_commands(self):
         completed = subprocess.CompletedProcess(
             args=[],
             returncode=0,
-            stdout="registered v003 char/hero/model files=1 bytes=10 manifest=abc\n",
+            stdout="ok files_scanned=1 references_checked=2 warnings=0\n",
             stderr="",
         )
         with patch("ads.client.subprocess.run", return_value=completed) as run:
-            text = AdsCli("ads.exe").publish_register(
+            text = AdsCli("ads.exe").publish_validate(
                 store="D:\\store",
-                public_root="D:\\public",
                 category="char",
                 asset_code="hero",
                 department="model",
-                version="v003",
+                wip=True,
             )
-
-        self.assertIn("registered v003", text)
+        self.assertIn("references_checked=2", text)
         args = run.call_args.args[0]
-        self.assertEqual(args[:2], ["ads.exe", "publish"])
-        self.assertIn("register", args)
-        self.assertEqual(args[args.index("--public-root") + 1], "D:\\public")
-        self.assertEqual(args[args.index("--version") + 1], "v003")
+        self.assertEqual(args[1:3], ["publish", "validate"])
+        self.assertIn("--wip", args)
+
+        with patch("ads.client.subprocess.run", return_value=completed) as run:
+            AdsCli("ads.exe").publish_validate(source="D:\\staging\\run1")
+        args = run.call_args.args[0]
+        self.assertEqual(args[args.index("--source") + 1], "D:\\staging\\run1")
+        self.assertNotIn("--store", args)
+
+        with self.assertRaises(ValueError):
+            AdsCli("ads.exe").publish_validate(category="char")
 
     def test_fetch_builds_expected_command(self):
         completed = subprocess.CompletedProcess(

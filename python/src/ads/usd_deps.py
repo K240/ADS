@@ -46,7 +46,7 @@ class DependencyPlan:
 
     @property
     def pull_urls(self) -> list[str]:
-        return [item.asset_path for item in self.dependencies if item.action in {"pull", "restore"}]
+        return [item.asset_path for item in self.dependencies if item.action == "materialize"]
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -180,6 +180,10 @@ def execute_pull_plan(
     ads: AdsCli | None = None,
     force: bool = False,
 ) -> DependencyPlan:
+    # Schema v8: resolving in local mode materializes the immutable manifest
+    # view, so warming the cache is a plain resolve per dependency. The view
+    # never conflicts with existing content, which makes `force` obsolete.
+    del force
     ads = ads or AdsCli()
     for item in plan.dependencies:
         if item.action == "none":
@@ -188,43 +192,16 @@ def execute_pull_plan(
             item.action = "error"
             item.error = "cannot infer asset_code and department from ADS URI"
             continue
-        if item.category is None:
-            item.action = "error"
-            item.error = "cannot execute pull for category-less ADS URI; use ads://category/asset_code/department/..."
-            continue
         try:
-            if item.action == "restore" and _is_explicit_version(item.version):
-                ads.restore(
-                    store=store,
-                    workspace=workspace,
-                    category=item.category or "",
-                    asset_code=item.asset_code,
-                    department=item.department,
-                    version=item.version,
-                    force=force,
-                )
-            else:
-                ads.pull(
-                    store=store,
-                    workspace=workspace,
-                    category=item.category or "",
-                    asset_code=item.asset_code,
-                    department=item.department,
-                    latest=item.version == "latest",
-                    force=force,
-                )
+            item.local_path = ads.resolve(
+                item.asset_path,
+                store=store,
+                workspace=workspace,
+                mode="local",
+            )
             item.action = "none"
             item.present = True
             item.error = None
-            try:
-                item.local_path = ads.resolve(
-                    item.asset_path,
-                    store=store,
-                    workspace=workspace,
-                    mode="local",
-                )
-            except AdsCommandError:
-                pass
         except AdsCommandError as exc:
             item.action = "error"
             item.error = str(exc)
@@ -262,8 +239,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--store", help="ADS store path. Enables local presence checks")
     parser.add_argument("--workspace", help="ADS workspace path")
     parser.add_argument("--ads-executable", default="ads", help="ads executable path")
-    parser.add_argument("--execute", action="store_true", help="pull/restore missing dependencies")
-    parser.add_argument("--force", action="store_true", help="pass force when executing the plan")
+    parser.add_argument("--execute", action="store_true", help="materialize missing dependencies into the manifest view cache")
     parser.add_argument("--json", action="store_true", help="print JSON")
     parser.add_argument("--all", action="store_true", help="include all USD dependencies in text output")
     args = parser.parse_args(argv)
@@ -278,7 +254,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             store=args.store,
             workspace=args.workspace,
             ads=ads,
-            force=args.force,
         )
 
     if args.json:
@@ -382,22 +357,12 @@ def _first(values: list[str] | None) -> str | None:
     return value or None
 
 
-def _is_explicit_version(version: str | None) -> bool:
-    """True for pinned versions in either form (`v012` or the canonical `12`)."""
-    if not version or version in ("current", "latest"):
-        return False
-    digits = version[1:] if version.startswith("v") else version
-    return digits.isdigit() and int(digits) > 0
-
-
 def _plan_action(parts: AdsUriParts, present: bool | None) -> str:
     if present is True:
         return "none"
     if not parts.asset_code or not parts.department:
         return "inspect"
-    if _is_explicit_version(parts.version):
-        return "restore"
-    return "pull"
+    return "materialize"
 
 
 if __name__ == "__main__":

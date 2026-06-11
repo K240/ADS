@@ -789,11 +789,11 @@ struct ResolveCacheEntry
     bool permanent = false;
 };
 
-bool HasExplicitVersionPin(const std::string& assetPath)
+std::string VersionSelectorValue(const std::string& assetPath)
 {
     const std::size_t query = assetPath.find('?');
     if (query == std::string::npos) {
-        return false;
+        return {};
     }
     std::size_t position = query + 1;
     while (position < assetPath.size()) {
@@ -803,23 +803,35 @@ bool HasExplicitVersionPin(const std::string& assetPath)
         }
         const std::string pair = assetPath.substr(position, end - position);
         if (pair.rfind("v=", 0) == 0) {
-            std::string value = pair.substr(2);
-            if (!value.empty() && value[0] == 'v') {
-                value = value.substr(1);
-            }
-            if (value.empty()) {
-                return false;
-            }
-            for (const char ch : value) {
-                if (ch < '0' || ch > '9') {
-                    return false;
-                }
-            }
-            return true;
+            return pair.substr(2);
         }
         position = end + 1;
     }
-    return false;
+    return {};
+}
+
+bool HasExplicitVersionPin(const std::string& assetPath)
+{
+    std::string value = VersionSelectorValue(assetPath);
+    if (!value.empty() && value[0] == 'v') {
+        value = value.substr(1);
+    }
+    if (value.empty()) {
+        return false;
+    }
+    for (const char ch : value) {
+        if (ch < '0' || ch > '9') {
+            return false;
+        }
+    }
+    return true;
+}
+
+// WIP heads move on every registered write, so wip resolutions must never be
+// cached (schema v8 cache policy).
+bool HasWipSelector(const std::string& assetPath)
+{
+    return VersionSelectorValue(assetPath) == "wip";
 }
 
 long CacheTtlSeconds()
@@ -891,8 +903,9 @@ std::string ResolveWithAdsServer(const std::string& assetPath)
         "server\n" + server + "\n" + profile + "\n" + mode + "\n" + normalizedAssetPath;
     static std::mutex cacheMutex;
     static std::unordered_map<std::string, ResolveCacheEntry> cache;
+    const bool wip = HasWipSelector(normalizedAssetPath);
     std::string cached;
-    if (LookupResolveCache(cacheMutex, cache, cacheKey, &cached)) {
+    if (!wip && LookupResolveCache(cacheMutex, cache, cacheKey, &cached)) {
         return cached;
     }
 
@@ -914,7 +927,7 @@ std::string ResolveWithAdsServer(const std::string& assetPath)
                 + "` profile `" + profile + "`",
             true);
     }
-    if (!location.empty()) {
+    if (!location.empty() && !wip) {
         StoreResolveCache(
             cacheMutex,
             cache,
@@ -966,8 +979,9 @@ std::string ResolveWithAdsCli(const std::string& assetPath)
         + "\n" + remoteBaseUrl + "\n" + cliAssetPath;
     static std::mutex cacheMutex;
     static std::unordered_map<std::string, ResolveCacheEntry> cache;
+    const bool wip = HasWipSelector(cliAssetPath);
     std::string cached;
-    if (LookupResolveCache(cacheMutex, cache, cacheKey, &cached)) {
+    if (!wip && LookupResolveCache(cacheMutex, cache, cacheKey, &cached)) {
         return cached;
     }
 
@@ -997,7 +1011,7 @@ std::string ResolveWithAdsCli(const std::string& assetPath)
     if (DebugEnabled()) {
         LogResolverMessage("ADS Resolver resolved `" + assetPath + "` -> `" + resolved + "`");
     }
-    if (!resolved.empty()) {
+    if (!resolved.empty() && !wip) {
         StoreResolveCache(
             cacheMutex,
             cache,
