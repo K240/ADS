@@ -847,6 +847,223 @@ fn resolve_accepts_simplified_uri_current_and_query_version() {
 }
 
 #[test]
+fn cache_gc_prunes_stale_views_blobs_and_staging_runs() {
+    let temp = TempDir::new().unwrap();
+    let store = temp.path().join("store");
+    let workspace = temp.path().join("workspace");
+    assert!(ads().arg("init").arg(&store).status().unwrap().success());
+
+    // Two versions; resolving each materializes its manifest view.
+    new_version(&store, &workspace, "prop", "crate");
+    fs::write(
+        version_folder(&workspace, "prop", "crate", "v001").join("model.usd"),
+        "v1",
+    )
+    .unwrap();
+    add_asset(&store, &workspace, "prop", "crate", "v001");
+    let pinned = resolve_asset(
+        &store,
+        &workspace,
+        "local",
+        None,
+        "ads://prop/crate/model/model.usd?v=1",
+    );
+    assert!(pinned.status.success(), "{}", stderr(&pinned));
+
+    new_version(&store, &workspace, "prop", "crate");
+    fs::write(
+        version_folder(&workspace, "prop", "crate", "v002").join("model.usd"),
+        "v2",
+    )
+    .unwrap();
+    add_asset(&store, &workspace, "prop", "crate", "v002");
+    let current = resolve_asset(
+        &store,
+        &workspace,
+        "local",
+        None,
+        "ads://prop/crate/model/model.usd",
+    );
+    assert!(current.status.success(), "{}", stderr(&current));
+
+    // A stale staging run left behind by a crashed write.
+    fs::create_dir_all(workspace.join(".ads-staging").join("run-dead")).unwrap();
+    fs::write(
+        workspace
+            .join(".ads-staging")
+            .join("run-dead")
+            .join("x.usd"),
+        "orphan",
+    )
+    .unwrap();
+
+    // Dry run reports the v001 view and blob without deleting anything.
+    let dry = cache_gc_run(&store, &workspace, true);
+    assert!(dry.status.success(), "{}", stderr(&dry));
+    let dry_stdout = stdout(&dry);
+    assert!(dry_stdout.contains("\"retained_views\": 1"), "{dry_stdout}");
+    assert!(dry_stdout.contains("\"deleted_views\": 1"), "{dry_stdout}");
+    assert!(dry_stdout.contains("\"deleted_blobs\": 1"), "{dry_stdout}");
+    assert!(
+        dry_stdout.contains("\"deleted_staging_runs\": 1"),
+        "{dry_stdout}"
+    );
+    assert!(workspace.join(".ads-staging").join("run-dead").exists());
+
+    let swept = cache_gc_run(&store, &workspace, false);
+    assert!(swept.status.success(), "{}", stderr(&swept));
+    assert!(!workspace.join(".ads-staging").join("run-dead").exists());
+
+    // The kept view (current=latest=v002) still resolves, and the pruned
+    // pinned view simply re-materializes from the store on demand.
+    let still_current = resolve_asset(
+        &store,
+        &workspace,
+        "local",
+        None,
+        "ads://prop/crate/model/model.usd",
+    );
+    assert!(still_current.status.success(), "{}", stderr(&still_current));
+    assert_view_resolution(&workspace, &still_current, "model.usd", "v2");
+    let repinned = resolve_asset(
+        &store,
+        &workspace,
+        "local",
+        None,
+        "ads://prop/crate/model/model.usd?v=1",
+    );
+    assert!(repinned.status.success(), "{}", stderr(&repinned));
+    assert_view_resolution(&workspace, &repinned, "model.usd", "v1");
+}
+
+fn cache_gc_run(store: &Path, workspace: &Path, dry_run: bool) -> Output {
+    let mut command = ads();
+    command
+        .arg("cache")
+        .arg("gc")
+        .arg("--store")
+        .arg(store)
+        .arg("--workspace")
+        .arg(workspace)
+        .arg("--staging-hours")
+        .arg("0");
+    if dry_run {
+        command.arg("--dry-run");
+    }
+    command.output().unwrap()
+}
+
+#[test]
+fn read_commands_work_while_a_writer_holds_the_store() {
+    let temp = TempDir::new().unwrap();
+    let store = temp.path().join("store");
+    let workspace = temp.path().join("workspace");
+    assert!(ads().arg("init").arg(&store).status().unwrap().success());
+
+    new_version(&store, &workspace, "prop", "crate");
+    fs::write(
+        version_folder(&workspace, "prop", "crate", "v001").join("model.usd"),
+        "v1",
+    )
+    .unwrap();
+    add_asset(&store, &workspace, "prop", "crate", "v001");
+
+    // Hold a writer handle the way `ads serve` does.
+    let _writer = ads::Store::open(&store).unwrap();
+
+    // Read commands open the store read-only and keep working.
+    let list = ads().arg("list").arg("--store").arg(&store).output().unwrap();
+    assert!(list.status.success(), "{}", stderr(&list));
+    let resolved = resolve_asset(
+        &store,
+        &workspace,
+        "local",
+        None,
+        "ads://prop/crate/model/model.usd",
+    );
+    assert!(resolved.status.success(), "{}", stderr(&resolved));
+    assert_view_resolution(&workspace, &resolved, "model.usd", "v1");
+
+    // Writes still need exclusive access and fail on the RocksDB lock.
+    let staging = temp.path().join("staging");
+    fs::create_dir_all(&staging).unwrap();
+    fs::write(staging.join("x.usd"), "wip").unwrap();
+    let blocked = wip_add(&store, &staging);
+    assert!(!blocked.status.success());
+    assert!(stderr(&blocked).to_lowercase().contains("lock"));
+}
+
+#[test]
+fn leaf_files_resolve_lazily_and_fall_back_to_remote() {
+    let temp = TempDir::new().unwrap();
+    let store = temp.path().join("store");
+    let workspace = temp.path().join("workspace");
+    assert!(
+        ads()
+            .arg("init")
+            .arg(&store)
+            .arg("--remote-base-url")
+            .arg("https://assets.example.com/objects/sha256")
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    new_version(&store, &workspace, "prop", "crate");
+    let v001 = version_folder(&workspace, "prop", "crate", "v001");
+    fs::create_dir(v001.join("sim")).unwrap();
+    fs::write(v001.join("model.usd"), "usd").unwrap();
+    fs::write(v001.join("sim").join("smoke.vdb"), "vdb data").unwrap();
+    add_asset(&store, &workspace, "prop", "crate", "v001");
+
+    // Any non-composing format is a leaf: a direct URI resolves lazily to the
+    // flat blob cache without materializing the whole manifest view.
+    let leaf = resolve_asset(
+        &store,
+        &workspace,
+        "local",
+        None,
+        "ads://prop/crate/model/sim/smoke.vdb",
+    );
+    assert!(leaf.status.success(), "{}", stderr(&leaf));
+    let resolved = stdout(&leaf).trim().replace('\\', "/");
+    assert!(resolved.contains(".ads-cache/sha256/"), "{resolved}");
+    assert_eq!(fs::read_to_string(resolved.as_str()).unwrap(), "vdb data");
+    assert!(
+        !workspace.join(".ads-cache").join("manifests").exists(),
+        "leaf resolution must not materialize the manifest view"
+    );
+
+    // Auto mode falls back to the remote object URL for leaves too once the
+    // local object is gone.
+    let vdb_hash = sha256_hex(b"vdb data");
+    fs::remove_file(
+        store
+            .join("objects")
+            .join("sha256")
+            .join(&vdb_hash[0..2])
+            .join(&vdb_hash),
+    )
+    .unwrap();
+    let fallback = resolve_asset(
+        &store,
+        &workspace,
+        "auto",
+        None,
+        "ads://prop/crate/model/sim/smoke.vdb",
+    );
+    assert!(fallback.status.success(), "{}", stderr(&fallback));
+    assert_eq!(
+        stdout(&fallback).trim(),
+        format!(
+            "https://assets.example.com/objects/sha256/{}/{}",
+            &vdb_hash[0..2],
+            vdb_hash
+        )
+    );
+}
+
+#[test]
 fn resolve_materializes_manifest_view_with_sibling_files_and_integer_pin() {
     let temp = TempDir::new().unwrap();
     let store = temp.path().join("store");

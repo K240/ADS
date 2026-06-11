@@ -56,6 +56,30 @@ class AdsCliTests(unittest.TestCase):
         self.assertEqual(args[1:3], ["publish", "promote"])
         self.assertEqual(args[args.index("--wip-seq") + 1], "7")
 
+    def test_command_errors_redact_auth_tokens(self):
+        completed = subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout="",
+            stderr="remote request failed",
+        )
+        with patch("ads.client.subprocess.run", return_value=completed):
+            with self.assertRaises(AdsCommandError) as raised:
+                AdsCli("ads.exe").fetch(
+                    server="http://ads-server:8787",
+                    auth_token="super-secret",
+                    store="D:\\cache",
+                    category="char",
+                    asset_code="hero",
+                    department="model",
+                    latest=True,
+                )
+
+        error = raised.exception
+        self.assertNotIn("super-secret", " ".join(error.args_list))
+        self.assertIn("***", error.args_list)
+        self.assertNotIn("super-secret", str(error))
+
     def test_checkout_accepts_integer_version(self):
         completed = subprocess.CompletedProcess(
             args=[],

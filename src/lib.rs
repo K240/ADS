@@ -32,11 +32,14 @@ const OBJECTS_DIR: &str = "objects";
 const SHA256_DIR: &str = "sha256";
 const CACHE_DIR: &str = ".ads-cache";
 const MANIFESTS_DIR: &str = "manifests";
-const TEXTURE_DEPARTMENTS: &[&str] = &["texture", "textures", "tex"];
-const TEXTURE_EXTENSIONS: &[&str] = &[
-    "tx", "rat", "exr", "tif", "tiff", "png", "jpg", "jpeg", "tga", "bmp", "hdr", "pic", "tex",
-];
+const STAGING_DIR: &str = ".ads-staging";
 const USD_EXTENSIONS: &[&str] = &["usd", "usda", "usdc", "usdz"];
+/// Formats that can carry relative references to sibling files and therefore
+/// resolve through the eagerly materialized manifest view. Everything else is
+/// a leaf (textures, volumes, caches, ...) and resolves lazily to its flat
+/// blob cache path — one file copied per request instead of the whole
+/// version.
+const VIEW_EXTENSIONS: &[&str] = &["usd", "usda", "usdc", "usdz", "mtlx"];
 
 #[derive(Parser, Debug)]
 #[command(
@@ -179,6 +182,11 @@ enum Commands {
         /// Report what would be deleted without deleting anything.
         #[arg(long = "dry-run")]
         dry_run: bool,
+    },
+    /// Workspace cache maintenance.
+    Cache {
+        #[command(subcommand)]
+        command: CacheCommands,
     },
     /// Fetch a version and missing objects from a remote ADS server into a local store.
     Fetch(FetchArgs),
@@ -443,6 +451,27 @@ enum PublishCommands {
         /// Skip the publish reference validation gate.
         #[arg(long = "no-validate")]
         no_validate: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum CacheCommands {
+    /// Delete manifest views, blobs, and stale staging runs that latest,
+    /// current, and WIP heads no longer reference. The cache rebuilds on
+    /// demand, so this is safe at any time and works while `ads serve` runs.
+    Gc {
+        /// Store root path.
+        #[arg(long)]
+        store: PathBuf,
+        /// Workspace root. Defaults to the current directory.
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Staging runs older than this many hours are removed.
+        #[arg(long = "staging-hours", default_value_t = 24)]
+        staging_hours: u64,
+        /// Report what would be deleted without deleting anything.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
     },
 }
 
@@ -798,8 +827,7 @@ where
                 let asset_key = AssetKey::new(category, asset_code)?;
                 let department_key = DepartmentKey::new(asset_key, department)?;
                 let store = Store::open(&store)?;
-                let source_path = source.display().to_string();
-                let outcome = store.add_wip_from_source(&source, &department_key, source_path)?;
+                let outcome = store.add_wip_from_source(&source, &department_key)?;
                 println!(
                     "{} wip seq={} {}/{}/{} files={} bytes={} manifest={}",
                     if outcome.created {
@@ -824,7 +852,7 @@ where
             } => {
                 let asset_key = AssetKey::new(category, asset_code)?;
                 let department_key = DepartmentKey::new(asset_key, department)?;
-                let store = Store::open(&store)?;
+                let store = Store::open_read_only(&store)?;
                 let records = store.list_wips(&department_key)?;
                 println!("{}", serde_json::to_string_pretty(&records)?);
             }
@@ -843,6 +871,23 @@ where
             )?;
             println!("{}", serde_json::to_string_pretty(&outcome)?);
         }
+        Commands::Cache { command } => match command {
+            CacheCommands::Gc {
+                store,
+                workspace,
+                staging_hours,
+                dry_run,
+            } => {
+                let workspace = workspace_root(workspace)?;
+                let store = Store::open_read_only(&store)?;
+                let outcome = store.cache_gc(
+                    &workspace,
+                    std::time::Duration::from_secs(staging_hours * 3600),
+                    dry_run,
+                )?;
+                println!("{}", serde_json::to_string_pretty(&outcome)?);
+            }
+        },
         Commands::Asset { command } => match command {
             AssetCommands::Create {
                 store,
@@ -867,7 +912,7 @@ where
                 asset_code,
             } => {
                 let asset_key = AssetKey::new(category, asset_code)?;
-                let store = Store::open(&store)?;
+                let store = Store::open_read_only(&store)?;
                 let info = store.asset_info(&asset_key)?;
                 println!("{}", serde_json::to_string_pretty(&info)?);
             }
@@ -881,7 +926,7 @@ where
             } => {
                 let asset_key = AssetKey::new(category, asset_code)?;
                 let department_key = DepartmentKey::new(asset_key, department)?;
-                let store = Store::open(&store)?;
+                let store = Store::open_read_only(&store)?;
                 let status = store.current_status_for_department(&department_key)?;
                 let current = status.current.ok_or_else(|| {
                     anyhow!(
@@ -947,7 +992,7 @@ where
                 if let Some(department) = &department {
                     validate_department(department)?;
                 }
-                let store = Store::open(&store)?;
+                let store = Store::open_read_only(&store)?;
                 let statuses = store.current_status(
                     category.as_deref(),
                     asset_code.as_deref(),
@@ -1000,7 +1045,7 @@ where
                 } else {
                     version.map_or(VersionSelector::Current, VersionSelector::Version)
                 };
-                let store = Store::open(&store)?;
+                let store = Store::open_read_only(&store)?;
                 let record = store.copy_thumbnail(&department_key, selector, &dest, force)?;
                 println!(
                     "thumbnail copied {} {}/{}/{} to {}",
@@ -1029,7 +1074,7 @@ where
                 } else {
                     version.map_or(VersionSelector::Current, VersionSelector::Version)
                 };
-                let store = Store::open(&store)?;
+                let store = Store::open_read_only(&store)?;
                 let record = store.thumbnail_info(&department_key, selector)?;
                 println!("{}", serde_json::to_string_pretty(&record)?);
             }
@@ -1048,7 +1093,7 @@ where
                 if let Some(department) = &department {
                     validate_department(department)?;
                 }
-                let store = Store::open(&store)?;
+                let store = Store::open_read_only(&store)?;
                 let records = store.list_thumbnails(
                     category.as_deref(),
                     asset_code.as_deref(),
@@ -1075,7 +1120,7 @@ where
                 } else {
                     version.map_or(VersionSelector::Current, VersionSelector::Version)
                 };
-                let store = Store::open(&store)?;
+                let store = Store::open_read_only(&store)?;
                 let url =
                     store.thumbnail_url(&department_key, selector, remote_base_url.as_deref())?;
                 println!("{url}");
@@ -1125,7 +1170,7 @@ where
                 validate_department(department)?;
             }
 
-            let store = Store::open(&store)?;
+            let store = Store::open_read_only(&store)?;
             let versions = store.list_versions(
                 category.as_deref(),
                 asset_code.as_deref(),
@@ -1147,7 +1192,7 @@ where
             version,
         } => {
             let asset_key = AssetKey::new(category, asset_code)?;
-            let store = Store::open(&store)?;
+            let store = Store::open_read_only(&store)?;
             match (department, version) {
                 (Some(department), version) => {
                     let department_key = DepartmentKey::new(asset_key, department)?;
@@ -1178,7 +1223,7 @@ where
             }
             let asset_key = AssetKey::new(category, asset_code)?;
             let department_key = DepartmentKey::new(asset_key, department)?;
-            let store = Store::open(&store)?;
+            let store = Store::open_read_only(&store)?;
             let selector = if latest {
                 VersionSelector::Latest
             } else {
@@ -1379,7 +1424,7 @@ where
                 args.version
                     .map_or(VersionSelector::Current, VersionSelector::Version)
             };
-            let store = Store::open(&args.store)?;
+            let store = Store::open_read_only(&args.store)?;
             let remote = RemoteClient::new(&args.server, &args.auth_token)?;
             let (version_info, stats) =
                 push_remote_version(&store, &remote, &args.profile, &department_key, selector)?;
@@ -1421,7 +1466,7 @@ where
             let asset_key = AssetKey::new(category, asset_code)?;
             let department_key = DepartmentKey::new(asset_key, department)?;
             let workspace = workspace_root(workspace)?;
-            let store = Store::open(&store)?;
+            let store = Store::open_read_only(&store)?;
             let selector = if latest {
                 VersionSelector::Latest
             } else {
@@ -1442,7 +1487,7 @@ where
         } => {
             let workspace = workspace_root(workspace)?;
             let asset_path = AssetPath::parse(&asset_path)?;
-            let store = Store::open(&store)?;
+            let store = Store::open_read_only(&store)?;
             let outcome = store.resolve_asset_path(
                 &workspace,
                 &asset_path,
@@ -1562,7 +1607,7 @@ where
                     };
                     let asset_key = AssetKey::new(category, asset_code)?;
                     let department_key = DepartmentKey::new(asset_key, department)?;
-                    let store = Store::open(&store_path)?;
+                    let store = Store::open_read_only(&store_path)?;
                     let (target, manifest_hash) = if wip || wip_seq.is_some() {
                         let record = match wip_seq {
                             Some(seq) => store.get_wip(&department_key, seq)?,
@@ -1608,7 +1653,7 @@ where
             }
         },
         Commands::Verify { store } => {
-            let store = Store::open(&store)?;
+            let store = Store::open_read_only(&store)?;
             let report = store.verify()?;
             if report.errors.is_empty() {
                 println!(
@@ -1824,9 +1869,7 @@ fn resolve_version_relative_reference(from: &str, reference: &str) -> Option<Str
         match component {
             "" | "." => continue,
             ".." => {
-                if parts.pop().is_none() {
-                    return None;
-                }
+                parts.pop()?;
             }
             other => parts.push(other.to_string()),
         }
@@ -2267,9 +2310,11 @@ pub enum ResolveSource {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AssetFileKind {
-    Usd,
-    Texture,
-    Generic,
+    /// May reference sibling files relatively; resolves through the manifest
+    /// view so those references keep working.
+    Composing,
+    /// Pure leaf content; resolves lazily to the flat blob cache.
+    Leaf,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -2376,6 +2421,17 @@ pub struct GcOutcome {
     pub deleted_bytes: u64,
     pub pruned_wips: u64,
     pub pruned_manifests: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct CacheGcOutcome {
+    pub dry_run: bool,
+    pub retained_views: u64,
+    pub deleted_views: u64,
+    pub retained_blobs: u64,
+    pub deleted_blobs: u64,
+    pub deleted_bytes: u64,
+    pub deleted_staging_runs: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -2746,6 +2802,36 @@ impl Store {
         options.create_if_missing(false);
         let db = DB::open(&options, db_path(path))
             .with_context(|| format!("failed to open RocksDB at {}", db_path(path).display()))?;
+        Self::validate_schema(&db)?;
+        Ok(Self {
+            root: path.to_path_buf(),
+            db,
+        })
+    }
+
+    /// Opens the store read-only. Read-only opens do not take the RocksDB
+    /// LOCK file, so read commands (resolve, list, info, checkout,
+    /// materialize, ...) keep working while `ads serve` or another writer
+    /// holds the store.
+    pub fn open_read_only(path: &Path) -> Result<Self> {
+        if !db_path(path).exists() {
+            bail!(
+                "store is not initialized at {}; run `ads init {}` first",
+                path.display(),
+                path.display()
+            );
+        }
+        let options = Options::default();
+        let db = DB::open_for_read_only(&options, db_path(path), false)
+            .with_context(|| format!("failed to open RocksDB at {}", db_path(path).display()))?;
+        Self::validate_schema(&db)?;
+        Ok(Self {
+            root: path.to_path_buf(),
+            db,
+        })
+    }
+
+    fn validate_schema(db: &DB) -> Result<()> {
         let schema = db
             .get(key_meta("schema_version"))?
             .ok_or_else(|| anyhow!("store metadata is missing schema_version"))?;
@@ -2755,10 +2841,7 @@ impl Store {
                 String::from_utf8_lossy(&schema)
             );
         }
-        Ok(Self {
-            root: path.to_path_buf(),
-            db,
-        })
+        Ok(())
     }
 
     pub fn set_remote_base_url(&self, remote_base_url: &str) -> Result<String> {
@@ -3002,7 +3085,6 @@ impl Store {
         &self,
         source: &Path,
         department_key: &DepartmentKey,
-        source_path: String,
     ) -> Result<WipOutcome> {
         let source = source
             .canonicalize()
@@ -3010,20 +3092,29 @@ impl Store {
         if !source.is_dir() {
             bail!("wip source path is not a folder: {}", source.display());
         }
+        // The record carries the logical work line, not the filesystem source:
+        // staging folders are deleted right after registration, so their paths
+        // would be dead the moment they were written.
+        let source_path = format!(
+            "{}/{}/{}",
+            department_key.asset_key.category,
+            department_key.asset_key.asset_code,
+            department_key.department
+        );
 
         let manifest = self.build_manifest(&source)?;
         let manifest_hash = manifest.canonical_hash()?;
 
-        if let Some(head) = self.wip_head(department_key)? {
-            if head.manifest_hash == manifest_hash {
-                return Ok(WipOutcome {
-                    created: false,
-                    seq: head.seq,
-                    manifest_hash,
-                    file_count: head.file_count,
-                    total_bytes: head.total_bytes,
-                });
-            }
+        if let Some(head) = self.wip_head(department_key)?
+            && head.manifest_hash == manifest_hash
+        {
+            return Ok(WipOutcome {
+                created: false,
+                seq: head.seq,
+                manifest_hash,
+                file_count: head.file_count,
+                total_bytes: head.total_bytes,
+            });
         }
 
         let seq = self.wip_head_seq(department_key)?.unwrap_or(0) + 1;
@@ -3275,6 +3366,181 @@ impl Store {
             pruned_wips,
             pruned_manifests,
         })
+    }
+
+    /// Workspace cache garbage collection. The cache is rebuildable from the
+    /// store, so this is purely a disk-space policy: keep the manifest views
+    /// (and blobs) referenced by every department's latest, explicit current,
+    /// and WIP head, delete the rest, and sweep staging runs older than the
+    /// grace window. Anything deleted re-materializes on the next resolve —
+    /// including views for explicitly pinned old versions.
+    ///
+    /// Reads the store only, so it can run while `ads serve` holds it.
+    pub fn cache_gc(
+        &self,
+        workspace: &Path,
+        staging_grace: std::time::Duration,
+        dry_run: bool,
+    ) -> Result<CacheGcOutcome> {
+        let mut department_keys: BTreeMap<String, DepartmentKey> = BTreeMap::new();
+        let mut latest_by_department: BTreeMap<String, (VersionId, String)> = BTreeMap::new();
+        for item in self.db.iterator(IteratorMode::Start) {
+            let (key, value) = item?;
+            if key.starts_with(b"version/") {
+                let record: VersionRecord = serde_json::from_slice(&value).with_context(|| {
+                    format!("failed to decode {}", String::from_utf8_lossy(&key))
+                })?;
+                let department = format!(
+                    "{}/{}/{}",
+                    record.department_key.asset_key.category,
+                    record.department_key.asset_key.asset_code,
+                    record.department_key.department
+                );
+                department_keys
+                    .entry(department.clone())
+                    .or_insert_with(|| record.department_key.clone());
+                let candidate = (record.version, record.manifest_hash);
+                latest_by_department
+                    .entry(department)
+                    .and_modify(|current| {
+                        if current.0 < candidate.0 {
+                            *current = candidate.clone();
+                        }
+                    })
+                    .or_insert(candidate);
+            } else if key.starts_with(b"wip/") {
+                let record: WipRecord = serde_json::from_slice(&value).with_context(|| {
+                    format!("failed to decode {}", String::from_utf8_lossy(&key))
+                })?;
+                let department = format!(
+                    "{}/{}/{}",
+                    record.department_key.asset_key.category,
+                    record.department_key.asset_key.asset_code,
+                    record.department_key.department
+                );
+                department_keys
+                    .entry(department)
+                    .or_insert(record.department_key);
+            }
+        }
+
+        let mut kept_manifests: BTreeSet<String> = BTreeSet::new();
+        for (department, department_key) in &department_keys {
+            if let Some((_, manifest_hash)) = latest_by_department.get(department) {
+                kept_manifests.insert(manifest_hash.clone());
+            }
+            if let Some(version) = self.explicit_current_version(department_key)? {
+                let record = self.get_version(department_key, version)?;
+                kept_manifests.insert(record.manifest_hash);
+            }
+            if let Some(wip) = self.wip_head(department_key)? {
+                kept_manifests.insert(wip.manifest_hash);
+            }
+        }
+
+        let mut kept_blob_names: BTreeSet<String> = BTreeSet::new();
+        for manifest_hash in &kept_manifests {
+            let manifest = self.get_manifest(manifest_hash)?;
+            for entry in &manifest.entries {
+                kept_blob_names.insert(cache_blob_file_name(entry));
+            }
+        }
+
+        let mut outcome = CacheGcOutcome {
+            dry_run,
+            ..CacheGcOutcome::default()
+        };
+
+        let manifests_root = workspace.join(CACHE_DIR).join(MANIFESTS_DIR);
+        if manifests_root.exists() {
+            for entry in fs::read_dir(&manifests_root)
+                .with_context(|| format!("failed to read {}", manifests_root.display()))?
+            {
+                let entry = entry?;
+                let name = entry.file_name().to_string_lossy().to_string();
+                let path = entry.path();
+                if path.is_dir() {
+                    if kept_manifests.contains(&name) {
+                        outcome.retained_views += 1;
+                        continue;
+                    }
+                    outcome.deleted_views += 1;
+                    for file in WalkDir::new(&path).follow_links(false) {
+                        let file = file
+                            .with_context(|| format!("failed to walk {}", path.display()))?;
+                        if file.file_type().is_file() {
+                            outcome.deleted_bytes += file.metadata().map(|m| m.len()).unwrap_or(0);
+                        }
+                    }
+                    if !dry_run {
+                        let _ = fs::remove_file(manifests_root.join(format!("{name}.complete")));
+                        fs::remove_dir_all(&path).with_context(|| {
+                            format!("failed to delete view {}", path.display())
+                        })?;
+                    }
+                } else if let Some(manifest_hash) = name.strip_suffix(".complete") {
+                    // Orphan markers whose view folder is already gone.
+                    if !kept_manifests.contains(manifest_hash)
+                        && !manifests_root.join(manifest_hash).exists()
+                        && !dry_run
+                    {
+                        let _ = fs::remove_file(&path);
+                    }
+                }
+            }
+        }
+
+        let blobs_root = workspace.join(CACHE_DIR).join(SHA256_DIR);
+        if blobs_root.exists() {
+            for entry in WalkDir::new(&blobs_root).follow_links(false) {
+                let entry =
+                    entry.with_context(|| format!("failed to walk {}", blobs_root.display()))?;
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().to_string();
+                if kept_blob_names.contains(&name) {
+                    outcome.retained_blobs += 1;
+                    continue;
+                }
+                outcome.deleted_blobs += 1;
+                outcome.deleted_bytes += entry.metadata().map(|m| m.len()).unwrap_or(0);
+                if !dry_run {
+                    fs::remove_file(entry.path()).with_context(|| {
+                        format!("failed to delete blob {}", entry.path().display())
+                    })?;
+                }
+            }
+        }
+
+        let staging_root = workspace.join(STAGING_DIR);
+        if staging_root.exists() {
+            let now = std::time::SystemTime::now();
+            for entry in fs::read_dir(&staging_root)
+                .with_context(|| format!("failed to read {}", staging_root.display()))?
+            {
+                let entry = entry?;
+                if !entry.path().is_dir() {
+                    continue;
+                }
+                let age = entry
+                    .metadata()
+                    .ok()
+                    .and_then(|metadata| metadata.modified().ok())
+                    .and_then(|modified| now.duration_since(modified).ok());
+                if age.is_none_or(|age| age < staging_grace) {
+                    continue;
+                }
+                outcome.deleted_staging_runs += 1;
+                if !dry_run {
+                    fs::remove_dir_all(entry.path()).with_context(|| {
+                        format!("failed to delete staging run {}", entry.path().display())
+                    })?;
+                }
+            }
+        }
+
+        Ok(outcome)
     }
 
     fn add_version_from_source(
@@ -3628,19 +3894,17 @@ impl Store {
                     asset_path.relative_path
                 )
             })?;
-        let asset_file_kind = asset_file_kind(
-            &asset_path.department_key.department,
-            &asset_path.relative_path,
-        );
+        let asset_file_kind = asset_file_kind(&asset_path.relative_path);
 
         // Local/auto resolve materializes from the store cache instead of the
-        // workspace: textures resolve to flat blob cache paths, every other
-        // file resolves into the immutable manifest view so sibling-relative
-        // references keep working (schema v8: version folders are no longer
-        // load targets).
+        // workspace: leaf files resolve lazily to flat blob cache paths,
+        // composing formats resolve into the immutable manifest view so
+        // sibling-relative references keep working (schema v8: version
+        // folders are no longer load targets). Auto falls back to the remote
+        // object URL for both shapes when local objects are missing.
         match mode {
             ResolveMode::Local => {
-                if asset_file_kind == AssetFileKind::Texture {
+                if asset_file_kind == AssetFileKind::Leaf {
                     let cache_path = self.ensure_cache_object(workspace, entry)?;
                     return Ok(ResolveOutcome {
                         location: cache_path.display().to_string(),
@@ -3666,14 +3930,22 @@ impl Store {
                 sha256: entry.sha256.clone(),
             }),
             ResolveMode::Auto => {
-                if asset_file_kind == AssetFileKind::Texture {
-                    let cache_path = self.ensure_cache_object(workspace, entry)?;
-                    return Ok(ResolveOutcome {
-                        location: cache_path.display().to_string(),
-                        source: ResolveSource::Cache,
-                        version: Some(version),
-                        sha256: entry.sha256.clone(),
-                    });
+                if asset_file_kind == AssetFileKind::Leaf {
+                    return match self.ensure_cache_object(workspace, entry) {
+                        Ok(cache_path) => Ok(ResolveOutcome {
+                            location: cache_path.display().to_string(),
+                            source: ResolveSource::Cache,
+                            version: Some(version),
+                            sha256: entry.sha256.clone(),
+                        }),
+                        Err(_) => Ok(ResolveOutcome {
+                            location: self
+                                .resolve_remote_url(entry, remote_base_url_override)?,
+                            source: ResolveSource::Remote,
+                            version: Some(version),
+                            sha256: entry.sha256.clone(),
+                        }),
+                    };
                 }
                 match self.ensure_manifest_view(workspace, &record.manifest_hash, &manifest) {
                     Ok(view_root) => {
@@ -3730,11 +4002,8 @@ impl Store {
                     asset_path.relative_path
                 )
             })?;
-        let asset_file_kind = asset_file_kind(
-            &asset_path.department_key.department,
-            &asset_path.relative_path,
-        );
-        if asset_file_kind == AssetFileKind::Texture {
+        let asset_file_kind = asset_file_kind(&asset_path.relative_path);
+        if asset_file_kind == AssetFileKind::Leaf {
             let cache_path = self.ensure_cache_object(workspace, entry)?;
             return Ok(ResolveOutcome {
                 location: cache_path.display().to_string(),
@@ -5363,11 +5632,27 @@ async fn api_auth_middleware(
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "));
-    if token == Some(state.auth_token.as_str()) {
+    let authorized = token
+        .is_some_and(|token| constant_time_eq(token.as_bytes(), state.auth_token.as_bytes()));
+    if authorized {
         Ok(next.run(request).await)
     } else {
         Err(ApiError::unauthorized("missing or invalid bearer token"))
     }
+}
+
+/// Constant-time byte comparison for the bearer-token check, so response
+/// timing does not leak how much of a guessed token matched. The length
+/// itself is not treated as secret.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    std::hint::black_box(diff) == 0
 }
 
 async fn index_html() -> Html<&'static str> {
@@ -7741,22 +8026,13 @@ fn url_encode_component(value: &str) -> String {
     encoded
 }
 
-fn asset_file_kind(department: &str, relative_path: &str) -> AssetFileKind {
-    if let Some(extension) = normalized_extension(relative_path) {
-        if USD_EXTENSIONS.contains(&extension.as_str()) {
-            return AssetFileKind::Usd;
-        }
-        if TEXTURE_EXTENSIONS.contains(&extension.as_str()) {
-            return AssetFileKind::Texture;
-        }
-    }
-    if TEXTURE_DEPARTMENTS
-        .iter()
-        .any(|candidate| department.eq_ignore_ascii_case(candidate))
+fn asset_file_kind(relative_path: &str) -> AssetFileKind {
+    if let Some(extension) = normalized_extension(relative_path)
+        && VIEW_EXTENSIONS.contains(&extension.as_str())
     {
-        return AssetFileKind::Texture;
+        return AssetFileKind::Composing;
     }
-    AssetFileKind::Generic
+    AssetFileKind::Leaf
 }
 
 fn normalized_extension(path: &str) -> Option<String> {
@@ -7782,16 +8058,20 @@ fn manifest_view_marker(workspace: &Path, manifest_hash: &str) -> PathBuf {
 
 fn cache_object_path(workspace: &Path, entry: &ManifestEntry) -> PathBuf {
     let prefix = entry.sha256.get(0..2).unwrap_or("00");
+    workspace
+        .join(CACHE_DIR)
+        .join(SHA256_DIR)
+        .join(prefix)
+        .join(cache_blob_file_name(entry))
+}
+
+fn cache_blob_file_name(entry: &ManifestEntry) -> String {
     let mut file_name = entry.sha256.clone();
     if let Some(extension) = normalized_extension(&entry.relative_path) {
         file_name.push('.');
         file_name.push_str(&extension);
     }
-    workspace
-        .join(CACHE_DIR)
-        .join(SHA256_DIR)
-        .join(prefix)
-        .join(file_name)
+    file_name
 }
 
 fn inspect_thumbnail_image(path: &Path) -> Result<ThumbnailImageInfo> {
@@ -8220,24 +8500,21 @@ mod tests {
     }
 
     #[test]
-    fn asset_file_kind_classifies_usd_and_textures() {
-        assert_eq!(asset_file_kind("model", "hero.usd"), AssetFileKind::Usd);
+    fn asset_file_kind_splits_composing_formats_from_leaves() {
+        // Composing formats carry relative sibling references and resolve
+        // through the manifest view.
+        assert_eq!(asset_file_kind("hero.usd"), AssetFileKind::Composing);
+        assert_eq!(asset_file_kind("geo/body.USDA"), AssetFileKind::Composing);
+        assert_eq!(asset_file_kind("mtl/look.mtlx"), AssetFileKind::Composing);
+        // Everything else is a leaf and resolves lazily to the flat blob
+        // cache — textures, volumes, caches, and unknown formats alike.
         assert_eq!(
-            asset_file_kind("model", "body_diffuse.1001.tx"),
-            AssetFileKind::Texture
+            asset_file_kind("body_diffuse.1001.tx"),
+            AssetFileKind::Leaf
         );
-        assert_eq!(
-            asset_file_kind("texture", "source/custom.bin"),
-            AssetFileKind::Texture
-        );
-        assert_eq!(
-            asset_file_kind("texture", "source/readme"),
-            AssetFileKind::Texture
-        );
-        assert_eq!(
-            asset_file_kind("model", "cache/custom.bin"),
-            AssetFileKind::Generic
-        );
+        assert_eq!(asset_file_kind("vol/smoke.vdb"), AssetFileKind::Leaf);
+        assert_eq!(asset_file_kind("cache/custom.bin"), AssetFileKind::Leaf);
+        assert_eq!(asset_file_kind("source/readme"), AssetFileKind::Leaf);
     }
 
     #[test]

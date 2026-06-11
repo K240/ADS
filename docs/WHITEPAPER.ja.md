@@ -517,11 +517,13 @@ ads resolve `
 
 mode:
 
-`local` / `auto` の解決先はworkspaceの不変キャッシュです。textureはflat blob cache(`<workspace>/.ads-cache/sha256/<prefix>/<hash>.<ext>`)へ、USD layer(`.usd`, `.usda`, `.usdc`, `.usdz`)と他のファイルはmanifest view(`<workspace>/.ads-cache/manifests/<manifest_hash>/<relative_path>`)へ解決します。viewはmanifest全体をblobへのhardlinkで実体化したフォルダ形状のキャッシュで、兄弟ファイルへの相対参照が保たれます。manifest hashが鍵であるため上書きは発生せず、workspaceのフォルダ配置に依存しません。
+`local` / `auto` の解決先はworkspaceの不変キャッシュで、ファイルの解決形状は1つの規則で決まります: **兄弟への相対参照を運びうる合成形式**(`.usd`, `.usda`, `.usdc`, `.usdz`, `.mtlx`)はmanifest view(`<workspace>/.ads-cache/manifests/<manifest_hash>/<relative_path>`)へ、**それ以外のすべての葉ファイル**(テクスチャ、ボリューム、キャッシュ等)はflat blob cache(`<workspace>/.ads-cache/sha256/<prefix>/<hash>.<ext>`)へ解決します。
+
+viewはmanifest全体をblobへのhardlinkで実体化したフォルダ形状のキャッシュで、兄弟ファイルへの相対参照が保たれます。葉ファイルの直URI解決は**遅延的**で、要求された1ファイルだけがキャッシュへ取り込まれます — 数GBのテクスチャ/ボリュームセットでも、触ったファイル分しかコストを払いません。manifest hashとcontent hashが鍵であるため上書きは発生せず、workspaceのフォルダ配置に依存しません。
 
 同じ論理ファイル名を更新した場合も、versionごとにmanifest hashとSHA-256が変わるため、cache上では別の実体として共存します。USD内の `ads://.../body_diffuse.1001.tx` 参照は安定したまま、`current` / `latest` / `?v=2` / `wip` の選択によって返るcache実体だけが変わります。`.ads-cache` と `.ads-staging` は登録対象から除外されます。
 
-- `local`: store内容をmanifest view / texture cacheへ実体化して解決
+- `local`: store内容をmanifest view(合成形式)/ flat blob cache(葉)へ実体化して解決
 - `remote`: object URLへ解決(`wip` は不可)
 - `auto`: manifest view実体化を試み、object欠損時はremote object URLへフォールバック
 
@@ -710,7 +712,7 @@ uv run ads-deps D:\shots\shot010\shot.usda `
 
 Resolverはread-onlyです。ADS URIへの書き込みは行わず、作業者の書き出しはWIP staging経由で `ads wip add` により登録され、`ads publish promote` で公開されます。
 
-local modeでは、Resolverは `ads resolve` CLIへ委譲してworkspace上のローカルファイルパスまたはtexture cache pathへ解決し、USDの `ArFilesystemAsset` で開きます。
+local modeでは、Resolverは `ads resolve` CLIへ委譲してworkspaceの不変キャッシュ(manifest viewまたはflat blob cache)上のパスへ解決し、USDの `ArFilesystemAsset` で開きます。
 
 ```text
 USD / Houdini

@@ -10,6 +10,12 @@ Status: Implemented(2026-06-11、全3段階実装済み)
 - department別のWIP自動登録ポリシー(off設定)
 - ArNoticeによるstage自動refresh(現状は手動reload)
 
+実装後の改訂: 解決形状の分類を「texture拡張子/texture department」から
+「合成形式(usd/usda/usdc/usdz/mtlx)→ manifest view / それ以外の葉 →
+flat blob cache(遅延取得)」へ一般化。texture拡張子リストと
+department名規約は撤廃し、葉ファイルのautoモードにもremoteフォールバックを
+追加(本文のtexture記述は決定当時の表現)。
+
 ## 背景
 
 ADSはusdcファイルが上書きできない問題を起点に設計され、その回避策として

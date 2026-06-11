@@ -36,7 +36,6 @@ class AdsDataSource(husd.datasource.DataSource):
         return True
 
     def infoHtml(self):
-        return ""
         if self._config is None:
             detail = self._last_error or "ADS catalog is not configured."
         else:

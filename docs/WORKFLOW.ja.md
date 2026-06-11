@@ -40,7 +40,7 @@ ads serve `
 
 - `--profile name=<store>::<workspace>` は複数指定できます
 - ブラウザで `http://<host>:8787` を開き、Bearer tokenを入力します
-- **注意**: serve起動中、同じstoreをCLIから開くことはできません(RocksDBの単一プロセス制約)。CLI操作はserveを止めるか、別storeに対して行います
+- **注意**: 読み取り系コマンド(`resolve` / `list` / `info` / `checkout` / `materialize` / `wip list` / `verify` / `publish validate` / `push` 等)はread-only openで動くため、**serve起動中でもそのまま使えます**(HoudiniのResolverもこちら)。書き込み系(`wip add` / `publish promote` / `add` / `current set` / `gc` 等)はRocksDBの書き込み排他のため、serveを止めるか別storeに対して実行します
 
 ### Houdini環境(packageまたは起動スクリプト)
 
@@ -192,7 +192,7 @@ ads://hero/model/hero.usd               category省略形(一意に解決でき�
 
 ### 4.2 解決のしくみ(知っておくと便利)
 
-- local/autoの解決先はworkspaceの**不変キャッシュ**です: USDは `.ads-cache/manifests/<hash>/`、textureは `.ads-cache/sha256/`。workフォルダは読みません
+- local/autoの解決先はworkspaceの**不変キャッシュ**です: 合成形式(usd/usda/usdc/usdz/mtlx)は `.ads-cache/manifests/<hash>/`(version全体を実体化、相対参照が生きる)、それ以外の葉ファイル(テクスチャ・ボリューム・キャッシュ等)は `.ads-cache/sha256/`(要求した1ファイルだけ遅延取得)。workフォルダは読みません
 - 事前のpullは不要です(解決時にstoreから自動実体化)。多数の依存を事前に温めたい場合のみ `uv run ads-deps <root.usd> --store ... --workspace ... --execute`
 - Resolverキャッシュ: pin(`?v=2`)はセッション中ずっと、current/latestは30秒(`ADS_RESOLVER_CACHE_TTL_SECONDS`)、wipはキャッシュなし
 
@@ -251,6 +251,19 @@ ads gc --store D:\store               # retention 20 / 猶予24hで実行
 - 保持されるもの: 全publish version、thumbnail、部門ごとのWIP直近20件(`--retention`)
 - 作成から24時間以内(`--grace-hours`)のobjectは並行書き込み保護のため削除されません
 
+### Workspaceキャッシュの掃除
+
+`.ads-cache`(manifest view+blob)はWIP運用で書き出しごとに成長します。各作業マシンで定期的に掃除してください。
+
+```powershell
+ads cache gc --store D:\store --workspace D:\workspace [--staging-hours 24] [--dry-run]
+```
+
+- 保持されるもの: 各departmentの **latest・明示current・wip head** が参照するviewとblob
+- それ以外は削除されます。**キャッシュはstoreから再構築可能**なので常に安全で、pinした旧version(`?v=N`)も次のresolveで自動的に再実体化されます
+- `.ads-staging` に残った古いrun(クラッシュしたROPの残骸)も `--staging-hours` より古ければ削除されます
+- storeはread-only openで読むだけなので、**serve起動中でも実行できます**
+
 ### 整合性検査・サムネイル
 
 ```powershell
@@ -265,7 +278,7 @@ ads thumbnail set --store D:\store --category char --asset-code hero --departmen
 | 症状 | 原因と対処 |
 |---|---|
 | `work folder exists and is not empty` | workフォルダに編集中データがある。意図的に置き換えるならForce(WebAppはチェックボックス、CLIは `--force`) |
-| `Failed to create lock file ... LOCK` | serveがstoreを開いている。CLI操作はserve停止後に(またはAPI経由で) |
+| `Failed to create lock file ... LOCK` | serveがstoreを開いている状態での**書き込み系**コマンド。serve停止後に実行(読み取り系はread-only openで共存可能) |
 | `unsupported store schema version` | 旧schemaのstore。開発中storeは再作成が前提(`ads init` し直し) |
 | `wip versions are local-only` | `?v=wip` をremote modeで解決しようとした。wipは自分のlocal storeでのみ有効 |
 | `department has no wip versions` | そのdepartmentにWIPが未登録。書き出し(またはwip add)が先 |
@@ -289,7 +302,8 @@ ads thumbnail set --store D:\store --category char --asset-code hero --departmen
 | 実体取り出し | `ads checkout --store --category --asset-code --department [--version N] <dest>` |
 | URI解決 | `ads resolve --store --workspace --mode local\|remote\|auto <ads://...>` |
 | 一覧/詳細 | `ads list` / `ads info` |
-| GC | `ads gc --store [--retention N] [--grace-hours H] [--dry-run]` |
+| GC(store) | `ads gc --store [--retention N] [--grace-hours H] [--dry-run]` |
+| GC(workspaceキャッシュ) | `ads cache gc --store --workspace [--staging-hours H] [--dry-run]` |
 | 整合性検査 | `ads verify --store` |
 | リモート同期 | `ads fetch` / `ads sync` / `ads push` |
 | 参照検証 | `ads publish validate --store ... [--version N\|--wip\|--wip-seq N]` または `--source <dir>` |

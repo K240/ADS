@@ -619,7 +619,11 @@ class AdsCli:
         cmd = [_path(self.executable), *[_path(arg) for arg in args]]
         result = subprocess.run(cmd, text=True, capture_output=True, check=False)
         if result.returncode != 0:
-            raise AdsCommandError(cmd, result.returncode, result.stdout, result.stderr)
+            # Errors travel into logs and tracebacks; never carry credentials
+            # along (the subprocess itself received the real values).
+            raise AdsCommandError(
+                _redact_secrets(cmd), result.returncode, result.stdout, result.stderr
+            )
         return result
 
 
@@ -1006,6 +1010,17 @@ class AdsHttpClient:
             raise AdsHttpError(error.code, raw.decode("utf-8", "replace"), raw) from error
         except URLError as error:
             raise AdsHttpError(0, str(error)) from error
+
+
+_SECRET_FLAGS = frozenset({"--auth-token"})
+
+
+def _redact_secrets(args: Sequence[str]) -> list[str]:
+    redacted = list(args)
+    for index, value in enumerate(redacted[:-1]):
+        if value in _SECRET_FLAGS:
+            redacted[index + 1] = "***"
+    return redacted
 
 
 def _path(value: str | int | os.PathLike[str]) -> str:
