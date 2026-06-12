@@ -286,6 +286,16 @@ ads verify --store D:\store
 ads thumbnail set --store D:\store --category char --asset-code hero --department model --version 2 D:\thumbs\hero.png
 ```
 
+`ads serve` 稼働中の store に対して書き込み系 CLI を実行する場合は、RocksDB を直接開かず Web API 経由にします。
+
+```powershell
+ads add --server http://server:8787 --auth-token <token> --profile default `
+  --category char --asset-code hero --department model --source D:\publish\hero
+
+ads thumbnail set --server http://server:8787 --auth-token <token> --profile default `
+  --category char --asset-code hero --department model --version 1 D:\thumbs\hero.png
+```
+
 サムネイルはWebAppのインスペクタからもアップロードできます。バックアップはstoreの `db/` と `objects/` を両方対象にしてください。
 
 ## 7. トラブルシューティング
@@ -293,7 +303,7 @@ ads thumbnail set --store D:\store --category char --asset-code hero --departmen
 | 症状 | 原因と対処 |
 |---|---|
 | `work folder exists and is not empty` | workフォルダに編集中データがある。意図的に置き換えるならForce(WebAppはチェックボックス、CLIは `--force`) |
-| `Failed to create lock file ... LOCK` | serveがstoreを開いている状態での**書き込み系**コマンド。serve停止後に実行(読み取り系はread-only openで共存可能) |
+| `Failed to create lock file ... LOCK` | serveがstoreを開いている状態で直接storeを開く**書き込み系**コマンド。serve稼働中は `ads add --server ...` / `ads thumbnail set --server ...` などWeb API経由で実行(読み取り系はread-only openで共存可能) |
 | `unsupported store schema version` | 旧schemaのstore。開発中storeは再作成が前提(`ads init` し直し) |
 | `wip versions are local-only` | `?v=wip` をremote modeで解決しようとした。wipは自分のlocal storeでのみ有効 |
 | `department has no wip versions` | そのdepartmentにWIPが未登録。書き出し(またはwip add)が先 |
@@ -312,7 +322,7 @@ ads thumbnail set --store D:\store --category char --asset-code hero --departmen
 | WIP登録 | `ads wip add --store --category --asset-code --department --source <dir>` |
 | WIP一覧 | `ads wip list --store --category --asset-code --department` |
 | 公開(昇格) | `ads publish promote --store --category --asset-code --department [--wip-seq N]` |
-| 直接登録 | `ads add --store --category --asset-code --department --source <dir> [--version N]` |
+| 直接登録 | `ads add --store --category --asset-code --department --source <dir> [--version N]` / serve稼働中は `ads add --server <url> --auth-token <t> --profile <p> ...` |
 | current操作 | `ads current set/get/reset/status ...` |
 | 実体取り出し | `ads checkout --store --category --asset-code --department [--version N] <dest>` |
 | URI解決 | `ads resolve --store --workspace --mode local\|remote\|auto <ads://...>` |

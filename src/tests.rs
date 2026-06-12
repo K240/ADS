@@ -438,6 +438,14 @@ async fn web_api_lists_assets_updates_current_and_pulls() {
             .unwrap()
             .starts_with("https://assets.example.com/objects/sha256/")
     );
+    assert_eq!(assets["assets"][0]["thumbnail_mime_type"], "image/png");
+    assert_eq!(
+        assets["assets"][0]["thumbnail_sha256"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
 
     let prefixed_assets = app
         .clone()

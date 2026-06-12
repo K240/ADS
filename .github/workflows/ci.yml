@@ -10,24 +10,18 @@ env:
 
 jobs:
   rust:
-    name: Rust (Windows)
-    runs-on: windows-latest
+    name: Rust (Linux)
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      # librocksdb-sys builds bindings through bindgen and needs libclang;
-      # the GitHub Windows runners ship LLVM.
-      - name: Locate libclang for librocksdb-sys
-        shell: pwsh
+      - name: Install native build dependencies
         run: |
-          $llvm = "C:\Program Files\LLVM\bin"
-          if (-not (Test-Path "$llvm\libclang.dll")) {
-            $llvm = Split-Path (Get-Command clang).Source
-          }
-          "LIBCLANG_PATH=$llvm" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-dev
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
       - name: Test
@@ -35,14 +29,15 @@ jobs:
 
   python:
     name: Python
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+      - uses: astral-sh/setup-uv@v5
       - name: Unit tests
         working-directory: python
         env:
           PYTHONPATH: src
-        run: python -m unittest discover -s tests -v
+        run: uv run python -m unittest discover -s tests -v
