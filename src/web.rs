@@ -876,11 +876,22 @@ pub(crate) fn build_asset_cards(store: &Store, query: &AssetsQuery) -> Result<As
                 latest: latest_record.map(|record| record.version),
                 explicit: false,
             });
-        let thumbnail_url = status.current.and_then(|version| {
+        let thumbnail = status.current.and_then(|version| {
             store
-                .thumbnail_url(&department_key, VersionSelector::Version(version), None)
+                .thumbnail_info(&department_key, VersionSelector::Version(version))
                 .ok()
         });
+        let thumbnail_url = thumbnail.as_ref().and_then(|record| {
+            store
+                .thumbnail_url(
+                    &department_key,
+                    VersionSelector::Version(record.version),
+                    None,
+                )
+                .ok()
+        });
+        let thumbnail_sha256 = thumbnail.as_ref().map(|record| record.sha256.clone());
+        let thumbnail_mime_type = thumbnail.as_ref().map(|record| record.mime_type.clone());
 
         assets.push(AssetCardDto {
             category: department_key.asset_key.category,
@@ -894,6 +905,8 @@ pub(crate) fn build_asset_cards(store: &Store, query: &AssetsQuery) -> Result<As
             latest_file_count: latest_record.map(|record| record.file_count),
             latest_total_bytes: latest_record.map(|record| record.total_bytes),
             thumbnail_url,
+            thumbnail_sha256,
+            thumbnail_mime_type,
         });
     }
     assets.sort_by(|left, right| {

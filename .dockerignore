@@ -1,0 +1,11 @@
+.git/
+.github/
+.claude/
+target/
+resolver/build/
+python/.venv/
+**/__pycache__/
+*.o
+*.obj
+*.exp
+*.lib

@@ -66,9 +66,19 @@ enum Commands {
     },
     /// Register a version from a source folder.
     Add {
-        /// Store root path.
+        /// Store root path. Required unless --server is used.
         #[arg(long)]
-        store: PathBuf,
+        store: Option<PathBuf>,
+        /// ADS Web/API server base URL. When set, registration writes through
+        /// the server instead of opening the local store.
+        #[arg(long)]
+        server: Option<String>,
+        /// Bearer token for the ADS Web/API server. Can also be ADS_WEB_TOKEN.
+        #[arg(long = "auth-token")]
+        auth_token: Option<String>,
+        /// Remote profile name for --server. Defaults to "default".
+        #[arg(long)]
+        profile: Option<String>,
         /// Workspace root, used together with --version to locate the
         /// conventional <category>/<asset-code>/<department>/v### folder.
         #[arg(long)]
@@ -616,9 +626,19 @@ enum CurrentCommands {
 enum ThumbnailCommands {
     /// Attach or replace a thumbnail for a registered version.
     Set {
-        /// Store root path.
+        /// Store root path. Required unless --server is used.
         #[arg(long)]
-        store: PathBuf,
+        store: Option<PathBuf>,
+        /// ADS Web/API server base URL. When set, registration writes through
+        /// the server instead of opening the local store.
+        #[arg(long)]
+        server: Option<String>,
+        /// Bearer token for the ADS Web/API server. Can also be ADS_WEB_TOKEN.
+        #[arg(long = "auth-token")]
+        auth_token: Option<String>,
+        /// Remote profile name for --server. Defaults to "default".
+        #[arg(long)]
+        profile: Option<String>,
         /// Asset category. Supports nested paths such as aaa/bbb/ccc.
         #[arg(long)]
         category: String,
@@ -766,6 +786,9 @@ where
         }
         Commands::Add {
             store,
+            server,
+            auth_token,
+            profile,
             workspace,
             category,
             asset_code,
@@ -775,23 +798,39 @@ where
         } => {
             let asset_key = AssetKey::new(category, asset_code)?;
             let department_key = DepartmentKey::new(asset_key, department)?;
-            let store = Store::open(&store)?;
-            let outcome = match source {
-                Some(source) => {
-                    let version = match version {
-                        Some(version) => version,
-                        None => store.next_version(&department_key)?,
-                    };
-                    store.add_version_source(&source, &department_key, version)?
-                }
-                None => {
-                    let version = version.ok_or_else(|| {
-                        anyhow!(
-                            "either --source or --version (with a workspace version folder) is required"
-                        )
-                    })?;
-                    let workspace = workspace_root(workspace)?;
-                    store.add_version_folder(&workspace, &department_key, version)?
+            let outcome = if let Some(server) = server {
+                let auth_token = resolve_remote_auth_token(auth_token.as_deref())?;
+                let remote = RemoteClient::new(&server, &auth_token)?;
+                let profile = profile.as_deref().unwrap_or("default");
+                add_remote_source(
+                    &remote,
+                    profile,
+                    source.as_deref(),
+                    &department_key,
+                    version,
+                )?
+            } else {
+                let store = store
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("--store is required unless --server is used"))?;
+                let store = Store::open(store)?;
+                match source {
+                    Some(source) => {
+                        let version = match version {
+                            Some(version) => version,
+                            None => store.next_version(&department_key)?,
+                        };
+                        store.add_version_source(&source, &department_key, version)?
+                    }
+                    None => {
+                        let version = version.ok_or_else(|| {
+                            anyhow!(
+                                "either --source or --version (with a workspace version folder) is required"
+                            )
+                        })?;
+                        let workspace = workspace_root(workspace)?;
+                        store.add_version_folder(&workspace, &department_key, version)?
+                    }
                 }
             };
             if outcome.created {
@@ -1006,6 +1045,9 @@ where
         Commands::Thumbnail { command } => match command {
             ThumbnailCommands::Set {
                 store,
+                server,
+                auth_token,
+                profile,
                 category,
                 asset_code,
                 department,
@@ -1014,8 +1056,18 @@ where
             } => {
                 let asset_key = AssetKey::new(category, asset_code)?;
                 let department_key = DepartmentKey::new(asset_key, department)?;
-                let store = Store::open(&store)?;
-                let record = store.set_thumbnail(&department_key, version, &image)?;
+                let record = if let Some(server) = server {
+                    let auth_token = resolve_remote_auth_token(auth_token.as_deref())?;
+                    let remote = RemoteClient::new(&server, &auth_token)?;
+                    let profile = profile.as_deref().unwrap_or("default");
+                    set_remote_thumbnail(&remote, profile, &department_key, version, &image)?
+                } else {
+                    let store = store
+                        .as_deref()
+                        .ok_or_else(|| anyhow!("--store is required unless --server is used"))?;
+                    let store = Store::open(store)?;
+                    store.set_thumbnail(&department_key, version, &image)?
+                };
                 println!(
                     "thumbnail set {} {}/{}/{} sha256={} mime={} size={}",
                     record.version,
@@ -1708,6 +1760,20 @@ fn print_publish_validate_report(report: &PublishValidateReport, context: &str) 
     Ok(())
 }
 
+fn resolve_remote_auth_token(cli_token: Option<&str>) -> Result<String> {
+    cli_token
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            std::env::var("ADS_WEB_TOKEN")
+                .ok()
+                .map(|token| token.trim().to_string())
+                .filter(|token| !token.is_empty())
+        })
+        .ok_or_else(|| anyhow!("--auth-token or ADS_WEB_TOKEN is required with --server"))
+}
+
 /// Validates the publish reference policy (schema v8) over a manifest stored
 /// in the content-addressed store. Cross-asset references must use ads://;
 /// intra-version references may be relative as long as they resolve to
@@ -2086,6 +2152,215 @@ fn push_remote_version(
         stats.thumbnails_pushed += 1;
     }
     Ok((version_info, stats))
+}
+
+fn add_remote_source(
+    remote: &RemoteClient,
+    profile: &str,
+    source: Option<&Path>,
+    department_key: &DepartmentKey,
+    version: Option<VersionId>,
+) -> Result<AddOutcome> {
+    let source = source.ok_or_else(|| anyhow!("--source is required with --server"))?;
+    let source_files = scan_source_for_upload(source)?;
+    let manifest = Manifest {
+        entries: source_files
+            .iter()
+            .map(|source_file| source_file.entry.clone())
+            .collect(),
+    };
+    let manifest_hash = manifest.canonical_hash()?;
+    let versions = remote.fetch_versions(
+        profile,
+        &department_key.asset_key.category,
+        &department_key.asset_key.asset_code,
+        &department_key.department,
+    )?;
+    if let Some(record) = version.and_then(|version| {
+        versions
+            .versions
+            .iter()
+            .find(|record| record.version == version)
+    }) {
+        if record.manifest_hash == manifest_hash {
+            return Ok(AddOutcome {
+                created: false,
+                version: record.version,
+                manifest_hash,
+                file_count: record.file_count,
+                total_bytes: record.total_bytes,
+            });
+        }
+        bail!(
+            "version already exists with different content: {}/{}/{} {}",
+            department_key.asset_key.category,
+            department_key.asset_key.asset_code,
+            department_key.department,
+            record.version
+        );
+    }
+    if let Some(record) = versions
+        .versions
+        .iter()
+        .find(|record| record.manifest_hash == manifest_hash)
+    {
+        return Ok(AddOutcome {
+            created: false,
+            version: record.version,
+            manifest_hash,
+            file_count: record.file_count,
+            total_bytes: record.total_bytes,
+        });
+    }
+    let latest = versions
+        .current_status
+        .latest
+        .or_else(|| versions.versions.iter().map(|record| record.version).max());
+    let version = match version {
+        Some(version) => version,
+        None => latest.map_or(VersionId(1), VersionId::next),
+    };
+    let expected_version = latest.map_or(VersionId(1), VersionId::next);
+    if version != expected_version {
+        bail!(
+            "version must be the next version for {}/{}/{}: expected {}, got {}",
+            department_key.asset_key.category,
+            department_key.asset_key.asset_code,
+            department_key.department,
+            expected_version,
+            version
+        );
+    }
+
+    let mut uploaded = BTreeSet::new();
+    for source_file in &source_files {
+        if !uploaded.insert(source_file.entry.sha256.clone()) {
+            continue;
+        }
+        let status =
+            remote.object_status(profile, &source_file.entry.sha256, source_file.entry.size)?;
+        if status.exists {
+            continue;
+        }
+        let bytes = fs::read(&source_file.path)
+            .with_context(|| format!("failed to read {}", source_file.path.display()))?;
+        remote.upload_object(profile, &source_file.entry.sha256, &bytes)?;
+    }
+
+    let version_info = VersionInfo {
+        version: VersionRecord {
+            department_key: department_key.clone(),
+            version,
+            manifest_hash: manifest_hash.clone(),
+            created_at: Utc::now().to_rfc3339(),
+            source_path: source.display().to_string(),
+            file_count: manifest.entries.len() as u64,
+            total_bytes: manifest.total_bytes(),
+            promoted_from: None,
+        },
+        manifest,
+    };
+    remote.import_version_info(profile, &version_info)?;
+    Ok(AddOutcome {
+        created: true,
+        version,
+        manifest_hash,
+        file_count: version_info.version.file_count,
+        total_bytes: version_info.version.total_bytes,
+    })
+}
+
+fn set_remote_thumbnail(
+    remote: &RemoteClient,
+    profile: &str,
+    department_key: &DepartmentKey,
+    version: VersionId,
+    image: &Path,
+) -> Result<ThumbnailRecord> {
+    let image = image
+        .canonicalize()
+        .with_context(|| format!("thumbnail image does not exist: {}", image.display()))?;
+    if !image.is_file() {
+        bail!("thumbnail image is not a file: {}", image.display());
+    }
+    let image_info = inspect_thumbnail_image(&image)?;
+    let (sha256, size) = hash_file(&image)?;
+    if !remote.object_status(profile, &sha256, size)?.exists {
+        let bytes =
+            fs::read(&image).with_context(|| format!("failed to read {}", image.display()))?;
+        remote.upload_object(profile, &sha256, &bytes)?;
+    }
+    let record = ThumbnailRecord {
+        department_key: department_key.clone(),
+        version,
+        sha256,
+        size,
+        mime_type: image_info.mime_type,
+        width: image_info.width,
+        height: image_info.height,
+        created_at: Utc::now().to_rfc3339(),
+        source_path: image.display().to_string(),
+    };
+    remote.import_thumbnail_info(profile, &record)
+}
+
+#[derive(Clone, Debug)]
+struct SourceUploadFile {
+    entry: ManifestEntry,
+    path: PathBuf,
+}
+
+fn scan_source_for_upload(source: &Path) -> Result<Vec<SourceUploadFile>> {
+    let source_abs = source
+        .canonicalize()
+        .with_context(|| format!("source folder does not exist: {}", source.display()))?;
+    if !source_abs.is_dir() {
+        bail!("source is not a folder: {}", source.display());
+    }
+
+    let ignore_rules = IgnoreRules::load(&source_abs)?;
+    let mut files = Vec::new();
+    for entry in WalkDir::new(&source_abs)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| should_descend_upload_entry(entry, &source_abs, &ignore_rules))
+    {
+        let entry = entry.with_context(|| format!("failed to walk {}", source_abs.display()))?;
+        if entry.path() == source_abs {
+            continue;
+        }
+        let file_type = entry.file_type();
+        if file_type.is_dir() {
+            continue;
+        }
+        if file_type.is_symlink() {
+            bail!("symlinks are not supported: {}", entry.path().display());
+        }
+        if !file_type.is_file() {
+            continue;
+        }
+
+        let rel_path = entry
+            .path()
+            .strip_prefix(&source_abs)
+            .with_context(|| format!("failed to relativize {}", entry.path().display()))?;
+        if is_default_ignored(rel_path, false) || ignore_rules.is_ignored(rel_path, false) {
+            continue;
+        }
+        let relative_path = normalize_relative_path(rel_path)?;
+        let (sha256, size) = hash_file(entry.path())?;
+        files.push(SourceUploadFile {
+            entry: ManifestEntry {
+                relative_path,
+                sha256,
+                size,
+                mode: simple_mode(entry.path())?,
+            },
+            path: entry.path().to_path_buf(),
+        });
+    }
+    files.sort_by(|left, right| left.entry.relative_path.cmp(&right.entry.relative_path));
+    Ok(files)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
@@ -2734,6 +3009,8 @@ struct AssetCardDto {
     latest_file_count: Option<u64>,
     latest_total_bytes: Option<u64>,
     thumbnail_url: Option<String>,
+    thumbnail_sha256: Option<String>,
+    thumbnail_mime_type: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -5438,6 +5715,26 @@ fn should_descend_entry(
     }
     if entry.path().starts_with(store_abs) {
         return false;
+    }
+    let Ok(rel_path) = entry.path().strip_prefix(source_abs) else {
+        return true;
+    };
+    if is_default_ignored(rel_path, entry.file_type().is_dir()) {
+        return false;
+    }
+    if ignore_rules.is_ignored(rel_path, entry.file_type().is_dir()) {
+        return false;
+    }
+    true
+}
+
+fn should_descend_upload_entry(
+    entry: &DirEntry,
+    source_abs: &Path,
+    ignore_rules: &IgnoreRules,
+) -> bool {
+    if entry.path() == source_abs {
+        return true;
     }
     let Ok(rel_path) = entry.path().strip_prefix(source_abs) else {
         return true;

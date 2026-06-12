@@ -1065,6 +1065,24 @@ async function api(path, options = {}) {
   return res.json();
 }
 
+async function apiBlob(path, mimeType = '') {
+  const headers = new Headers();
+  headers.set('Authorization', `Bearer ${state.token}`);
+  const res = await fetch(path, {headers});
+  if (res.status === 401) {
+    sessionStorage.removeItem('adsToken');
+    led('err');
+    $('auth').classList.remove('hidden');
+  }
+  if (!res.ok) {
+    let message = `${res.status} ${res.statusText}`;
+    try { message = (await res.json()).error || message; } catch (_) {}
+    throw new Error(message);
+  }
+  const blob = await res.blob();
+  return mimeType ? blob.slice(0, blob.size, mimeType) : blob;
+}
+
 function qs(params) {
   const search = new URLSearchParams();
   Object.entries(params).forEach(([key, value]) => {
@@ -1139,7 +1157,8 @@ function renderGrid() {
   $('assetGrid').innerHTML = state.assets.map(asset => {
     const key = assetKey(asset);
     const active = state.selected && assetKey(state.selected) === key ? ' active' : '';
-    const thumb = asset.thumbnail_url ? `<img src="${esc(asset.thumbnail_url)}" alt="" loading="lazy" onerror="this.remove()">` : '';
+    const hasThumb = asset.thumbnail_url || asset.thumbnail_sha256;
+    const thumb = hasThumb ? `<img data-thumb-key="${esc(key)}" alt="" loading="lazy" onerror="this.remove()">` : '';
     return `<article class="card${active}" data-key="${esc(key)}">
       <div class="thumb">${thumb}<span class="dept-badge" style="--dh:${deptHue(asset.department)}">${esc(asset.department)}</span></div>
       <div class="card-meta">
@@ -1155,6 +1174,7 @@ function renderGrid() {
       if (asset) selectAsset(asset).catch(showError);
     });
   });
+  hydrateGridThumbnails();
 }
 
 function setActiveCard(key) {
@@ -1175,6 +1195,7 @@ async function selectAsset(asset) {
     api(`/api/wips?${qs(params)}`)
   ]);
   state.versions = data.versions;
+  state.thumbnails = data.thumbnails;
   state.wips = wipData.wips;
   state.lastCurrentStatus = data.current_status;
   renderDetail(asset, data);
@@ -1189,12 +1210,65 @@ function renderDetail(asset, data) {
   $('detailSubtitle').textContent = asset.category;
   $('detailDepartment').textContent = asset.department;
   $('detailDepartment').style.setProperty('--dh', deptHue(asset.department));
-  $('detailPreview').innerHTML = asset.thumbnail_url ? `<img src="${esc(asset.thumbnail_url)}" alt="" onerror="this.remove()">` : '<span>NO THUMBNAIL</span>';
   const options = data.versions.map(v => `<option value="${esc(v.version)}">${fmtVersion(v.version)}</option>`).join('');
   $('versionSelect').innerHTML = options;
   $('versionSelect').value = String(state.selectedVersion || data.current_status.current || data.current_status.latest || '');
+  renderDetailThumbnail(asset, data.thumbnails || []);
   updateAssetUriField();
   renderTakeLog(data);
+}
+
+const thumbObjectUrls = new Map();
+
+async function thumbnailObjectUrl(asset) {
+  if (asset.thumbnail_url) return asset.thumbnail_url;
+  if (!asset.thumbnail_sha256) return '';
+  const cacheKey = `${state.profile}:${asset.thumbnail_sha256}:${asset.thumbnail_mime_type || ''}`;
+  if (!thumbObjectUrls.has(cacheKey)) {
+    const path = `/api/object?${qs({profile: state.profile, sha256: asset.thumbnail_sha256})}`;
+    thumbObjectUrls.set(cacheKey, apiBlob(path, asset.thumbnail_mime_type).then(blob => URL.createObjectURL(blob)));
+  }
+  return thumbObjectUrls.get(cacheKey);
+}
+
+async function loadThumbnailImage(img, asset) {
+  const url = await thumbnailObjectUrl(asset);
+  if (!url || !img.isConnected) return;
+  img.src = url;
+}
+
+function hydrateGridThumbnails() {
+  $('assetGrid').querySelectorAll('img[data-thumb-key]').forEach(img => {
+    const asset = state.assets.find(item => assetKey(item) === img.dataset.thumbKey);
+    if (asset) loadThumbnailImage(img, asset).catch(() => img.remove());
+  });
+}
+
+function thumbnailAssetForVersion(asset, thumbnails, version) {
+  const record = thumbnails.find(thumbnail =>
+    String(thumbnail.version) === String(version) &&
+    thumbnail.department_key?.asset_key?.category === asset.category &&
+    thumbnail.department_key?.asset_key?.asset_code === asset.asset_code &&
+    thumbnail.department_key?.department === asset.department);
+  if (!record) return asset;
+  return {
+    ...asset,
+    thumbnail_url: null,
+    thumbnail_sha256: record.sha256,
+    thumbnail_mime_type: record.mime_type
+  };
+}
+
+function renderDetailThumbnail(asset, thumbnails) {
+  const thumbAsset = thumbnailAssetForVersion(asset, thumbnails, $('versionSelect').value);
+  if (!thumbAsset.thumbnail_url && !thumbAsset.thumbnail_sha256) {
+    $('detailPreview').innerHTML = '<span>NO THUMBNAIL</span>';
+    return;
+  }
+  $('detailPreview').innerHTML = '<img alt="" onerror="this.remove()">';
+  loadThumbnailImage($('detailPreview').querySelector('img'), thumbAsset).catch(() => {
+    $('detailPreview').innerHTML = '<span>NO THUMBNAIL</span>';
+  });
 }
 
 function renderTakeLog(data) {
@@ -1218,6 +1292,7 @@ function renderTakeLog(data) {
     row.addEventListener('click', () => {
       $('versionSelect').value = row.dataset.version;
       state.selectedVersion = row.dataset.version;
+      renderDetailThumbnail(state.selected, data.thumbnails || []);
       updateAssetUriField();
       renderTakeLog(data);
       loadManifest(row.dataset.version).catch(showError);
@@ -1439,7 +1514,8 @@ $('versionSelect').addEventListener('change', () => {
   state.selectedVersion = $('versionSelect').value;
   updateAssetUriField();
   if (state.selected) {
-    renderTakeLog({versions: state.versions, current_status: state.lastCurrentStatus || {}});
+    renderDetailThumbnail(state.selected, state.thumbnails || []);
+    renderTakeLog({versions: state.versions, current_status: state.lastCurrentStatus || {}, thumbnails: state.thumbnails || []});
     loadManifest(state.selectedVersion).catch(showError);
   }
 });
