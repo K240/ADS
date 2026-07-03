@@ -2,21 +2,27 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self};
-use std::path::PathBuf;
+use std::io::SeekFrom;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow, bail};
-use axum::body::Bytes;
+use axum::body::Body;
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{DefaultBodyLimit, Multipart, Query, Request, State};
-use axum::http::{HeaderName, HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use chrono::Utc;
+use futures_util::StreamExt;
+use sha2::{Digest, Sha256};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tower_http::cors::CorsLayer;
+use tokio_util::io::ReaderStream;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use crate::*;
 
@@ -26,6 +32,7 @@ pub(crate) struct WebState {
     profiles: Arc<BTreeMap<String, WebProfile>>,
     max_upload_bytes: usize,
     max_object_upload_bytes: usize,
+    cors_allow_origins: Vec<HeaderValue>,
 }
 
 #[derive(Clone)]
@@ -62,6 +69,7 @@ impl WebState {
             profiles: Arc::new(profiles),
             max_upload_bytes: config.max_upload_bytes,
             max_object_upload_bytes: config.max_object_upload_bytes,
+            cors_allow_origins: config.cors_allow_origins,
         })
     }
 }
@@ -88,6 +96,13 @@ impl ApiError {
         }
     }
 
+    pub(crate) fn payload_too_large(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            message: message.into(),
+        }
+    }
+
     pub(crate) fn internal(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -108,6 +123,23 @@ impl IntoResponse for ApiError {
     }
 }
 
+/// 500 whose detail only reaches the server log: these failures embed server
+/// filesystem paths that must not leak into response bodies.
+pub(crate) fn internal_error(detail: impl std::fmt::Display) -> ApiError {
+    eprintln!("internal error: {detail}");
+    ApiError::internal("internal server error")
+}
+
+/// Keeps extractor failures (oversized body, malformed JSON) in the same
+/// `{"error": ...}` shape as every other API error instead of axum's
+/// plain-text default, preserving the rejection's status (413 vs 400).
+pub(crate) fn json_rejection_error(rejection: JsonRejection) -> ApiError {
+    ApiError {
+        status: rejection.status(),
+        message: rejection.body_text(),
+    }
+}
+
 pub(crate) async fn serve_web(config: ServeConfig) -> Result<()> {
     let bind = config.bind;
     let state = Arc::new(WebState::try_new(config)?);
@@ -123,20 +155,25 @@ pub(crate) async fn serve_web(config: ServeConfig) -> Result<()> {
 
 pub(crate) fn web_app(state: Arc<WebState>) -> Router {
     let max_upload_bytes = state.max_upload_bytes;
-    let max_object_upload_bytes = state.max_object_upload_bytes;
     let api = Router::new()
         .route("/profiles", get(api_profiles))
         .route("/assets", get(api_assets))
         .route("/asset", get(api_asset))
         .route("/versions", get(api_versions))
-        .route("/version", get(api_version_info).put(api_import_version))
-        .route("/object/status", get(api_object_status))
+        // Version and wip imports carry a full manifest whose JSON grows
+        // with file count; axum's default 2 MiB extractor limit rejects
+        // ~10k-entry manifests these endpoints exist to accept, so they
+        // share the object-upload cap instead.
         .route(
-            "/object",
-            get(api_object)
-                .put(api_upload_object)
-                .layer(DefaultBodyLimit::max(max_object_upload_bytes)),
+            "/version",
+            get(api_version_info)
+                .put(api_import_version)
+                .layer(DefaultBodyLimit::max(state.max_object_upload_bytes)),
         )
+        .route("/object/status", get(api_object_status))
+        // No DefaultBodyLimit here: PUT enforces its cap while streaming to
+        // disk, and the limit layer only guards buffering extractors anyway.
+        .route("/object", get(api_object).put(api_upload_object))
         .route("/current/status", get(api_current_status))
         .route("/current", put(api_update_current))
         .route("/pull", post(api_pull))
@@ -150,6 +187,10 @@ pub(crate) fn web_app(state: Arc<WebState>) -> Router {
         .route("/thumbnail-url", get(api_thumbnail_url))
         .route("/resolve", get(api_resolve))
         .route("/wips", get(api_wips))
+        .route(
+            "/wip",
+            post(api_wip).layer(DefaultBodyLimit::max(state.max_object_upload_bytes)),
+        )
         .route("/promote", post(api_promote))
         .route("/gc", post(api_gc))
         .route_layer(middleware::from_fn_with_state(
@@ -157,13 +198,24 @@ pub(crate) fn web_app(state: Arc<WebState>) -> Router {
             api_auth_middleware,
         ));
 
-    Router::new()
+    let mut app = Router::new()
         .route("/", get(index_html))
         .route("/app.js", get(app_js))
         .route("/style.css", get(style_css))
         .nest("/api", api)
-        .with_state(state)
-        .layer(CorsLayer::permissive())
+        .with_state(state.clone());
+    // CORS is opt-in per origin (`serve --cors-allow-origin`): the bundled
+    // WebApp is served same-origin, and the CLI and resolver are not
+    // browsers, so by default no CORS headers are sent at all.
+    if !state.cors_allow_origins.is_empty() {
+        app = app.layer(
+            CorsLayer::new()
+                .allow_origin(AllowOrigin::list(state.cors_allow_origins.iter().cloned()))
+                .allow_methods([Method::GET, Method::POST, Method::PUT])
+                .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]),
+        );
+    }
+    app
 }
 
 pub(crate) async fn api_auth_middleware(
@@ -327,8 +379,9 @@ pub(crate) async fn api_version_info(
 
 pub(crate) async fn api_import_version(
     State(state): State<Arc<WebState>>,
-    Json(request): Json<VersionImportRequest>,
+    payload: std::result::Result<Json<VersionImportRequest>, JsonRejection>,
 ) -> std::result::Result<Json<VersionRecord>, ApiError> {
+    let Json(request) = payload.map_err(json_rejection_error)?;
     let profile = profile_for(&state, &request.profile)?;
     let lock = profile.mutation_lock.clone();
     run_store_write(lock, move || {
@@ -374,57 +427,263 @@ pub(crate) async fn api_object_status(
 pub(crate) async fn api_object(
     State(state): State<Arc<WebState>>,
     Query(query): Query<ObjectQuery>,
+    headers: HeaderMap,
 ) -> std::result::Result<Response, ApiError> {
     let profile = profile_for(&state, &query.profile)?;
-    run_store_read(move || {
-        validate_sha256(&query.sha256)?;
-        let path = object_path(&profile.store, &query.sha256);
-        if !path.exists() {
-            bail!("object not found: {}", query.sha256);
+    validate_sha256(&query.sha256).map_err(|error| ApiError::bad_request(format!("{error:#}")))?;
+    let path = object_path(&profile.store, &query.sha256);
+    let mut file = match tokio::fs::File::open(&path).await {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ApiError::not_found(format!(
+                "object not found: {}",
+                query.sha256
+            )));
         }
-        let bytes =
-            fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
-        Ok((query.sha256, bytes))
-    })
-    .await
-    .map(|(sha256, bytes)| {
-        let mut response = bytes.into_response();
-        response.headers_mut().insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/octet-stream"),
+        Err(error) => {
+            return Err(internal_error(format!(
+                "failed to open {}: {error}",
+                path.display()
+            )));
+        }
+    };
+    let len = file
+        .metadata()
+        .await
+        .map_err(|error| internal_error(format!("failed to stat {}: {error}", path.display())))?
+        .len();
+
+    let range = headers
+        .get(header::RANGE)
+        .and_then(|value| value.to_str().ok())
+        .map_or(ByteRange::Full, |value| parse_byte_range(value, len));
+    let (status, start, end_exclusive) = match range {
+        ByteRange::Full => (StatusCode::OK, 0, len),
+        ByteRange::Slice { start, end } => (StatusCode::PARTIAL_CONTENT, start, end + 1),
+        ByteRange::Unsatisfiable => {
+            return Response::builder()
+                .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                .header(header::CONTENT_RANGE, format!("bytes */{len}"))
+                .body(Body::empty())
+                .map_err(|error| ApiError::internal(error.to_string()));
+        }
+    };
+    let content_length = end_exclusive - start;
+    if start > 0 {
+        file.seek(SeekFrom::Start(start)).await.map_err(|error| {
+            internal_error(format!("failed to seek {}: {error}", path.display()))
+        })?;
+    }
+
+    // `take` bounds the stream for range replies and pins the full reply to
+    // the promised Content-Length even if the file grows mid-stream.
+    let body = Body::from_stream(ReaderStream::new(file.take(content_length)));
+    let mut builder = Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::CONTENT_LENGTH, content_length)
+        .header(
+            HeaderName::from_static("x-ads-sha256"),
+            query.sha256.as_str(),
         );
-        if let Ok(value) = HeaderValue::from_str(&sha256) {
-            response
-                .headers_mut()
-                .insert(HeaderName::from_static("x-ads-sha256"), value);
+    if status == StatusCode::PARTIAL_CONTENT {
+        builder = builder.header(
+            header::CONTENT_RANGE,
+            format!("bytes {start}-{}/{len}", end_exclusive - 1),
+        );
+    }
+    builder
+        .body(body)
+        .map_err(|error| ApiError::internal(error.to_string()))
+}
+
+/// Outcome of parsing a Range header against an object of known length.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum ByteRange {
+    Full,
+    /// Inclusive byte bounds, both within the object.
+    Slice {
+        start: u64,
+        end: u64,
+    },
+    Unsatisfiable,
+}
+
+/// Single-range `bytes=` parser. Multi-range and malformed headers return
+/// `Full` — RFC 9110 lets a server ignore Range — while a syntactically
+/// valid range that selects nothing is `Unsatisfiable` (416).
+pub(crate) fn parse_byte_range(header: &str, len: u64) -> ByteRange {
+    let Some(spec) = header.strip_prefix("bytes=") else {
+        return ByteRange::Full;
+    };
+    let spec = spec.trim();
+    if spec.contains(',') {
+        return ByteRange::Full;
+    }
+    let Some((first, last)) = spec.split_once('-') else {
+        return ByteRange::Full;
+    };
+    match (first.is_empty(), last.is_empty()) {
+        // "-n": the final n bytes.
+        (true, false) => {
+            let Ok(suffix) = last.parse::<u64>() else {
+                return ByteRange::Full;
+            };
+            if suffix == 0 || len == 0 {
+                return ByteRange::Unsatisfiable;
+            }
+            ByteRange::Slice {
+                start: len.saturating_sub(suffix),
+                end: len - 1,
+            }
         }
-        response
-    })
+        // "a-": from a to the end.
+        (false, true) => {
+            let Ok(start) = first.parse::<u64>() else {
+                return ByteRange::Full;
+            };
+            if start >= len {
+                return ByteRange::Unsatisfiable;
+            }
+            ByteRange::Slice {
+                start,
+                end: len - 1,
+            }
+        }
+        // "a-b": inclusive bounds, end clamped to the object.
+        (false, false) => {
+            let (Ok(start), Ok(end)) = (first.parse::<u64>(), last.parse::<u64>()) else {
+                return ByteRange::Full;
+            };
+            if start > end {
+                return ByteRange::Full;
+            }
+            if start >= len {
+                return ByteRange::Unsatisfiable;
+            }
+            ByteRange::Slice {
+                start,
+                end: end.min(len - 1),
+            }
+        }
+        (true, true) => ByteRange::Full,
+    }
 }
 
 pub(crate) async fn api_upload_object(
     State(state): State<Arc<WebState>>,
     Query(query): Query<ObjectQuery>,
-    body: Bytes,
+    body: Body,
 ) -> std::result::Result<Json<ObjectUploadResponse>, ApiError> {
     let profile = profile_for(&state, &query.profile)?;
+    validate_sha256(&query.sha256).map_err(|error| ApiError::bad_request(format!("{error:#}")))?;
+    let path = object_path(&profile.store, &query.sha256);
+    let parent = path
+        .parent()
+        .ok_or_else(|| internal_error(format!("invalid object path: {}", path.display())))?;
+    tokio::fs::create_dir_all(parent).await.map_err(|error| {
+        internal_error(format!(
+            "failed to create object directory {}: {error}",
+            parent.display()
+        ))
+    })?;
+    let temp_path = temp_sibling_path(&path);
+    let (computed, size) =
+        stream_body_to_temp(body, &temp_path, state.max_object_upload_bytes).await?;
+    if computed != query.sha256 {
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        return Err(ApiError::bad_request(format!(
+            "uploaded object hash mismatch: expected {}, computed {computed}",
+            query.sha256
+        )));
+    }
+
     let lock = profile.mutation_lock.clone();
-    run_store_write(lock, move || {
-        validate_sha256(&query.sha256)?;
+    let sha256 = query.sha256.clone();
+    let temp = temp_path.clone();
+    let result = run_store_write(lock, move || {
         let store = profile.store_handle.clone();
-        let size = body.len() as u64;
-        let reused = store.object_is_valid(&query.sha256, size)?;
-        if !reused {
-            store.write_object_bytes(&query.sha256, &body)?;
+        // Same short-circuit as the buffered handler had: a valid
+        // byte-identical object already in the store is reused, not replaced.
+        let reused = store.object_is_valid(&sha256, size)?;
+        if reused {
+            let _ = fs::remove_file(&temp);
+        } else {
+            store.finalize_object_temp(&temp, &sha256)?;
         }
         Ok(ObjectUploadResponse {
-            sha256: query.sha256,
+            sha256,
             size,
             reused,
         })
     })
-    .await
-    .map(Json)
+    .await;
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&temp_path).await;
+    }
+    result.map(Json)
+}
+
+/// Streams a request body to `temp_path`, hashing chunks as they arrive so
+/// multi-GB uploads never sit in memory, and enforcing the configured cap
+/// mid-stream. Removes the temp file itself on every error path.
+pub(crate) async fn stream_body_to_temp(
+    body: Body,
+    temp_path: &Path,
+    max_bytes: usize,
+) -> std::result::Result<(String, u64), ApiError> {
+    let mut file = tokio::fs::File::create(temp_path).await.map_err(|error| {
+        internal_error(format!(
+            "failed to create temporary object {}: {error}",
+            temp_path.display()
+        ))
+    })?;
+    let result = copy_body_hashed(&mut file, body, temp_path, max_bytes).await;
+    // Deterministic close before rename/remove: Windows cannot move or
+    // delete a file whose handle is still open, and `into_std` waits for
+    // in-flight writes that a plain drop could leave running.
+    drop(file.into_std().await);
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(temp_path).await;
+    }
+    result
+}
+
+pub(crate) async fn copy_body_hashed(
+    file: &mut tokio::fs::File,
+    body: Body,
+    temp_path: &Path,
+    max_bytes: usize,
+) -> std::result::Result<(String, u64), ApiError> {
+    let mut hasher = Sha256::new();
+    let mut size = 0u64;
+    let mut stream = body.into_data_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| {
+            ApiError::bad_request(format!("failed to read request body: {error}"))
+        })?;
+        size += chunk.len() as u64;
+        if size > max_bytes as u64 {
+            return Err(ApiError::payload_too_large(format!(
+                "object upload exceeds the configured limit of {max_bytes} bytes"
+            )));
+        }
+        hasher.update(&chunk);
+        file.write_all(&chunk).await.map_err(|error| {
+            internal_error(format!(
+                "failed to write temporary object {}: {error}",
+                temp_path.display()
+            ))
+        })?;
+    }
+    file.flush().await.map_err(|error| {
+        internal_error(format!(
+            "failed to write temporary object {}: {error}",
+            temp_path.display()
+        ))
+    })?;
+    Ok((hex::encode(hasher.finalize()), size))
 }
 
 pub(crate) async fn api_current_status(
@@ -620,6 +879,55 @@ pub(crate) async fn api_wips(
     .map(Json)
 }
 
+/// Registers a WIP micro-version against a served store — the remote
+/// counterpart of `ads wip add`, whose exclusive RocksDB open cannot coexist
+/// with `ads serve`. Objects must already be in the store (uploaded via
+/// PUT /api/object, same as push); only metadata is written here.
+pub(crate) async fn api_wip(
+    State(state): State<Arc<WebState>>,
+    payload: std::result::Result<Json<WipImportRequest>, JsonRejection>,
+) -> std::result::Result<Json<WipOutcome>, ApiError> {
+    let Json(request) = payload.map_err(json_rejection_error)?;
+    let profile = profile_for(&state, &request.profile)?;
+    let lock = profile.mutation_lock.clone();
+    run_store_write(lock, move || {
+        let store = profile.store_handle.clone();
+        let asset_key = AssetKey::new(request.category, request.asset_code)?;
+        let department_key = DepartmentKey::new(asset_key, request.department)?;
+        let mut missing = Vec::new();
+        for entry in &request.manifest.entries {
+            validate_sha256(&entry.sha256)?;
+            validate_manifest_relative_path(&entry.relative_path)?;
+            if !store.object_is_valid(&entry.sha256, entry.size)? {
+                missing.push(entry.sha256.as_str());
+            }
+        }
+        if !missing.is_empty() {
+            const LISTED: usize = 10;
+            let suffix = if missing.len() > LISTED {
+                format!(" (and {} more)", missing.len() - LISTED)
+            } else {
+                String::new()
+            };
+            bail!(
+                "objects missing or invalid for wip: {}{suffix}",
+                missing[..missing.len().min(LISTED)].join(", ")
+            );
+        }
+        let source_path = request.source_path.unwrap_or_else(|| {
+            format!(
+                "{}/{}/{}",
+                department_key.asset_key.category,
+                department_key.asset_key.asset_code,
+                department_key.department
+            )
+        });
+        store.add_wip_from_manifest(&department_key, &request.manifest, source_path)
+    })
+    .await
+    .map(Json)
+}
+
 pub(crate) async fn api_promote(
     State(state): State<Arc<WebState>>,
     Json(request): Json<PromoteRequest>,
@@ -786,7 +1094,7 @@ where
     tokio::task::spawn_blocking(f)
         .await
         .map_err(|error| ApiError::internal(error.to_string()))?
-        .map_err(|error| ApiError::bad_request(format!("{error:#}")))
+        .map_err(map_domain_error)
 }
 
 pub(crate) async fn run_store_write<T, F>(
@@ -805,7 +1113,38 @@ where
     })
     .await
     .map_err(|error| ApiError::internal(error.to_string()))?
-    .map_err(|error| ApiError::bad_request(format!("{error:#}")))
+    .map_err(map_domain_error)
+}
+
+/// Maps a domain error chain onto the HTTP taxonomy. A `NotFound` marker
+/// anywhere in the chain is a 404. An `io::Error` or `rocksdb::Error` in the
+/// chain means an unexpected infrastructure failure (rocksdb::Error is a
+/// plain string wrapper with no io::Error source, so ENOSPC and corruption
+/// surface only as it): 500 with a generic body, because those messages
+/// carry server filesystem paths that must not reach clients; the full chain
+/// goes to the server log instead. Everything else is a user-actionable
+/// input error and keeps its message as a 400 (the troubleshooting docs
+/// quote some of these verbatim).
+pub(crate) fn map_domain_error(error: anyhow::Error) -> ApiError {
+    if error.chain().any(|cause| cause.is::<NotFound>()) {
+        return ApiError::not_found(format!("{error:#}"));
+    }
+    if error
+        .chain()
+        .any(|cause| cause.is::<std::io::Error>() || cause.is::<rocksdb::Error>())
+    {
+        eprintln!("internal error: {error:#}");
+        return ApiError::internal("internal server error");
+    }
+    ApiError::bad_request(format!("{error:#}"))
+}
+
+/// Category filters select whole path segments: `prop` matches `prop` and
+/// `prop/vehicle` but not `propx`.
+fn category_filter_matches(category: &str, filter: &str) -> bool {
+    category
+        .strip_prefix(filter)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
 pub(crate) fn build_asset_cards(store: &Store, query: &AssetsQuery) -> Result<AssetsResponse> {
@@ -845,10 +1184,7 @@ pub(crate) fn build_asset_cards(store: &Store, query: &AssetsQuery) -> Result<As
     let mut assets = Vec::new();
     for (department_key, versions) in by_department {
         if query.category.as_ref().is_some_and(|category| {
-            !department_key
-                .asset_key
-                .category
-                .starts_with(category.as_str())
+            !category_filter_matches(&department_key.asset_key.category, category)
         }) {
             continue;
         }

@@ -958,6 +958,154 @@ fn cache_gc_run(store: &Path, workspace: &Path, dry_run: bool) -> Output {
 }
 
 #[test]
+fn interrupted_view_materialization_leftover_is_ignored_and_swept() {
+    let temp = TempDir::new().unwrap();
+    let store = temp.path().join("store");
+    let workspace = temp.path().join("workspace");
+    assert!(ads().arg("init").arg(&store).status().unwrap().success());
+
+    new_version(&store, &workspace, "prop", "crate");
+    fs::write(
+        version_folder(&workspace, "prop", "crate", "v001").join("model.usd"),
+        "v1",
+    )
+    .unwrap();
+    add_asset(&store, &workspace, "prop", "crate", "v001");
+
+    // A crashed materialization leaves its half-built sibling temp folder.
+    let manifests = workspace.join(".ads-cache").join("manifests");
+    let leftover = manifests.join("deadbeef.tmp.4242.7");
+    fs::create_dir_all(&leftover).unwrap();
+    fs::write(leftover.join("model.usd"), "partial").unwrap();
+
+    let resolved = resolve_asset(
+        &store,
+        &workspace,
+        "local",
+        None,
+        "ads://prop/crate/model/model.usd",
+    );
+    assert!(resolved.status.success(), "{}", stderr(&resolved));
+    assert_view_resolution(&workspace, &resolved, "model.usd", "v1");
+
+    // Grace 0: the leftover counts as stale; the completed view survives.
+    let swept = cache_gc_run(&store, &workspace, false);
+    assert!(swept.status.success(), "{}", stderr(&swept));
+    assert!(!leftover.exists());
+    let again = resolve_asset(
+        &store,
+        &workspace,
+        "local",
+        None,
+        "ads://prop/crate/model/model.usd",
+    );
+    assert!(again.status.success(), "{}", stderr(&again));
+    assert_view_resolution(&workspace, &again, "model.usd", "v1");
+}
+
+#[test]
+fn cache_gc_skips_in_flight_view_build_holding_its_lock() {
+    let temp = TempDir::new().unwrap();
+    let store = temp.path().join("store");
+    let workspace = temp.path().join("workspace");
+    assert!(ads().arg("init").arg(&store).status().unwrap().success());
+
+    // A build in progress in another process: temp folder plus a held
+    // exclusive lock on the sibling `.lock` file (the builder takes the lock
+    // before creating the folder).
+    let manifests = workspace.join(".ads-cache").join("manifests");
+    let in_flight = manifests.join("cafef00d.tmp.31337.0");
+    let lock_path = manifests.join("cafef00d.tmp.31337.0.lock");
+    fs::create_dir_all(&in_flight).unwrap();
+    fs::write(in_flight.join("model.usd"), "partial").unwrap();
+    let lock_file = fs::File::create(&lock_path).unwrap();
+    lock_file.try_lock().unwrap();
+
+    // Grace 0 (see cache_gc_run) would sweep by age alone; the held lock
+    // must win.
+    let swept = cache_gc_run(&store, &workspace, false);
+    assert!(swept.status.success(), "{}", stderr(&swept));
+    assert!(in_flight.exists());
+    assert!(lock_path.exists());
+
+    // Builder gone (lock released): the leftover and its lock are swept.
+    drop(lock_file);
+    let swept = cache_gc_run(&store, &workspace, false);
+    assert!(swept.status.success(), "{}", stderr(&swept));
+    assert!(!in_flight.exists());
+    assert!(!lock_path.exists());
+}
+
+#[test]
+fn cache_gc_removes_orphan_view_build_locks() {
+    let temp = TempDir::new().unwrap();
+    let store = temp.path().join("store");
+    let workspace = temp.path().join("workspace");
+    assert!(ads().arg("init").arg(&store).status().unwrap().success());
+
+    // A crashed builder can leave the lock file with no temp folder at all
+    // (the lock is created first); a released lock with no folder is trash.
+    let manifests = workspace.join(".ads-cache").join("manifests");
+    fs::create_dir_all(&manifests).unwrap();
+    let orphan_lock = manifests.join("deadbeef.tmp.4242.7.lock");
+    fs::write(&orphan_lock, b"").unwrap();
+
+    let swept = cache_gc_run(&store, &workspace, false);
+    assert!(swept.status.success(), "{}", stderr(&swept));
+    assert!(!orphan_lock.exists());
+}
+
+#[test]
+fn view_missing_its_marker_is_rematerialized() {
+    let temp = TempDir::new().unwrap();
+    let store = temp.path().join("store");
+    let workspace = temp.path().join("workspace");
+    assert!(ads().arg("init").arg(&store).status().unwrap().success());
+
+    new_version(&store, &workspace, "prop", "crate");
+    fs::write(
+        version_folder(&workspace, "prop", "crate", "v001").join("model.usd"),
+        "v1",
+    )
+    .unwrap();
+    add_asset(&store, &workspace, "prop", "crate", "v001");
+
+    let resolved = resolve_asset(
+        &store,
+        &workspace,
+        "local",
+        None,
+        "ads://prop/crate/model/model.usd",
+    );
+    assert!(resolved.status.success(), "{}", stderr(&resolved));
+    assert_view_resolution(&workspace, &resolved, "model.usd", "v1");
+    let view_root = PathBuf::from(stdout(&resolved).trim())
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    assert!(view_root.join(".ads-complete").is_file());
+
+    // Simulate the pre-atomic failure mode: view files on disk but no
+    // completeness marker anywhere. Delete a file (not rewrite it — view
+    // files are hardlinks into the blob cache) to prove a rebuild happens.
+    fs::remove_file(view_root.join(".ads-complete")).unwrap();
+    let hash = view_root.file_name().unwrap().to_string_lossy().to_string();
+    let _ = fs::remove_file(view_root.parent().unwrap().join(format!("{hash}.complete")));
+    fs::remove_file(view_root.join("model.usd")).unwrap();
+
+    let again = resolve_asset(
+        &store,
+        &workspace,
+        "local",
+        None,
+        "ads://prop/crate/model/model.usd",
+    );
+    assert!(again.status.success(), "{}", stderr(&again));
+    assert_view_resolution(&workspace, &again, "model.usd", "v1");
+    assert!(view_root.join(".ads-complete").is_file());
+}
+
+#[test]
 fn read_commands_work_while_a_writer_holds_the_store() {
     let temp = TempDir::new().unwrap();
     let store = temp.path().join("store");

@@ -1220,13 +1220,26 @@ function renderDetail(asset, data) {
 
 const thumbObjectUrls = new Map();
 
+function setThumbObjectUrl(cacheKey, promise) {
+  // Blob URLs pin their blobs in memory until revoked, so an entry never
+  // just falls out of the map.
+  const previous = thumbObjectUrls.get(cacheKey);
+  if (previous) previous.then(url => URL.revokeObjectURL(url)).catch(() => {});
+  thumbObjectUrls.set(cacheKey, promise);
+}
+
+function clearThumbObjectUrls() {
+  thumbObjectUrls.forEach(promise => promise.then(url => URL.revokeObjectURL(url)).catch(() => {}));
+  thumbObjectUrls.clear();
+}
+
 async function thumbnailObjectUrl(asset) {
   if (asset.thumbnail_url) return asset.thumbnail_url;
   if (!asset.thumbnail_sha256) return '';
   const cacheKey = `${state.profile}:${asset.thumbnail_sha256}:${asset.thumbnail_mime_type || ''}`;
   if (!thumbObjectUrls.has(cacheKey)) {
     const path = `/api/object?${qs({profile: state.profile, sha256: asset.thumbnail_sha256})}`;
-    thumbObjectUrls.set(cacheKey, apiBlob(path, asset.thumbnail_mime_type).then(blob => URL.createObjectURL(blob)));
+    setThumbObjectUrl(cacheKey, apiBlob(path, asset.thumbnail_mime_type).then(blob => URL.createObjectURL(blob)));
   }
   return thumbObjectUrls.get(cacheKey);
 }
@@ -1503,9 +1516,15 @@ $('profileSelect').addEventListener('change', () => {
   state.profile = $('profileSelect').value;
   state.category = '';
   state.department = '';
+  // Wholesale reloads drop the blob-URL cache; keys are content-addressed,
+  // so a re-fetch is cheap and never stale. Search keeps the cache warm.
+  clearThumbObjectUrls();
   loadAssets().catch(showError);
 });
-$('refreshButton').addEventListener('click', () => loadAssets().catch(showError));
+$('refreshButton').addEventListener('click', () => {
+  clearThumbObjectUrls();
+  loadAssets().catch(showError);
+});
 $('logoutButton').addEventListener('click', () => { sessionStorage.removeItem('adsToken'); location.reload(); });
 $('setCurrentButton').addEventListener('click', () => setCurrent().catch(showError));
 $('resetCurrentButton').addEventListener('click', () => resetCurrent().catch(showError));

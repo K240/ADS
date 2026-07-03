@@ -108,6 +108,24 @@ fn usd_asset_reference_scanner_extracts_at_paths() {
 }
 
 #[test]
+fn usd_asset_reference_scanner_handles_triple_at_escapes() {
+    assert_eq!(extract_usd_asset_references("@a.usd@"), vec!["a.usd"]);
+    assert_eq!(
+        extract_usd_asset_references("@@@weird @ path.usd@@@"),
+        vec!["weird @ path.usd"]
+    );
+    // Both delimiter forms on one line, in either order.
+    assert_eq!(
+        extract_usd_asset_references("references = @a.usd@, payload = @@@weird @ path.usd@@@"),
+        vec!["a.usd", "weird @ path.usd"]
+    );
+    assert_eq!(
+        extract_usd_asset_references("payload = @@@weird @ path.usd@@@, references = @a.usd@"),
+        vec!["weird @ path.usd", "a.usd"]
+    );
+}
+
+#[test]
 fn publish_reference_validation_applies_v8_policy() {
     let mut report = PublishValidateReport {
         target: "version 1".to_string(),
@@ -230,6 +248,71 @@ fn manifest_hash_is_stable_after_sorting() {
         first.canonical_hash().unwrap(),
         second.canonical_hash().unwrap()
     );
+}
+
+#[test]
+fn init_twice_on_same_store_is_idempotent_and_keeps_data() {
+    let temp = TempDir::new().unwrap();
+    let store_path = temp.path().join("store");
+
+    let store = Store::init(&store_path).unwrap();
+    store
+        .set_remote_base_url("https://assets.example.com/objects/sha256")
+        .unwrap();
+    drop(store);
+
+    let store = Store::init(&store_path).unwrap();
+    assert_eq!(
+        store.remote_base_url().unwrap().as_deref(),
+        Some("https://assets.example.com/objects/sha256")
+    );
+}
+
+#[test]
+fn init_refuses_to_restamp_an_older_schema_store() {
+    let temp = TempDir::new().unwrap();
+    let store_path = temp.path().join("store");
+
+    {
+        let mut options = Options::default();
+        options.create_if_missing(true);
+        let db = DB::open(&options, db_path(&store_path)).unwrap();
+        db.put(key_meta("schema_version"), b"7").unwrap();
+    }
+
+    let err = match Store::init(&store_path) {
+        Ok(_) => panic!("init must fail on an older-schema store"),
+        Err(err) => err.to_string(),
+    };
+    assert!(err.contains("unsupported store schema version 7"), "{err}");
+    assert!(err.contains(&format!("expected {SCHEMA_VERSION}")), "{err}");
+
+    // The failed init must leave the v7 marker untouched.
+    let db = DB::open_for_read_only(&Options::default(), db_path(&store_path), false).unwrap();
+    assert_eq!(
+        db.get(key_meta("schema_version")).unwrap().as_deref(),
+        Some(b"7".as_slice())
+    );
+}
+
+#[test]
+fn init_refuses_a_database_without_schema_marker() {
+    let temp = TempDir::new().unwrap();
+    let store_path = temp.path().join("store");
+
+    // A DB directory with content but no marker is either foreign or a
+    // half-initialized store; init must not stamp it as current.
+    {
+        let mut options = Options::default();
+        options.create_if_missing(true);
+        DB::open(&options, db_path(&store_path)).unwrap();
+    }
+
+    let err = match Store::init(&store_path) {
+        Ok(_) => panic!("init must fail on a database without a schema marker"),
+        Err(err) => err.to_string(),
+    };
+    assert!(err.contains("no schema_version marker"), "{err}");
 }
 
 #[test]
@@ -413,6 +496,27 @@ async fn web_api_lists_assets_updates_current_and_pulls() {
     store
         .add_version_folder(&workspace, &nested_department_key, VersionId(1))
         .unwrap();
+    // Sibling category sharing the `prop` spelling as a raw prefix; the
+    // category filter must not match it.
+    let propx_department_key = DepartmentKey::new(
+        AssetKey::new("propx".to_string(), "box".to_string()).unwrap(),
+        "model".to_string(),
+    )
+    .unwrap();
+    fs::create_dir_all(version_folder(
+        &workspace,
+        &propx_department_key,
+        VersionId(1),
+    ))
+    .unwrap();
+    fs::write(
+        version_folder(&workspace, &propx_department_key, VersionId(1)).join("box.usd"),
+        "box-v1",
+    )
+    .unwrap();
+    store
+        .add_version_folder(&workspace, &propx_department_key, VersionId(1))
+        .unwrap();
     drop(store);
 
     let app = web_app(test_web_state(&store_path, &workspace));
@@ -447,21 +551,43 @@ async fn web_api_lists_assets_updates_current_and_pulls() {
         64
     );
 
-    let prefixed_assets = app
+    // Category filters match whole segments: `prop` covers the nested
+    // `prop/vehicle` but not the raw-prefix sibling `propx`.
+    let filtered_assets = app
         .clone()
         .oneshot(api_request(
             "GET",
-            "/api/assets?profile=main&category=prop/veh",
+            "/api/assets?profile=main&category=prop",
             "secret",
             Body::empty(),
         ))
         .await
         .unwrap();
-    assert_eq!(prefixed_assets.status(), StatusCode::OK);
-    let prefixed_assets = response_json(prefixed_assets).await;
-    assert_eq!(prefixed_assets["assets"].as_array().unwrap().len(), 1);
-    assert_eq!(prefixed_assets["assets"][0]["category"], "prop/vehicle");
-    assert_eq!(prefixed_assets["assets"][0]["asset_code"], "truck");
+    assert_eq!(filtered_assets.status(), StatusCode::OK);
+    let filtered_assets = response_json(filtered_assets).await;
+    let filtered_categories: Vec<&str> = filtered_assets["assets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|asset| asset["category"].as_str().unwrap())
+        .collect();
+    assert_eq!(filtered_categories, vec!["prop", "prop/vehicle"]);
+
+    let nested_assets = app
+        .clone()
+        .oneshot(api_request(
+            "GET",
+            "/api/assets?profile=main&category=prop/vehicle",
+            "secret",
+            Body::empty(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(nested_assets.status(), StatusCode::OK);
+    let nested_assets = response_json(nested_assets).await;
+    assert_eq!(nested_assets["assets"].as_array().unwrap().len(), 1);
+    assert_eq!(nested_assets["assets"][0]["category"], "prop/vehicle");
+    assert_eq!(nested_assets["assets"][0]["asset_code"], "truck");
 
     let version_info = app
             .clone()
@@ -742,6 +868,258 @@ async fn web_api_accepts_object_and_version_import() {
 }
 
 #[tokio::test]
+async fn web_api_object_get_streams_full_and_ranged_reads() {
+    let temp = TempDir::new().unwrap();
+    let store_path = temp.path().join("store");
+    let workspace = temp.path().join("workspace");
+    Store::init(&store_path).unwrap();
+    let app = web_app(test_web_state(&store_path, &workspace));
+
+    let payload = b"0123456789abcdefghij";
+    let hash = sha256_bytes(payload);
+    let uri = format!("/api/object?profile=main&sha256={hash}");
+    let upload = app
+        .clone()
+        .oneshot(api_request(
+            "PUT",
+            &uri,
+            "secret",
+            Body::from(payload.as_slice()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(upload.status(), StatusCode::OK);
+
+    let full = app
+        .clone()
+        .oneshot(api_request("GET", &uri, "secret", Body::empty()))
+        .await
+        .unwrap();
+    assert_eq!(full.status(), StatusCode::OK);
+    assert_eq!(full.headers()[header::CONTENT_LENGTH], "20");
+    assert_eq!(full.headers()[header::ACCEPT_RANGES], "bytes");
+    assert_eq!(full.headers()["x-ads-sha256"], hash.as_str());
+    assert_eq!(response_bytes(full).await, payload);
+
+    let bounded = app
+        .clone()
+        .oneshot(ranged_request(&uri, "bytes=2-5"))
+        .await
+        .unwrap();
+    assert_eq!(bounded.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(bounded.headers()[header::CONTENT_RANGE], "bytes 2-5/20");
+    assert_eq!(bounded.headers()[header::CONTENT_LENGTH], "4");
+    assert_eq!(response_bytes(bounded).await, b"2345");
+
+    let open_ended = app
+        .clone()
+        .oneshot(ranged_request(&uri, "bytes=15-"))
+        .await
+        .unwrap();
+    assert_eq!(open_ended.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        open_ended.headers()[header::CONTENT_RANGE],
+        "bytes 15-19/20"
+    );
+    assert_eq!(response_bytes(open_ended).await, b"fghij");
+
+    let suffix = app
+        .clone()
+        .oneshot(ranged_request(&uri, "bytes=-4"))
+        .await
+        .unwrap();
+    assert_eq!(suffix.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(suffix.headers()[header::CONTENT_RANGE], "bytes 16-19/20");
+    assert_eq!(response_bytes(suffix).await, b"ghij");
+
+    // An end past the object clamps instead of failing.
+    let clamped = app
+        .clone()
+        .oneshot(ranged_request(&uri, "bytes=18-99"))
+        .await
+        .unwrap();
+    assert_eq!(clamped.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(clamped.headers()[header::CONTENT_RANGE], "bytes 18-19/20");
+    assert_eq!(response_bytes(clamped).await, b"ij");
+
+    let unsatisfiable = app
+        .clone()
+        .oneshot(ranged_request(&uri, "bytes=20-"))
+        .await
+        .unwrap();
+    assert_eq!(unsatisfiable.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    assert_eq!(unsatisfiable.headers()[header::CONTENT_RANGE], "bytes */20");
+
+    // Malformed and multi-range specs are ignored per RFC 9110: full 200.
+    for ignored in ["bytes=5-2", "bytes=0-1,3-4", "lines=1-2", "bytes=abc-def"] {
+        let response = app
+            .clone()
+            .oneshot(ranged_request(&uri, ignored))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{ignored}");
+        assert_eq!(response_bytes(response).await, payload, "{ignored}");
+    }
+}
+
+#[tokio::test]
+async fn web_api_object_put_streams_chunked_bodies_and_reuses_duplicates() {
+    let temp = TempDir::new().unwrap();
+    let store_path = temp.path().join("store");
+    let workspace = temp.path().join("workspace");
+    Store::init(&store_path).unwrap();
+    let app = web_app(test_web_state(&store_path, &workspace));
+
+    let payload: Vec<u8> = (0u8..=255).cycle().take(256 * 1024).collect();
+    let hash = sha256_bytes(&payload);
+    let uri = format!("/api/object?profile=main&sha256={hash}");
+    let chunks: Vec<std::result::Result<axum::body::Bytes, std::io::Error>> = payload
+        .chunks(64 * 1024)
+        .map(|chunk| Ok(axum::body::Bytes::copy_from_slice(chunk)))
+        .collect();
+    let upload = app
+        .clone()
+        .oneshot(api_request(
+            "PUT",
+            &uri,
+            "secret",
+            Body::from_stream(futures_util::stream::iter(chunks)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(upload.status(), StatusCode::OK);
+    let upload = response_json(upload).await;
+    assert_eq!(upload["reused"], false);
+    assert_eq!(upload["size"], 256 * 1024);
+    assert_eq!(fs::read(object_path(&store_path, &hash)).unwrap(), payload);
+
+    let again = app
+        .clone()
+        .oneshot(api_request(
+            "PUT",
+            &uri,
+            "secret",
+            Body::from(payload.clone()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(again.status(), StatusCode::OK);
+    assert_eq!(response_json(again).await["reused"], true);
+    // Streaming left no temp files next to the finished object.
+    assert_eq!(store_object_file_count(&store_path), 1);
+}
+
+#[tokio::test]
+async fn web_api_object_put_rejects_hash_mismatch_and_cleans_up() {
+    let temp = TempDir::new().unwrap();
+    let store_path = temp.path().join("store");
+    let workspace = temp.path().join("workspace");
+    Store::init(&store_path).unwrap();
+    let app = web_app(test_web_state(&store_path, &workspace));
+
+    let claimed = sha256_bytes(b"expected bytes");
+    let mismatch = app
+        .oneshot(api_request(
+            "PUT",
+            &format!("/api/object?profile=main&sha256={claimed}"),
+            "secret",
+            Body::from(b"actual bytes".as_slice()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(mismatch.status(), StatusCode::BAD_REQUEST);
+    let error = response_json(mismatch).await;
+    assert!(
+        error["error"].as_str().unwrap().contains("hash mismatch"),
+        "{error}"
+    );
+    assert!(!object_path(&store_path, &claimed).exists());
+    assert_eq!(store_object_file_count(&store_path), 0);
+}
+
+#[tokio::test]
+async fn web_api_object_put_enforces_upload_cap_with_413() {
+    let temp = TempDir::new().unwrap();
+    let store_path = temp.path().join("store");
+    let workspace = temp.path().join("workspace");
+    Store::init(&store_path).unwrap();
+    let app = web_app(test_web_state_with_object_cap(&store_path, &workspace, 8));
+
+    let payload = b"way past the eight byte cap";
+    let hash = sha256_bytes(payload);
+    let response = app
+        .oneshot(api_request(
+            "PUT",
+            &format!("/api/object?profile=main&sha256={hash}"),
+            "secret",
+            Body::from(payload.as_slice()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(!object_path(&store_path, &hash).exists());
+    assert_eq!(store_object_file_count(&store_path), 0);
+}
+
+#[tokio::test]
+async fn remote_client_streams_objects_end_to_end() {
+    let temp = TempDir::new().unwrap();
+    let server_store = temp.path().join("server-store");
+    let server_workspace = temp.path().join("server-workspace");
+    Store::init(&server_store).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let state = test_web_state(&server_store, &server_workspace);
+    let server = tokio::spawn(async move {
+        axum::serve(listener, web_app(state)).await.unwrap();
+    });
+
+    let client_store_path = temp.path().join("client-store");
+    let client_store = Store::init(&client_store_path).unwrap();
+    let fresh_store_path = temp.path().join("fresh-store");
+    let fresh_store = Store::init(&fresh_store_path).unwrap();
+    let payload: Vec<u8> = (0u8..=255).cycle().take(128 * 1024).collect();
+    let sha256 = sha256_bytes(&payload);
+    let source = temp.path().join("payload.bin");
+    fs::write(&source, &payload).unwrap();
+
+    // RemoteClient is sync ureq, so drive it off the async runtime.
+    tokio::task::spawn_blocking(move || {
+        let client = RemoteClient::new(&format!("http://{addr}"), "secret").unwrap();
+
+        let uploaded = client.upload_object("main", &sha256, &source).unwrap();
+        assert_eq!(uploaded.size, payload.len() as u64);
+        assert!(!uploaded.reused);
+        assert_eq!(
+            fs::read(object_path(&server_store, &sha256)).unwrap(),
+            payload
+        );
+        let again = client.upload_object("main", &sha256, &source).unwrap();
+        assert!(again.reused);
+
+        let downloaded = client.fetch_object("main", &sha256, &client_store).unwrap();
+        assert_eq!(downloaded, payload.len() as u64);
+        assert_eq!(
+            fs::read(object_path(&client_store_path, &sha256)).unwrap(),
+            payload
+        );
+
+        // A corrupted server object must fail the client's incremental hash
+        // verification and leave nothing behind in the destination store.
+        fs::write(object_path(&server_store, &sha256), b"corrupted").unwrap();
+        let error = client
+            .fetch_object("main", &sha256, &fresh_store)
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("hash mismatch"), "{error:#}");
+        assert!(!object_path(&fresh_store_path, &sha256).exists());
+        assert_eq!(store_object_file_count(&fresh_store_path), 0);
+    })
+    .await
+    .unwrap();
+    server.abort();
+}
+
+#[tokio::test]
 async fn web_api_lists_wips_promotes_and_runs_gc() {
     let temp = TempDir::new().unwrap();
     let store_path = temp.path().join("store");
@@ -844,7 +1222,562 @@ async fn web_api_lists_wips_promotes_and_runs_gc() {
     assert_eq!(remaining["wips"][0]["seq"], 2);
 }
 
+#[tokio::test]
+async fn web_api_maps_domain_errors_to_404_and_400() {
+    let temp = TempDir::new().unwrap();
+    let store_path = temp.path().join("store");
+    let workspace = temp.path().join("workspace");
+    let store = Store::init(&store_path).unwrap();
+    let department_key = DepartmentKey::new(
+        AssetKey::new("prop".to_string(), "crate".to_string()).unwrap(),
+        "model".to_string(),
+    )
+    .unwrap();
+    fs::create_dir_all(version_folder(&workspace, &department_key, VersionId(1))).unwrap();
+    fs::write(
+        version_folder(&workspace, &department_key, VersionId(1)).join("crate.usd"),
+        "v1",
+    )
+    .unwrap();
+    store
+        .add_version_folder(&workspace, &department_key, VersionId(1))
+        .unwrap();
+    drop(store);
+    let app = web_app(test_web_state(&store_path, &workspace));
+
+    // Lookup misses carry the NotFound marker through the anyhow chain.
+    for (uri, expected) in [
+        (
+            "/api/asset?profile=main&category=prop&asset_code=missing",
+            "asset not found",
+        ),
+        (
+            "/api/version?profile=main&category=prop&asset_code=crate&department=model&version=v009",
+            "department has no selected version",
+        ),
+        (
+            "/api/version?profile=main&category=prop&asset_code=other&department=model",
+            "department has no selected version",
+        ),
+        ("/api/assets?profile=missing", "profile not found"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(api_request("GET", uri, "secret", Body::empty()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
+        let error = response_json(response).await;
+        assert!(
+            error["error"].as_str().unwrap().contains(expected),
+            "{uri}: {error}"
+        );
+    }
+
+    let missing_object = app
+        .clone()
+        .oneshot(api_request(
+            "GET",
+            &format!("/api/object?profile=main&sha256={}", "0".repeat(64)),
+            "secret",
+            Body::empty(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(missing_object.status(), StatusCode::NOT_FOUND);
+
+    // Input errors keep their message and stay 400.
+    let invalid = app
+        .oneshot(api_request(
+            "GET",
+            "/api/version?profile=main&category=..&asset_code=crate&department=model",
+            "secret",
+            Body::empty(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+    let error = response_json(invalid).await;
+    assert!(
+        error["error"]
+            .as_str()
+            .unwrap()
+            .contains("category must not contain . or .. components"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn web_api_sends_cors_headers_only_for_configured_origins() {
+    let temp = TempDir::new().unwrap();
+    let store_path = temp.path().join("store");
+    let workspace = temp.path().join("workspace");
+    Store::init(&store_path).unwrap();
+
+    let preflight = |origin: &str| {
+        Request::builder()
+            .method("OPTIONS")
+            .uri("/api/profiles")
+            .header(header::ORIGIN, origin)
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+            .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "authorization")
+            .body(Body::empty())
+            .unwrap()
+    };
+    let simple = |origin: &str| {
+        Request::builder()
+            .method("GET")
+            .uri("/api/profiles")
+            .header(header::ORIGIN, origin)
+            .header(header::AUTHORIZATION, "Bearer secret")
+            .body(Body::empty())
+            .unwrap()
+    };
+
+    // Default: no CORS layer at all, so neither preflight nor simple
+    // requests are granted cross-origin access.
+    let app = web_app(test_web_state(&store_path, &workspace));
+    let response = app
+        .clone()
+        .oneshot(preflight("https://tools.example.com"))
+        .await
+        .unwrap();
+    assert!(
+        !response
+            .headers()
+            .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+    );
+    let response = app
+        .oneshot(simple("https://tools.example.com"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        !response
+            .headers()
+            .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+    );
+
+    // With the flag, exactly the configured origins are allowed.
+    let app = web_app(test_web_state_with_cors(
+        &store_path,
+        &workspace,
+        &["https://tools.example.com"],
+    ));
+    let response = app
+        .clone()
+        .oneshot(preflight("https://tools.example.com"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+        "https://tools.example.com"
+    );
+    let allow_headers = response.headers()[header::ACCESS_CONTROL_ALLOW_HEADERS]
+        .to_str()
+        .unwrap()
+        .to_ascii_lowercase();
+    assert!(allow_headers.contains("authorization"), "{allow_headers}");
+    assert!(allow_headers.contains("content-type"), "{allow_headers}");
+
+    let response = app
+        .clone()
+        .oneshot(simple("https://tools.example.com"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+        "https://tools.example.com"
+    );
+
+    let response = app
+        .oneshot(simple("https://evil.example.com"))
+        .await
+        .unwrap();
+    assert!(
+        !response
+            .headers()
+            .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+    );
+}
+
+#[tokio::test]
+async fn web_api_registers_wip_from_uploaded_objects_and_promotes() {
+    let temp = TempDir::new().unwrap();
+    let store_path = temp.path().join("store");
+    let workspace = temp.path().join("workspace");
+    Store::init(&store_path).unwrap();
+    let app = web_app(test_web_state(&store_path, &workspace));
+
+    let object_bytes = b"wip-usd-1";
+    let object_hash = sha256_bytes(object_bytes);
+    let upload = app
+        .clone()
+        .oneshot(api_request(
+            "PUT",
+            &format!("/api/object?profile=main&sha256={object_hash}"),
+            "secret",
+            Body::from(object_bytes.as_slice()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(upload.status(), StatusCode::OK);
+
+    let manifest = Manifest {
+        entries: vec![ManifestEntry {
+            relative_path: "crate.usd".to_string(),
+            sha256: object_hash.clone(),
+            size: object_bytes.len() as u64,
+            mode: 0o666,
+        }],
+    };
+    let wip_request = |source_path: Option<&str>| {
+        Body::from(
+            serde_json::to_vec(&WipImportRequest {
+                profile: "main".to_string(),
+                category: "prop".to_string(),
+                asset_code: "crate".to_string(),
+                department: "model".to_string(),
+                manifest: manifest.clone(),
+                source_path: source_path.map(str::to_string),
+            })
+            .unwrap(),
+        )
+    };
+
+    let registered = app
+        .clone()
+        .oneshot(api_request("POST", "/api/wip", "secret", wip_request(None)))
+        .await
+        .unwrap();
+    assert_eq!(registered.status(), StatusCode::OK);
+    let registered = response_json(registered).await;
+    assert_eq!(registered["created"], true);
+    assert_eq!(registered["seq"], 1);
+    assert_eq!(
+        registered["manifest_hash"],
+        manifest.canonical_hash().unwrap().as_str()
+    );
+
+    // Re-registering the unchanged manifest returns the existing head.
+    let unchanged = app
+        .clone()
+        .oneshot(api_request(
+            "POST",
+            "/api/wip",
+            "secret",
+            wip_request(Some("houdini:/obj/geo1")),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(unchanged.status(), StatusCode::OK);
+    let unchanged = response_json(unchanged).await;
+    assert_eq!(unchanged["created"], false);
+    assert_eq!(unchanged["seq"], 1);
+
+    let wips = app
+        .clone()
+        .oneshot(api_request(
+            "GET",
+            "/api/wips?profile=main&category=prop&asset_code=crate&department=model",
+            "secret",
+            Body::empty(),
+        ))
+        .await
+        .unwrap();
+    let wips = response_json(wips).await;
+    assert_eq!(wips["wips"].as_array().unwrap().len(), 1);
+    assert_eq!(wips["wips"][0]["seq"], 1);
+    assert_eq!(wips["wips"][0]["source_path"], "prop/crate/model");
+
+    let promote = app
+        .clone()
+        .oneshot(api_request(
+            "POST",
+            "/api/promote",
+            "secret",
+            Body::from(
+                r#"{"profile":"main","category":"prop","asset_code":"crate","department":"model"}"#,
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(promote.status(), StatusCode::OK);
+    let promote = response_json(promote).await;
+    assert_eq!(promote["outcome"]["created"], true);
+    assert_eq!(promote["outcome"]["version"], 1);
+
+    // A manifest referencing objects that were never uploaded is rejected
+    // with the missing hashes listed.
+    let missing_hash = sha256_bytes(b"never uploaded");
+    let missing = app
+        .oneshot(api_request(
+            "POST",
+            "/api/wip",
+            "secret",
+            Body::from(
+                serde_json::to_vec(&WipImportRequest {
+                    profile: "main".to_string(),
+                    category: "prop".to_string(),
+                    asset_code: "crate".to_string(),
+                    department: "model".to_string(),
+                    manifest: Manifest {
+                        entries: vec![ManifestEntry {
+                            relative_path: "crate.usd".to_string(),
+                            sha256: missing_hash.clone(),
+                            size: 4,
+                            mode: 0o666,
+                        }],
+                    },
+                    source_path: None,
+                })
+                .unwrap(),
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+    let error = response_json(missing).await;
+    let message = error["error"].as_str().unwrap();
+    assert!(message.contains("objects missing or invalid"), "{message}");
+    assert!(message.contains(&missing_hash), "{message}");
+}
+
+#[tokio::test]
+async fn web_api_wip_rejects_non_canonical_manifests() {
+    let temp = TempDir::new().unwrap();
+    let store_path = temp.path().join("store");
+    let workspace = temp.path().join("workspace");
+    Store::init(&store_path).unwrap();
+    let app = web_app(test_web_state(&store_path, &workspace));
+
+    let mut hashes = Vec::new();
+    for bytes in [b"aaa".as_slice(), b"bbb".as_slice()] {
+        let hash = sha256_bytes(bytes);
+        let upload = app
+            .clone()
+            .oneshot(api_request(
+                "PUT",
+                &format!("/api/object?profile=main&sha256={hash}"),
+                "secret",
+                Body::from(bytes),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(upload.status(), StatusCode::OK);
+        hashes.push(hash);
+    }
+    let entry = |path: &str, hash: &str| ManifestEntry {
+        relative_path: path.to_string(),
+        sha256: hash.to_string(),
+        size: 3,
+        mode: 0o666,
+    };
+    let wip_body = |entries: Vec<ManifestEntry>| {
+        Body::from(
+            serde_json::to_vec(&WipImportRequest {
+                profile: "main".to_string(),
+                category: "prop".to_string(),
+                asset_code: "crate".to_string(),
+                department: "model".to_string(),
+                manifest: Manifest { entries },
+                source_path: None,
+            })
+            .unwrap(),
+        )
+    };
+
+    // Duplicate relative_path: resolve (first match) and checkout (last
+    // write) would disagree about the version's content.
+    let duplicate = app
+        .clone()
+        .oneshot(api_request(
+            "POST",
+            "/api/wip",
+            "secret",
+            wip_body(vec![
+                entry("crate.usd", &hashes[0]),
+                entry("crate.usd", &hashes[1]),
+            ]),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(duplicate.status(), StatusCode::BAD_REQUEST);
+    let error = response_json(duplicate).await;
+    assert!(
+        error["error"].as_str().unwrap().contains("more than once"),
+        "{error}"
+    );
+
+    // Unsorted entries hash differently from the canonical manifest built
+    // locally for the same content, silently defeating dedup.
+    let unsorted = app
+        .clone()
+        .oneshot(api_request(
+            "POST",
+            "/api/wip",
+            "secret",
+            wip_body(vec![entry("b.usd", &hashes[1]), entry("a.usd", &hashes[0])]),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(unsorted.status(), StatusCode::BAD_REQUEST);
+    let error = response_json(unsorted).await;
+    assert!(
+        error["error"]
+            .as_str()
+            .unwrap()
+            .contains("sorted by relative_path"),
+        "{error}"
+    );
+
+    // The same gate guards PUT /api/version, which shares the store-layer
+    // validation through import_version_info.
+    let manifest = Manifest {
+        entries: vec![entry("b.usd", &hashes[1]), entry("a.usd", &hashes[0])],
+    };
+    let version_info = VersionInfo {
+        version: VersionRecord {
+            department_key: DepartmentKey::new(
+                AssetKey::new("prop".to_string(), "crate".to_string()).unwrap(),
+                "model".to_string(),
+            )
+            .unwrap(),
+            version: VersionId(1),
+            manifest_hash: manifest.canonical_hash().unwrap(),
+            created_at: Utc::now().to_rfc3339(),
+            source_path: "import".to_string(),
+            file_count: 2,
+            total_bytes: 6,
+            promoted_from: None,
+        },
+        manifest,
+    };
+    let import = app
+        .oneshot(api_request(
+            "PUT",
+            "/api/version",
+            "secret",
+            Body::from(
+                serde_json::to_vec(&VersionImportRequest {
+                    profile: "main".to_string(),
+                    version_info,
+                })
+                .unwrap(),
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(import.status(), StatusCode::BAD_REQUEST);
+    let error = response_json(import).await;
+    assert!(
+        error["error"]
+            .as_str()
+            .unwrap()
+            .contains("sorted by relative_path"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn web_api_wip_body_limit_uses_object_cap_and_json_errors() {
+    let temp = TempDir::new().unwrap();
+    let store_path = temp.path().join("store");
+    let workspace = temp.path().join("workspace");
+    Store::init(&store_path).unwrap();
+    // A cap far below the default 2 MiB proves the route's limit is wired to
+    // the configured object cap rather than axum's extractor default.
+    let app = web_app(test_web_state_with_object_cap(&store_path, &workspace, 256));
+
+    let filler = "x".repeat(1024);
+    let body = format!(
+        r#"{{"profile":"main","category":"prop","asset_code":"crate","department":"model","source_path":"{filler}","manifest":{{"entries":[]}}}}"#
+    );
+    let response = app
+        .oneshot(api_request("POST", "/api/wip", "secret", Body::from(body)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    // Extractor rejections keep the {"error": ...} shape of every other
+    // API error instead of axum's plain-text default.
+    let error = response_json(response).await;
+    assert!(error["error"].is_string(), "{error}");
+}
+
+#[test]
+fn map_domain_error_treats_rocksdb_errors_as_internal() {
+    let temp = TempDir::new().unwrap();
+    // A real rocksdb::Error (its constructor is private): read-only opens
+    // never create, so pointing one at an empty path must fail.
+    let rocks_error = rocksdb::DB::open_for_read_only(
+        &rocksdb::Options::default(),
+        temp.path().join("missing-db"),
+        false,
+    )
+    .expect_err("read-only open of a missing db must fail");
+    let mapped = map_domain_error(anyhow::Error::new(rocks_error));
+    assert_eq!(mapped.status, StatusCode::INTERNAL_SERVER_ERROR);
+    // The body stays generic: rocksdb messages embed server paths.
+    assert_eq!(mapped.message, "internal server error");
+}
+
+#[test]
+fn exact_len_reader_truncates_growth_and_fails_on_shrink() {
+    use std::io::Read;
+
+    // Growth: the source has more bytes than declared; the reader stops at
+    // the declared length so the HTTP framing stays intact.
+    let mut grown = ExactLenReader {
+        inner: std::io::Cursor::new(b"0123456789".to_vec()),
+        remaining: 4,
+    };
+    let mut sent = Vec::new();
+    grown.read_to_end(&mut sent).unwrap();
+    assert_eq!(sent, b"0123");
+
+    // Shrink: the source ends early; the reader fails fast instead of
+    // leaving the server waiting for the missing bytes.
+    let mut shrunk = ExactLenReader {
+        inner: std::io::Cursor::new(b"01".to_vec()),
+        remaining: 4,
+    };
+    let mut sent = Vec::new();
+    let error = shrunk.read_to_end(&mut sent).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+}
+
 fn test_web_state(store_path: &Path, workspace: &Path) -> Arc<WebState> {
+    test_web_state_with_object_cap(store_path, workspace, 1024 * 1024 * 1024)
+}
+
+fn test_web_state_with_object_cap(
+    store_path: &Path,
+    workspace: &Path,
+    max_object_upload_bytes: usize,
+) -> Arc<WebState> {
+    test_web_state_with_config(store_path, workspace, max_object_upload_bytes, Vec::new())
+}
+
+fn test_web_state_with_cors(
+    store_path: &Path,
+    workspace: &Path,
+    origins: &[&str],
+) -> Arc<WebState> {
+    let origins = origins
+        .iter()
+        .map(|origin| origin.parse().unwrap())
+        .collect();
+    test_web_state_with_config(store_path, workspace, 1024 * 1024 * 1024, origins)
+}
+
+fn test_web_state_with_config(
+    store_path: &Path,
+    workspace: &Path,
+    max_object_upload_bytes: usize,
+    cors_allow_origins: Vec<axum::http::HeaderValue>,
+) -> Arc<WebState> {
     let profile = ServeProfile::new(
         "main".to_string(),
         store_path.to_path_buf(),
@@ -857,10 +1790,32 @@ fn test_web_state(store_path: &Path, workspace: &Path) -> Arc<WebState> {
             auth_token: "secret".to_string(),
             profiles: BTreeMap::from([(profile.name.clone(), profile)]),
             max_upload_bytes: 10 * 1024 * 1024,
-            max_object_upload_bytes: 1024 * 1024 * 1024,
+            max_object_upload_bytes,
+            cors_allow_origins,
         })
         .unwrap(),
     )
+}
+
+fn ranged_request(uri: &str, range: &str) -> Request<Body> {
+    Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header(header::AUTHORIZATION, "Bearer secret")
+        .header(header::RANGE, range)
+        .body(Body::empty())
+        .unwrap()
+}
+
+/// Counts every file under the store's objects tree — finished objects and
+/// leftover temps alike — so tests can assert nothing leaked.
+fn store_object_file_count(store_path: &Path) -> usize {
+    WalkDir::new(objects_root(store_path))
+        .follow_links(false)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_file())
+        .count()
 }
 
 fn api_request(method: &str, uri: &str, token: &str, body: Body) -> Request<Body> {

@@ -1,13 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, File};
-use std::io::{BufReader, Read};
+use std::io::{BufReader, Read, Write};
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, anyhow, bail};
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode};
 use chrono::Utc;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use globset::{Glob, GlobMatcher};
@@ -31,6 +32,10 @@ const OBJECTS_DIR: &str = "objects";
 const SHA256_DIR: &str = "sha256";
 const CACHE_DIR: &str = ".ads-cache";
 const MANIFESTS_DIR: &str = "manifests";
+/// Completeness marker written inside a manifest view before it is renamed
+/// into place. Views from before atomic materialization used a sibling
+/// `<hash>.complete` file instead; both are still honored on read.
+const VIEW_COMPLETE_MARKER: &str = ".ads-complete";
 const STAGING_DIR: &str = ".ads-staging";
 const USD_EXTENSIONS: &[&str] = &["usd", "usda", "usdc", "usdz"];
 /// Formats that can carry relative references to sibling files and therefore
@@ -282,6 +287,11 @@ enum Commands {
         /// Maximum remote object upload size in MiB.
         #[arg(long = "max-object-upload-mb", default_value_t = 1024)]
         max_object_upload_mb: u64,
+        /// Origin allowed to call the API from a browser, for example
+        /// https://tools.example.com. Repeatable. Without this flag no CORS
+        /// headers are sent (the bundled WebApp is served same-origin).
+        #[arg(long = "cors-allow-origin")]
+        cors_allow_origins: Vec<String>,
     },
     /// Public publish folder operations.
     Publish {
@@ -1566,6 +1576,7 @@ where
             workspace,
             max_upload_mb,
             max_object_upload_mb,
+            cors_allow_origins,
         } => {
             let config = ServeConfig::from_args(
                 bind,
@@ -1575,6 +1586,7 @@ where
                 workspace,
                 max_upload_mb,
                 max_object_upload_mb,
+                cors_allow_origins,
             )?;
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -1953,26 +1965,26 @@ fn resolve_version_relative_reference(from: &str, reference: &str) -> Option<Str
 }
 
 fn extract_usd_asset_references(text: &str) -> Vec<String> {
+    // USD wraps asset paths that themselves contain `@` in triple-`@`
+    // delimiters, so `@@@` must be matched before plain `@` pairs — a
+    // naive per-`@` toggle misparses everything after the first escape.
     let mut references = Vec::new();
-    let mut current = String::new();
-    let mut in_reference = false;
-
-    for character in text.chars() {
-        if character == '@' {
-            if in_reference {
-                references.push(current.clone());
-                current.clear();
-                in_reference = false;
-            } else {
-                in_reference = true;
+    let mut remaining = text;
+    while let Some(start) = remaining.find('@') {
+        let after = &remaining[start..];
+        let (delimiter, body) = match after.strip_prefix("@@@") {
+            Some(body) => ("@@@", body),
+            None => ("@", &after[1..]),
+        };
+        match body.find(delimiter) {
+            Some(end) => {
+                references.push(body[..end].to_string());
+                remaining = &body[end + delimiter.len()..];
             }
-            continue;
-        }
-        if in_reference {
-            current.push(character);
+            // Unterminated reference; nothing after it can parse.
+            None => break,
         }
     }
-
     references
 }
 
@@ -2060,9 +2072,7 @@ fn fetch_remote_version(
             stats.objects_reused += 1;
             continue;
         }
-        let bytes = remote.fetch_object(profile, &entry.sha256)?;
-        stats.bytes_downloaded += bytes.len() as u64;
-        store.write_object_bytes(&entry.sha256, &bytes)?;
+        stats.bytes_downloaded += remote.fetch_object(profile, &entry.sha256, store)?;
         stats.objects_downloaded += 1;
     }
     store.import_version_info(&version_info)?;
@@ -2110,8 +2120,11 @@ fn push_remote_version(
             stats.objects_reused += 1;
             continue;
         }
-        let bytes = store.read_object_bytes(&entry.sha256, entry.size)?;
-        let upload = remote.upload_object(profile, &entry.sha256, &bytes)?;
+        let upload = remote.upload_object(
+            profile,
+            &entry.sha256,
+            &object_path(&store.root, &entry.sha256),
+        )?;
         if upload.reused {
             stats.objects_reused += 1;
         } else {
@@ -2139,8 +2152,11 @@ fn push_remote_version(
         {
             stats.objects_reused += 1;
         } else {
-            let bytes = store.read_object_bytes(&thumbnail.sha256, thumbnail.size)?;
-            let upload = remote.upload_object(profile, &thumbnail.sha256, &bytes)?;
+            let upload = remote.upload_object(
+                profile,
+                &thumbnail.sha256,
+                &object_path(&store.root, &thumbnail.sha256),
+            )?;
             if upload.reused {
                 stats.objects_reused += 1;
             } else {
@@ -2242,9 +2258,7 @@ fn add_remote_source(
         if status.exists {
             continue;
         }
-        let bytes = fs::read(&source_file.path)
-            .with_context(|| format!("failed to read {}", source_file.path.display()))?;
-        remote.upload_object(profile, &source_file.entry.sha256, &bytes)?;
+        remote.upload_object(profile, &source_file.entry.sha256, &source_file.path)?;
     }
 
     let version_info = VersionInfo {
@@ -2286,9 +2300,7 @@ fn set_remote_thumbnail(
     let image_info = inspect_thumbnail_image(&image)?;
     let (sha256, size) = hash_file(&image)?;
     if !remote.object_status(profile, &sha256, size)?.exists {
-        let bytes =
-            fs::read(&image).with_context(|| format!("failed to read {}", image.display()))?;
-        remote.upload_object(profile, &sha256, &bytes)?;
+        remote.upload_object(profile, &sha256, &image)?;
     }
     let record = ThumbnailRecord {
         department_key: department_key.clone(),
@@ -2649,6 +2661,31 @@ impl Manifest {
         Ok(sha256_bytes(&bytes))
     }
 
+    /// Rejects manifests that are not in the canonical form `build_manifest`
+    /// produces: entries strictly ascending by relative_path. The canonical
+    /// hash is order-sensitive, so an unsorted manifest for identical content
+    /// would hash differently and silently defeat wip-head/version dedup, and
+    /// a duplicate path makes resolve (first match wins) and checkout (last
+    /// write wins) disagree about a version's content.
+    pub fn validate_canonical(&self) -> Result<()> {
+        for pair in self.entries.windows(2) {
+            match pair[0].relative_path.cmp(&pair[1].relative_path) {
+                std::cmp::Ordering::Less => {}
+                std::cmp::Ordering::Equal => {
+                    bail!("manifest lists {} more than once", pair[1].relative_path);
+                }
+                std::cmp::Ordering::Greater => {
+                    bail!(
+                        "manifest entries must be sorted by relative_path ({} listed after {})",
+                        pair[1].relative_path,
+                        pair[0].relative_path
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn total_bytes(&self) -> u64 {
         self.entries.iter().map(|entry| entry.size).sum()
     }
@@ -2801,6 +2838,7 @@ struct ServeConfig {
     profiles: BTreeMap<String, ServeProfile>,
     max_upload_bytes: usize,
     max_object_upload_bytes: usize,
+    cors_allow_origins: Vec<HeaderValue>,
 }
 
 #[derive(Clone, Debug)]
@@ -2960,6 +2998,18 @@ struct WipsResponse {
     wips: Vec<WipRecord>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct WipImportRequest {
+    profile: String,
+    category: String,
+    asset_code: String,
+    department: String,
+    manifest: Manifest,
+    /// Provenance label stored on the record. Defaults to the logical work
+    /// line (category/asset_code/department), same as local `wip add`.
+    source_path: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 struct PromoteRequest {
     profile: String,
@@ -3050,6 +3100,25 @@ struct ErrorResponse {
     error: String,
 }
 
+/// Marker for "the requested entity does not exist" failures. The crate is
+/// anyhow-everywhere, so the web layer cannot type-match domain errors;
+/// carrying the original message inside this marker lets it walk the chain
+/// and map these sites to HTTP 404 without rewording anything.
+#[derive(Debug)]
+struct NotFound(String);
+
+impl fmt::Display for NotFound {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NotFound {}
+
+fn not_found_error(message: String) -> anyhow::Error {
+    anyhow::Error::new(NotFound(message))
+}
+
 pub struct Store {
     root: PathBuf,
     db: DB,
@@ -3057,6 +3126,17 @@ pub struct Store {
 
 impl Store {
     pub fn init(path: &Path) -> Result<Self> {
+        // RocksDB creates the db directory eagerly on open, and a
+        // just-created DB is indistinguishable from a foreign or corrupt one
+        // afterwards (both have no keys). Decide fresh-vs-existing before
+        // opening so init never re-stamps the schema marker on a store it
+        // did not create — that would bypass the schema gate without
+        // migrating anything.
+        let db_preexists = db_path(path)
+            .read_dir()
+            .map(|mut entries| entries.next().is_some())
+            .unwrap_or(false);
+
         fs::create_dir_all(path)
             .with_context(|| format!("failed to create store root {}", path.display()))?;
         fs::create_dir_all(objects_root(path)).with_context(|| {
@@ -3072,7 +3152,22 @@ impl Store {
         options.create_if_missing(true);
         let db = DB::open(&options, db_path(path))
             .with_context(|| format!("failed to open RocksDB at {}", db_path(path).display()))?;
-        db.put(key_meta("schema_version"), SCHEMA_VERSION.as_bytes())?;
+        if db_preexists {
+            match db.get(key_meta("schema_version"))? {
+                Some(schema) if schema.as_slice() == SCHEMA_VERSION.as_bytes() => {}
+                Some(schema) => bail!(
+                    "unsupported store schema version {}; expected {SCHEMA_VERSION} — init does not migrate existing stores; recreate the store at {}",
+                    String::from_utf8_lossy(&schema),
+                    path.display()
+                ),
+                None => bail!(
+                    "existing database at {} has no schema_version marker; not an ADS store (or corrupt), refusing to initialize over it",
+                    db_path(path).display()
+                ),
+            }
+        } else {
+            db.put(key_meta("schema_version"), SCHEMA_VERSION.as_bytes())?;
+        }
         Ok(Self {
             root: path.to_path_buf(),
             db,
@@ -3239,6 +3334,7 @@ impl Store {
     }
 
     pub fn import_version_info(&self, info: &VersionInfo) -> Result<()> {
+        info.manifest.validate_canonical()?;
         let manifest_hash = info.manifest.canonical_hash()?;
         if manifest_hash != info.version.manifest_hash {
             bail!(
@@ -3330,13 +3426,13 @@ impl Store {
 
     pub fn get_wip(&self, department_key: &DepartmentKey, seq: u64) -> Result<WipRecord> {
         let value = self.db.get(key_wip(department_key, seq))?.ok_or_else(|| {
-            anyhow!(
+            not_found_error(format!(
                 "wip not found: {}/{}/{} seq {}",
                 department_key.asset_key.category,
                 department_key.asset_key.asset_code,
                 department_key.department,
                 seq
-            )
+            ))
         })?;
         serde_json::from_slice(&value).context("failed to decode wip record")
     }
@@ -3400,6 +3496,20 @@ impl Store {
         );
 
         let manifest = self.build_manifest(&source)?;
+        self.add_wip_from_manifest(department_key, &manifest, source_path)
+    }
+
+    /// Registers one write of the WIP stream from an already-built manifest
+    /// whose objects are in the store. Shared by `wip add` (which stages the
+    /// objects while building the manifest) and `/api/wip` (whose objects
+    /// were uploaded beforehand).
+    pub fn add_wip_from_manifest(
+        &self,
+        department_key: &DepartmentKey,
+        manifest: &Manifest,
+        source_path: String,
+    ) -> Result<WipOutcome> {
+        manifest.validate_canonical()?;
         let manifest_hash = manifest.canonical_hash()?;
 
         if let Some(head) = self.wip_head(department_key)?
@@ -3427,7 +3537,7 @@ impl Store {
         let mut batch = WriteBatch::default();
         batch.put(
             key_manifest(&manifest_hash),
-            serde_json::to_vec(&manifest).context("failed to serialize manifest")?,
+            serde_json::to_vec(manifest).context("failed to serialize manifest")?,
         );
         batch.put(
             key_wip(department_key, seq),
@@ -3670,9 +3780,10 @@ impl Store {
     /// Workspace cache garbage collection. The cache is rebuildable from the
     /// store, so this is purely a disk-space policy: keep the manifest views
     /// (and blobs) referenced by every department's latest, explicit current,
-    /// and WIP head, delete the rest, and sweep staging runs older than the
-    /// grace window. Anything deleted re-materializes on the next resolve —
-    /// including views for explicitly pinned old versions.
+    /// and WIP head, delete the rest, and sweep staging runs and interrupted
+    /// view materializations older than the grace window. Anything deleted
+    /// re-materializes on the next resolve — including views for explicitly
+    /// pinned old versions.
     ///
     /// Reads the store only, so it can run while `ads serve` holds it.
     pub fn cache_gc(
@@ -3752,6 +3863,7 @@ impl Store {
 
         let manifests_root = workspace.join(CACHE_DIR).join(MANIFESTS_DIR);
         if manifests_root.exists() {
+            let now = std::time::SystemTime::now();
             for entry in fs::read_dir(&manifests_root)
                 .with_context(|| format!("failed to read {}", manifests_root.display()))?
             {
@@ -3759,7 +3871,28 @@ impl Store {
                 let name = entry.file_name().to_string_lossy().to_string();
                 let path = entry.path();
                 if path.is_dir() {
-                    if kept_manifests.contains(&name) {
+                    if name.contains(".tmp.") {
+                        // In-flight materializations build in sibling
+                        // `<hash>.tmp.<pid>.<id>` folders that are renamed
+                        // into place when complete. A live builder holds an
+                        // exclusive lock on the sibling `.lock` file (see
+                        // ensure_manifest_view); deleting under it would let
+                        // the builder silently recreate the tree and publish
+                        // a torn view with a valid marker, so a held lock
+                        // wins over any age. The staging grace still covers
+                        // pre-lock leftovers.
+                        if view_build_lock_is_held(&manifests_root.join(format!("{name}.lock"))) {
+                            continue;
+                        }
+                        let age = entry
+                            .metadata()
+                            .ok()
+                            .and_then(|metadata| metadata.modified().ok())
+                            .and_then(|modified| now.duration_since(modified).ok());
+                        if age.is_none_or(|age| age < staging_grace) {
+                            continue;
+                        }
+                    } else if kept_manifests.contains(&name) {
                         outcome.retained_views += 1;
                         continue;
                     }
@@ -3773,6 +3906,7 @@ impl Store {
                     }
                     if !dry_run {
                         let _ = fs::remove_file(manifests_root.join(format!("{name}.complete")));
+                        let _ = fs::remove_file(manifests_root.join(format!("{name}.lock")));
                         fs::remove_dir_all(&path)
                             .with_context(|| format!("failed to delete view {}", path.display()))?;
                     }
@@ -3781,6 +3915,16 @@ impl Store {
                     if !kept_manifests.contains(manifest_hash)
                         && !manifests_root.join(manifest_hash).exists()
                         && !dry_run
+                    {
+                        let _ = fs::remove_file(&path);
+                    }
+                } else if let Some(temp_name) = name.strip_suffix(".lock") {
+                    // Orphan build locks whose temp folder is already gone
+                    // and whose builder no longer holds them.
+                    if temp_name.contains(".tmp.")
+                        && !manifests_root.join(temp_name).exists()
+                        && !dry_run
+                        && !view_build_lock_is_held(&path)
                     {
                         let _ = fs::remove_file(&path);
                     }
@@ -4027,11 +4171,10 @@ impl Store {
 
     pub fn asset_info(&self, asset_key: &AssetKey) -> Result<AssetInfo> {
         let asset = self.asset_record(asset_key)?.ok_or_else(|| {
-            anyhow!(
+            not_found_error(format!(
                 "asset not found: {}/{}",
-                asset_key.category,
-                asset_key.asset_code
-            )
+                asset_key.category, asset_key.asset_code
+            ))
         })?;
         let versions =
             self.list_versions(Some(&asset_key.category), Some(&asset_key.asset_code), None)?;
@@ -4069,12 +4212,12 @@ impl Store {
         let version = self
             .selected_version(department_key, selector)?
             .ok_or_else(|| {
-                anyhow!(
+                not_found_error(format!(
                     "department has no selected version: {}/{}/{}",
                     department_key.asset_key.category,
                     department_key.asset_key.asset_code,
                     department_key.department
-                )
+                ))
             })?;
         self.version_info(department_key, version)
     }
@@ -4119,12 +4262,12 @@ impl Store {
         let version = self
             .selected_version(department_key, selector)?
             .ok_or_else(|| {
-                anyhow!(
+                not_found_error(format!(
                     "department has no selected version: {}/{}/{}",
                     department_key.asset_key.category,
                     department_key.asset_key.asset_code,
                     department_key.department
-                )
+                ))
             })?;
         let record = self.get_version(department_key, version)?;
         let manifest = self.get_manifest(&record.manifest_hash)?;
@@ -4170,12 +4313,12 @@ impl Store {
         let version = self
             .selected_version(&asset_path.department_key, asset_path.version)?
             .ok_or_else(|| {
-                anyhow!(
+                not_found_error(format!(
                     "department has no selected version: {}/{}/{}",
                     asset_path.department_key.asset_key.category,
                     asset_path.department_key.asset_key.asset_code,
                     asset_path.department_key.department
-                )
+                ))
             })?;
         let record = self.get_version(&asset_path.department_key, version)?;
         let manifest = self.get_manifest(&record.manifest_hash)?;
@@ -4184,14 +4327,14 @@ impl Store {
             .iter()
             .find(|entry| entry.relative_path == asset_path.relative_path)
             .ok_or_else(|| {
-                anyhow!(
+                not_found_error(format!(
                     "path not found in {}/{}/{} {}: {}",
                     asset_path.department_key.asset_key.category,
                     asset_path.department_key.asset_key.asset_code,
                     asset_path.department_key.department,
                     version,
                     asset_path.relative_path
-                )
+                ))
             })?;
         let asset_file_kind = asset_file_kind(&asset_path.relative_path);
 
@@ -4278,12 +4421,12 @@ impl Store {
             bail!("wip versions are local-only and cannot resolve in remote mode");
         }
         let wip = self.wip_head(&asset_path.department_key)?.ok_or_else(|| {
-            anyhow!(
+            not_found_error(format!(
                 "department has no wip versions: {}/{}/{}",
                 asset_path.department_key.asset_key.category,
                 asset_path.department_key.asset_key.asset_code,
                 asset_path.department_key.department
-            )
+            ))
         })?;
         let manifest = self.get_manifest(&wip.manifest_hash)?;
         let entry = manifest
@@ -4291,14 +4434,14 @@ impl Store {
             .iter()
             .find(|entry| entry.relative_path == asset_path.relative_path)
             .ok_or_else(|| {
-                anyhow!(
+                not_found_error(format!(
                     "path not found in {}/{}/{} wip seq {}: {}",
                     asset_path.department_key.asset_key.category,
                     asset_path.department_key.asset_key.asset_code,
                     asset_path.department_key.department,
                     wip.seq,
                     asset_path.relative_path
-                )
+                ))
             })?;
         let asset_file_kind = asset_file_kind(&asset_path.relative_path);
         if asset_file_kind == AssetFileKind::Leaf {
@@ -4437,12 +4580,12 @@ impl Store {
         let version = self
             .selected_version(department_key, selector)?
             .ok_or_else(|| {
-                anyhow!(
+                not_found_error(format!(
                     "department has no selected version: {}/{}/{}",
                     department_key.asset_key.category,
                     department_key.asset_key.asset_code,
                     department_key.department
-                )
+                ))
             })?;
         self.get_thumbnail(department_key, version)
     }
@@ -4591,7 +4734,7 @@ impl Store {
             .ok_or_else(|| anyhow!("invalid cache path: {}", cache_path.display()))?;
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create cache directory {}", parent.display()))?;
-        let temp_path = cache_path.with_extension(format!("tmp.{}", std::process::id()));
+        let temp_path = temp_sibling_path(&cache_path);
         fs::copy(&object_path, &temp_path).with_context(|| {
             format!(
                 "failed to copy object {} to cache {}",
@@ -4619,8 +4762,11 @@ impl Store {
     /// `<workspace>/.ads-cache/manifests/<manifest_hash>/`. Each entry is a
     /// hardlink to its blob in the sha256 cache (copy fallback), so relative
     /// references between files keep working and unchanged files cost no disk.
-    /// The view is keyed by manifest hash and therefore never overwritten; a
-    /// sibling `<manifest_hash>.complete` marker short-circuits repeat calls.
+    /// The view is built in a sibling `<hash>.tmp.<pid>.<id>` folder with its
+    /// completeness marker inside, then renamed into place — `cache gc` runs
+    /// concurrently with resolve, so a marker must never become visible ahead
+    /// of the files it vouches for. Legacy views guarded by a sibling
+    /// `<manifest_hash>.complete` marker are still trusted as-is.
     fn ensure_manifest_view(
         &self,
         workspace: &Path,
@@ -4628,60 +4774,99 @@ impl Store {
         manifest: &Manifest,
     ) -> Result<PathBuf> {
         let view_root = manifest_view_root(workspace, manifest_hash);
-        let marker = manifest_view_marker(workspace, manifest_hash);
-        if marker.exists() {
+        if view_root.join(VIEW_COMPLETE_MARKER).exists()
+            || manifest_view_marker(workspace, manifest_hash).exists()
+        {
             return Ok(view_root);
         }
-        for entry in &manifest.entries {
-            let link_path = safe_join(&view_root, &entry.relative_path)?;
-            if let Ok(metadata) = fs::metadata(&link_path) {
-                if metadata.is_file() && metadata.len() == entry.size {
-                    continue;
-                }
-                if metadata.is_dir() {
-                    bail!(
-                        "manifest view path exists and is a directory: {}",
-                        link_path.display()
-                    );
-                }
-                fs::remove_file(&link_path).with_context(|| {
-                    format!(
-                        "failed to remove incomplete view file {}",
-                        link_path.display()
-                    )
-                })?;
-            }
-            let blob_path = self.ensure_cache_object(workspace, entry)?;
-            let parent = link_path
-                .parent()
-                .ok_or_else(|| anyhow!("invalid view path: {}", link_path.display()))?;
+        // A view folder without either marker is an interrupted or gc-torn
+        // materialization; it cannot be resumed safely, so rebuild it.
+        if view_root.exists() {
+            fs::remove_dir_all(&view_root).with_context(|| {
+                format!("failed to remove incomplete view {}", view_root.display())
+            })?;
+        }
+        let temp_root = temp_sibling_path(&view_root);
+        // A concurrent `cache gc` must never sweep this build mid-flight:
+        // create_dir_all below would silently repair the tree and a torn
+        // view would be published with a valid marker. The lock is taken
+        // before the folder exists (so gc can never observe an unlocked
+        // in-flight build) and held until the rename settles; gc skips temp
+        // folders whose lock it cannot acquire.
+        let lock_path = view_build_lock_path(&temp_root);
+        if let Some(parent) = lock_path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create view directory {}", parent.display()))?;
-            if fs::hard_link(&blob_path, &link_path).is_err() {
-                if link_path.exists() {
-                    continue;
-                }
-                fs::copy(&blob_path, &link_path).with_context(|| {
-                    format!(
-                        "failed to copy blob {} into manifest view {}",
-                        blob_path.display(),
-                        link_path.display()
-                    )
-                })?;
-            }
         }
-        let marker_parent = marker
-            .parent()
-            .ok_or_else(|| anyhow!("invalid view marker path: {}", marker.display()))?;
-        fs::create_dir_all(marker_parent).with_context(|| {
-            format!(
-                "failed to create cache directory {}",
-                marker_parent.display()
-            )
-        })?;
-        fs::write(&marker, b"")
-            .with_context(|| format!("failed to write view marker {}", marker.display()))?;
-        Ok(view_root)
+        let lock_file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .with_context(|| format!("failed to create view lock {}", lock_path.display()))?;
+        lock_file
+            .try_lock()
+            .with_context(|| format!("failed to lock view lock {}", lock_path.display()))?;
+        let build = || -> Result<PathBuf> {
+            fs::create_dir_all(&temp_root).with_context(|| {
+                format!("failed to create view directory {}", temp_root.display())
+            })?;
+            for entry in &manifest.entries {
+                // The marker write below would truncate the hardlinked blob.
+                if entry
+                    .relative_path
+                    .eq_ignore_ascii_case(VIEW_COMPLETE_MARKER)
+                {
+                    bail!(
+                        "manifest entry collides with the view marker name: {}",
+                        entry.relative_path
+                    );
+                }
+                let link_path = safe_join(&temp_root, &entry.relative_path)?;
+                let blob_path = self.ensure_cache_object(workspace, entry)?;
+                let parent = link_path
+                    .parent()
+                    .ok_or_else(|| anyhow!("invalid view path: {}", link_path.display()))?;
+                fs::create_dir_all(parent).with_context(|| {
+                    format!("failed to create view directory {}", parent.display())
+                })?;
+                if fs::hard_link(&blob_path, &link_path).is_err() {
+                    fs::copy(&blob_path, &link_path).with_context(|| {
+                        format!(
+                            "failed to copy blob {} into manifest view {}",
+                            blob_path.display(),
+                            link_path.display()
+                        )
+                    })?;
+                }
+            }
+            let marker = temp_root.join(VIEW_COMPLETE_MARKER);
+            fs::write(&marker, b"")
+                .with_context(|| format!("failed to write view marker {}", marker.display()))?;
+            match fs::rename(&temp_root, &view_root) {
+                Ok(()) => Ok(view_root.clone()),
+                // Another materializer renamed its build in first; published
+                // views are complete by construction, so use it.
+                Err(_) if view_root.exists() => {
+                    let _ = fs::remove_dir_all(&temp_root);
+                    Ok(view_root.clone())
+                }
+                Err(error) => {
+                    let _ = fs::remove_dir_all(&temp_root);
+                    Err(error).with_context(|| {
+                        format!(
+                            "failed to move manifest view {} to {}",
+                            temp_root.display(),
+                            view_root.display()
+                        )
+                    })
+                }
+            }
+        };
+        let result = build();
+        drop(lock_file);
+        let _ = fs::remove_file(&lock_path);
+        result
     }
 
     pub fn remove_thumbnail(
@@ -5150,48 +5335,44 @@ impl Store {
         Ok(computed == sha256)
     }
 
-    fn read_object_bytes(&self, sha256: &str, expected_size: u64) -> Result<Vec<u8>> {
+    /// Streams `reader` into the object store: temp file next to the final
+    /// path, incremental hash, then rename. The object never becomes visible
+    /// under its sha256 before the bytes have been proven to match it.
+    /// Returns the number of bytes written.
+    fn write_object_from_reader(&self, sha256: &str, reader: &mut dyn Read) -> Result<u64> {
         validate_sha256(sha256)?;
         let path = object_path(&self.root, sha256);
-        let bytes =
-            fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
-        if bytes.len() as u64 != expected_size {
-            bail!(
-                "local object size mismatch: {} expected={} actual={}",
-                sha256,
-                expected_size,
-                bytes.len()
-            );
-        }
-        let computed = sha256_bytes(&bytes);
-        if computed != sha256 {
-            bail!("local object hash mismatch: expected {sha256}, computed {computed}");
-        }
-        Ok(bytes)
-    }
-
-    fn write_object_bytes(&self, sha256: &str, bytes: &[u8]) -> Result<()> {
-        validate_sha256(sha256)?;
-        let computed = sha256_bytes(bytes);
-        if computed != sha256 {
-            bail!("downloaded object hash mismatch: expected {sha256}, computed {computed}");
-        }
-        let path = object_path(&self.root, sha256);
-        if path.exists() {
-            let _ = fs::remove_file(&path);
-        }
         let parent = path
             .parent()
             .ok_or_else(|| anyhow!("invalid object path: {}", path.display()))?;
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create object directory {}", parent.display()))?;
-        let temp_path = path.with_extension(format!("tmp.{}", std::process::id()));
-        fs::write(&temp_path, bytes)
-            .with_context(|| format!("failed to write temporary object {}", temp_path.display()))?;
-        match fs::rename(&temp_path, &path) {
-            Ok(()) => Ok(()),
+        let temp_path = temp_sibling_path(&path);
+        match copy_hashed_to_temp(reader, &temp_path, sha256) {
+            Ok(size) => {
+                self.finalize_object_temp(&temp_path, sha256)?;
+                Ok(size)
+            }
             Err(error) => {
                 let _ = fs::remove_file(&temp_path);
+                Err(error)
+            }
+        }
+    }
+
+    /// Publishes a fully written, hash-verified temp file at its final
+    /// object path. Windows cannot rename over a file that is open, so a
+    /// stale object at the destination is removed first; the temp file is
+    /// cleaned up if the rename still fails.
+    fn finalize_object_temp(&self, temp_path: &Path, sha256: &str) -> Result<()> {
+        let path = object_path(&self.root, sha256);
+        if path.exists() {
+            let _ = fs::remove_file(&path);
+        }
+        match fs::rename(temp_path, &path) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let _ = fs::remove_file(temp_path);
                 Err(error).with_context(|| {
                     format!(
                         "failed to move temporary object {} to {}",
@@ -5367,13 +5548,13 @@ impl Store {
     ) -> Result<VersionRecord> {
         self.try_get_version(department_key, version)?
             .ok_or_else(|| {
-                anyhow!(
+                not_found_error(format!(
                     "version not found: {}/{}/{} {}",
                     department_key.asset_key.category,
                     department_key.asset_key.asset_code,
                     department_key.department,
                     version
-                )
+                ))
             })
     }
 
@@ -5395,13 +5576,13 @@ impl Store {
     ) -> Result<ThumbnailRecord> {
         self.try_get_thumbnail(department_key, version)?
             .ok_or_else(|| {
-                anyhow!(
+                not_found_error(format!(
                     "thumbnail not found: {}/{}/{} {}",
                     department_key.asset_key.category,
                     department_key.asset_key.asset_code,
                     department_key.department,
                     version
-                )
+                ))
             })
     }
 
@@ -5422,7 +5603,7 @@ impl Store {
         let value = self
             .db
             .get(key_manifest(manifest_hash))?
-            .ok_or_else(|| anyhow!("manifest not found: {manifest_hash}"))?;
+            .ok_or_else(|| not_found_error(format!("manifest not found: {manifest_hash}")))?;
         serde_json::from_slice(&value).context("failed to decode manifest")
     }
 }
@@ -5440,6 +5621,7 @@ fn mib_to_bytes(value: u64, name: &str) -> Result<usize> {
 }
 
 impl ServeConfig {
+    #[allow(clippy::too_many_arguments)]
     fn from_args(
         bind: SocketAddr,
         auth_token: Option<String>,
@@ -5448,6 +5630,7 @@ impl ServeConfig {
         workspace: Option<PathBuf>,
         max_upload_mb: u64,
         max_object_upload_mb: u64,
+        cors_allow_origins: Vec<String>,
     ) -> Result<Self> {
         let auth_token = auth_token
             .map(|token| token.trim().to_string())
@@ -5455,6 +5638,13 @@ impl ServeConfig {
             .ok_or_else(|| anyhow!("--auth-token or ADS_WEB_TOKEN is required for `ads serve`"))?;
         let max_upload_bytes = mib_to_bytes(max_upload_mb, "--max-upload-mb")?;
         let max_object_upload_bytes = mib_to_bytes(max_object_upload_mb, "--max-object-upload-mb")?;
+        let cors_allow_origins = cors_allow_origins
+            .iter()
+            .map(|origin| {
+                HeaderValue::from_str(origin)
+                    .map_err(|_| anyhow!("invalid --cors-allow-origin value: {origin}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         let profiles = if profiles.is_empty() {
             let store = store.ok_or_else(|| {
@@ -5489,6 +5679,7 @@ impl ServeConfig {
             profiles,
             max_upload_bytes,
             max_object_upload_bytes,
+            cors_allow_origins,
         })
     }
 }
@@ -5921,6 +6112,37 @@ fn manifest_view_marker(workspace: &Path, manifest_hash: &str) -> PathBuf {
         .join(format!("{manifest_hash}.complete"))
 }
 
+/// Sibling lock file guarding an in-flight manifest-view build. The builder
+/// holds an exclusive OS lock on it for the whole build so a concurrent
+/// `cache gc` (possibly in another process, possibly with `--staging-hours
+/// 0`) can tell a live build from a crashed one: the lock dies with the
+/// builder's process, whereas the temp folder's mtime does not move for
+/// writes in nested subdirs and its age says nothing at grace zero.
+fn view_build_lock_path(temp_root: &Path) -> PathBuf {
+    let mut file_name = temp_root
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_default();
+    file_name.push(".lock");
+    temp_root.with_file_name(file_name)
+}
+
+/// True when a live builder holds the build lock. A missing lock file means
+/// no builder (pre-lock leftovers or already-cleaned builds); any other
+/// failure to rule a builder out counts as held so gc never sweeps a build
+/// it cannot prove dead.
+fn view_build_lock_is_held(lock_path: &Path) -> bool {
+    match fs::File::open(lock_path) {
+        Ok(file) => match file.try_lock() {
+            // Acquired: the builder is gone. The lock releases again when
+            // `file` drops at the end of this match.
+            Ok(()) => false,
+            Err(_) => true,
+        },
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
 fn cache_object_path(workspace: &Path, entry: &ManifestEntry) -> PathBuf {
     let prefix = entry.sha256.get(0..2).unwrap_or("00");
     workspace
@@ -6068,6 +6290,52 @@ fn db_path(store: &Path) -> PathBuf {
 pub fn object_path(store: &Path, sha256: &str) -> PathBuf {
     let prefix = sha256.get(0..2).unwrap_or("00");
     objects_root(store).join(prefix).join(sha256)
+}
+
+/// Temp name for an in-flight write, appended to the full file name — a
+/// `with_extension` suffix would replace the blob extension, giving
+/// `<sha>.tx` and `<sha>.png` the same temp path. A pid-only suffix is not
+/// unique enough either: `ads serve` can run several writes of the same
+/// target concurrently in one process.
+fn temp_sibling_path(path: &Path) -> PathBuf {
+    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+    let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+    let mut file_name = path
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_default();
+    file_name.push(format!(".tmp.{}.{id}", std::process::id()));
+    path.with_file_name(file_name)
+}
+
+/// Copies `reader` into `temp_path` while hashing incrementally, and fails
+/// when the bytes do not match the claimed sha256 — callers only ever
+/// publish verified temp files.
+fn copy_hashed_to_temp(reader: &mut dyn Read, temp_path: &Path, sha256: &str) -> Result<u64> {
+    let mut file = File::create(temp_path)
+        .with_context(|| format!("failed to write temporary object {}", temp_path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut size = 0u64;
+    let mut buffer = [0u8; 1024 * 64];
+    loop {
+        let bytes_read = reader
+            .read(&mut buffer)
+            .context("failed to read object stream")?;
+        if bytes_read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..bytes_read]);
+        file.write_all(&buffer[..bytes_read])
+            .with_context(|| format!("failed to write temporary object {}", temp_path.display()))?;
+        size += bytes_read as u64;
+    }
+    // Close before the caller renames: Windows cannot move an open file.
+    drop(file);
+    let computed = hex::encode(hasher.finalize());
+    if computed != sha256 {
+        bail!("downloaded object hash mismatch: expected {sha256}, computed {computed}");
+    }
+    Ok(size)
 }
 
 fn hash_file(path: &Path) -> Result<(String, u64)> {
