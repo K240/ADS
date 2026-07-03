@@ -5,7 +5,7 @@ import mimetypes
 import os
 import subprocess
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, MutableMapping, Sequence
 from urllib.error import HTTPError, URLError
@@ -17,12 +17,15 @@ JsonObject = dict[str, Any]
 
 
 class AdsCommandError(RuntimeError):
-    """Raised when the local ADS CLI exits with a non-zero status."""
+    """Raised when the local ADS CLI exits with a non-zero status.
+
+    ``returncode`` is ``None`` when the CLI never exited (command timeout).
+    """
 
     def __init__(
         self,
         args: Sequence[str],
-        returncode: int,
+        returncode: int | None,
         stdout: str,
         stderr: str,
     ) -> None:
@@ -49,9 +52,14 @@ class AdsCli:
 
     This class is intentionally subprocess based so it works inside Houdini
     Python without compiling a native extension module.
+
+    ``timeout`` bounds every subprocess call in seconds; it defaults to
+    ``ADS_CLI_TIMEOUT_SECONDS`` when set and is otherwise unlimited (heavy
+    `wip add` runs on GB-scale sources legitimately take a long time).
     """
 
     executable: str | os.PathLike[str] = "ads"
+    timeout: float | None = field(default_factory=lambda: _default_cli_timeout())
 
     def init(
         self,
@@ -114,24 +122,31 @@ class AdsCli:
         category: str,
         asset_code: str,
         department: str,
-        version: int | str,
+        version: int | str | None = None,
+        source: str | os.PathLike[str] | None = None,
     ) -> str:
-        return self.run_text(
-            [
-                "add",
-                "--store",
-                _path(store),
-                *_workspace_args(workspace),
-                "--category",
-                category,
-                "--asset-code",
-                asset_code,
-                "--department",
-                department,
-                "--version",
-                version,
-            ]
-        )
+        # Mirrors the Rust CLI: --source registers an arbitrary folder and
+        # auto-assigns the next version when --version is omitted; the legacy
+        # workspace form locates the v### folder and so requires a version.
+        if source is None and version is None:
+            raise ValueError("add requires version unless source is provided")
+        args: list[str | int | os.PathLike[str]] = [
+            "add",
+            "--store",
+            _path(store),
+            *_workspace_args(workspace),
+            "--category",
+            category,
+            "--asset-code",
+            asset_code,
+            "--department",
+            department,
+        ]
+        if version is not None:
+            args += ["--version", version]
+        if source is not None:
+            args += ["--source", _path(source)]
+        return self.run_text(args)
 
     def info(
         self,
@@ -316,8 +331,6 @@ class AdsCli:
             "fetch",
             "--server",
             server,
-            "--auth-token",
-            auth_token,
             "--profile",
             profile,
             "--store",
@@ -339,7 +352,7 @@ class AdsCli:
             args.append("--materialize")
         if force:
             args.append("--force")
-        return self.run_text(args)
+        return self.run_text(args, env=_token_env(auth_token))
 
     def sync(
         self,
@@ -361,8 +374,6 @@ class AdsCli:
             "sync",
             "--server",
             server,
-            "--auth-token",
-            auth_token,
             "--profile",
             profile,
             "--store",
@@ -384,7 +395,7 @@ class AdsCli:
             args.append("--materialize")
         if force:
             args.append("--force")
-        return self.run_text(args)
+        return self.run_text(args, env=_token_env(auth_token))
 
     def push(
         self,
@@ -404,8 +415,6 @@ class AdsCli:
             "push",
             "--server",
             server,
-            "--auth-token",
-            auth_token,
             "--profile",
             profile,
             "--store",
@@ -423,7 +432,7 @@ class AdsCli:
             args.append("--latest")
         if set_current:
             args.append("--set-current")
-        return self.run_text(args)
+        return self.run_text(args, env=_token_env(auth_token))
 
     def checkout(
         self,
@@ -604,20 +613,54 @@ class AdsCli:
     def verify(self, *, store: str | os.PathLike[str]) -> str:
         return self.run_text(["verify", "--store", _path(store)])
 
-    def run_json(self, args: Sequence[str | int | os.PathLike[str]]) -> JsonObject:
-        text = self.run_text(args)
+    def run_json(
+        self,
+        args: Sequence[str | int | os.PathLike[str]],
+        *,
+        env: Mapping[str, str] | None = None,
+    ) -> JsonObject:
+        text = self.run_text(args, env=env)
         data = json.loads(text)
         if not isinstance(data, dict):
             raise ValueError("ADS command did not return a JSON object")
         return data
 
-    def run_text(self, args: Sequence[str | int | os.PathLike[str]]) -> str:
-        result = self.run(args)
+    def run_text(
+        self,
+        args: Sequence[str | int | os.PathLike[str]],
+        *,
+        env: Mapping[str, str] | None = None,
+    ) -> str:
+        result = self.run(args, env=env)
         return result.stdout.strip()
 
-    def run(self, args: Sequence[str | int | os.PathLike[str]]) -> subprocess.CompletedProcess[str]:
+    def run(
+        self,
+        args: Sequence[str | int | os.PathLike[str]],
+        *,
+        env: Mapping[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         cmd = [_path(self.executable), *[_path(arg) for arg in args]]
-        result = subprocess.run(cmd, text=True, capture_output=True, check=False)
+        try:
+            result = subprocess.run(
+                cmd,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=self.timeout,
+                env=dict(env) if env is not None else None,
+            )
+        except subprocess.TimeoutExpired:
+            # A wedged ads.exe must not hang the host (Houdini) forever.
+            # `from None` severs both cause and context: TimeoutExpired.cmd
+            # (and its str()) carries the unredacted argv, so chaining it
+            # would print secrets in tracebacks despite the redaction below.
+            raise AdsCommandError(
+                _redact_secrets(cmd),
+                None,
+                "",
+                f"ads command timed out after {self.timeout} seconds",
+            ) from None
         if result.returncode != 0:
             # Errors travel into logs and tracebacks; never carry credentials
             # along (the subprocess itself received the real values).
@@ -632,7 +675,9 @@ class AdsHttpClient:
     """Client for the ADS Web API served by `ads serve`."""
 
     base_url: str
-    token: str
+    # repr=False keeps the bearer token out of logs and tracebacks that
+    # stringify the client.
+    token: str = field(repr=False)
     timeout: float = 30.0
 
     def profiles(self) -> JsonObject:
@@ -708,6 +753,62 @@ class AdsHttpClient:
             },
         )
 
+    def wips(
+        self,
+        *,
+        profile: str = "main",
+        category: str,
+        asset_code: str,
+        department: str,
+    ) -> JsonObject:
+        return self.get(
+            "/api/wips",
+            {
+                "profile": profile,
+                "category": category,
+                "asset_code": asset_code,
+                "department": department,
+            },
+        )
+
+    def wip_import(
+        self,
+        manifest: Mapping[str, Any],
+        *,
+        profile: str = "main",
+        category: str,
+        asset_code: str,
+        department: str,
+        source_path: str | None = None,
+    ) -> JsonObject:
+        # Remote counterpart of `ads wip add` for stores held open by
+        # `ads serve`: every object in the manifest must already exist on the
+        # server (upload via upload_object first). source_path defaults
+        # server-side to category/asset_code/department.
+        #
+        # The server rejects manifests whose entries are not strictly
+        # ascending by relative_path (canonical form). Sorting here is safe
+        # because the server computes the manifest hash from what it
+        # receives; callers building entries in filesystem-listing order
+        # (case-insensitive on NTFS) would otherwise get a surprise 400.
+        # Duplicate paths are left for the server to reject with its message.
+        body = dict(manifest)
+        entries = body.get("entries")
+        if isinstance(entries, list):
+            body["entries"] = sorted(
+                entries, key=lambda entry: entry.get("relative_path", "")
+            )
+        payload: JsonObject = {
+            "profile": profile,
+            "category": category,
+            "asset_code": asset_code,
+            "department": department,
+            "manifest": body,
+        }
+        if source_path is not None:
+            payload["source_path"] = source_path
+        return self.post_json("/api/wip", payload)
+
     def object_bytes(self, sha256: str, *, profile: str = "main") -> bytes:
         return self.request_bytes(
             "GET",
@@ -746,6 +847,11 @@ class AdsHttpClient:
         *,
         profile: str = "main",
     ) -> JsonObject:
+        # The manifest's entries must already be strictly ascending by
+        # relative_path (canonical form) — the server rejects anything else.
+        # Unlike wip_import, no client-side sort is possible here: the
+        # record's manifest_hash was computed over the entry order, so
+        # reordering would break the hash check instead of fixing the sort.
         return self.put_json(
             "/api/version",
             {"profile": profile, "version_info": dict(version_info)},
@@ -1021,6 +1127,23 @@ def _redact_secrets(args: Sequence[str]) -> list[str]:
         if value in _SECRET_FLAGS:
             redacted[index + 1] = "***"
     return redacted
+
+
+def _token_env(auth_token: str) -> dict[str, str]:
+    # The token travels via the environment instead of argv so it never shows
+    # up in process listings (Task Manager, ps). The Rust CLI reads
+    # ADS_WEB_TOKEN for every --server command.
+    return {**os.environ, "ADS_WEB_TOKEN": auth_token}
+
+
+def _default_cli_timeout() -> float | None:
+    value = os.environ.get("ADS_CLI_TIMEOUT_SECONDS", "").strip()
+    if not value:
+        return None
+    timeout = float(value)
+    if timeout <= 0:
+        raise ValueError("ADS_CLI_TIMEOUT_SECONDS must be greater than zero")
+    return timeout
 
 
 def _path(value: str | int | os.PathLike[str]) -> str:

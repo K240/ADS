@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import warnings
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -11,8 +12,12 @@ from urllib.parse import parse_qs, urlsplit
 from .client import AdsCli, AdsCommandError
 
 
-ADS_URI_RE = re.compile(r"ads://[^\s\"'<>@,)\]}]+")
-ASSET_TOKEN_RE = re.compile(r"@([^@\n\r]+)@")
+# Angle brackets are URI terminators except for complete <...> tokens, so
+# placeholder segments like <UDIM> or <F4> stay part of the dependency.
+ADS_URI_RE = re.compile(r"ads://(?:<[^<>@\s]+>|[^\s\"'<>@,)\]}])+")
+# USD asset paths are @...@, or @@@...@@@ when the path itself contains @
+# (single @ inside the triple form is literal).
+ASSET_TOKEN_RE = re.compile(r"@@@([^\n\r]+?)@@@|@([^@\n\r]+)@")
 VERSION_RE = re.compile(r"^v[0-9]+$")
 
 
@@ -60,14 +65,15 @@ class DependencyPlan:
 def collect_usd_dependencies(root: str | Path) -> list[str]:
     """Collect unique USD dependency paths.
 
-    OpenUSD Python is used when available. Text USD fallback is intentionally
+    OpenUSD Python is used when available. The text USD fallback runs only
+    when pxr is unavailable or fails (with a warning); it is intentionally
     conservative and supports local .usd/.usda recursion only.
     """
 
     root_path = Path(root)
-    paths: list[str] = []
-    paths.extend(_collect_with_pxr(root_path))
-    paths.extend(_collect_from_text_usd(root_path, set()))
+    paths = _collect_with_pxr(root_path)
+    if paths is None:
+        paths = _collect_from_text_usd(root_path, set())
     return _unique(paths)
 
 
@@ -264,16 +270,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 1 if any(item.action == "error" for item in plan.dependencies) else 0
 
 
-def _collect_with_pxr(root: Path) -> list[str]:
+def _collect_with_pxr(root: Path) -> list[str] | None:
+    """Collect dependencies via OpenUSD, or ``None`` to use the text fallback."""
+
     try:
         from pxr import UsdUtils  # type: ignore
-    except Exception:
-        return []
+    except Exception as error:
+        warnings.warn(
+            f"OpenUSD (pxr) is unavailable, falling back to text USD scanning: {error}",
+            RuntimeWarning,
+        )
+        return None
 
     try:
         layers, assets, unresolved = UsdUtils.ComputeAllDependencies(str(root))
-    except Exception:
-        return []
+    except Exception as error:
+        warnings.warn(
+            f"UsdUtils.ComputeAllDependencies failed for {root}, "
+            f"falling back to text USD scanning: {error}",
+            RuntimeWarning,
+        )
+        return None
 
     paths: list[str] = []
     for layer in layers:
@@ -282,8 +299,18 @@ def _collect_with_pxr(root: Path) -> list[str]:
             if value:
                 paths.append(str(value))
                 break
+        # ads:// references usually land in unresolvedPaths, but composition
+        # metadata is queried per layer as well so pinned/odd forms are not
+        # missed. Deliberately no ExportToString here: serializing every
+        # layer costs seconds and GBs on production scenes.
         try:
-            paths.extend(_extract_ads_uris(layer.ExportToString()))
+            for value in layer.GetCompositionAssetDependencies():
+                paths.extend(_extract_ads_uris(str(value)))
+        except Exception:
+            pass
+        try:
+            for value in layer.externalReferences:
+                paths.extend(_extract_ads_uris(str(value)))
         except Exception:
             pass
     for value in [*assets, *unresolved]:
@@ -308,8 +335,10 @@ def _collect_from_text_usd(path: Path, seen: set[Path]) -> list[str]:
         return []
 
     paths = _extract_ads_uris(text)
-    for token in ASSET_TOKEN_RE.findall(text):
-        token = token.strip()
+    for match in ASSET_TOKEN_RE.finditer(text):
+        token = (match.group(1) or match.group(2) or "").strip()
+        if not token:
+            continue
         if token.startswith("ads://"):
             paths.append(token)
             continue

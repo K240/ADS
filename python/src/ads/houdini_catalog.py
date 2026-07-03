@@ -20,7 +20,9 @@ class CatalogConfig:
     category: str | None = None
     department: str | None = None
     resolve_mode: str = "auto"
-    timeout: float = 30.0
+    # Interactive default: husd datasource calls block the Houdini UI thread,
+    # so a dead server must fail fast rather than hang the gallery.
+    timeout: float = 5.0
 
 
 @dataclass
@@ -66,9 +68,10 @@ def parse_datasource_args(
         or "auto"
     ).strip()
 
-    timeout = 30.0
-    if values.get("timeout"):
-        timeout = float(values["timeout"])
+    timeout = 5.0
+    timeout_value = values.get("timeout") or env.get("ADS_CATALOG_TIMEOUT_SECONDS")
+    if timeout_value:
+        timeout = float(timeout_value)
         if timeout <= 0:
             raise ValueError("timeout must be greater than zero")
 

@@ -161,6 +161,21 @@ from ads.houdini_wip import commit_staged
 commit_staged()
 ```
 
+The output processor records its staging run id inside the Houdini process
+(module state in `ads.houdini_wip`), so `commit_staged()` commits exactly the
+run the ROP just wrote — no manual run id wiring is needed. The id is
+deliberately not published to the environment: os.environ leaks into child
+processes (farm submitters snapshot it), which would cross-link unrelated
+renders into one run. Cleanup removes only the committed target's staged
+files, and other staging runs found on disk are never committed
+automatically — they may belong to a live concurrent session; leftovers are
+reported in a warning and removed by `ads cache gc --staging-hours`. When
+nothing is staged, `commit_staged()` warns and returns without raising, so a
+post-render hook cannot break the render; when `ads wip add` itself fails,
+the run id is kept so the next `commit_staged()` retries. Set
+`ADS_WIP_RUN_ID` yourself only when an external process must commit one
+specific run — never share one id across concurrent tasks.
+
 `commit_staged()` runs `ads wip add` on the staged folder, advances the WIP
 head, and removes the staging copy; the bytes live on in the content-addressed
 store. Re-registering unchanged content returns the existing head instead of

@@ -6,7 +6,9 @@ Phase 1 is intentionally pure Python and uses only the standard library. It is d
 
 ## Local CLI API
 
-`AdsCli` wraps the `ads` executable.
+`AdsCli` wraps the `ads` executable. Set `ADS_CLI_TIMEOUT_SECONDS` (or pass
+`AdsCli(timeout=...)`) to bound every CLI call; when unset, commands may run
+as long as they need (heavy `wip add` runs on large sources take a while).
 
 ```python
 from ads import AdsCli
@@ -53,6 +55,21 @@ ads.add(
 )
 ```
 
+The legacy workspace form locates the conventional
+`<category>/<asset-code>/<department>/v###` folder and therefore requires an
+explicit version:
+
+```python
+ads.add(
+    store=r"D:\store",
+    workspace=r"D:\workspace",
+    category="char",
+    asset_code="hero",
+    department="model",
+    version=3,
+)
+```
+
 Resolve an ADS URI:
 
 ```python
@@ -91,7 +108,9 @@ ads.publish_validate(
 ads.publish_validate(source=r"D:\delivery\hero_model_fix")
 ```
 
-Fetch a remote version into a local store:
+Fetch a remote version into a local store. `auth_token` is handed to the CLI
+through the `ADS_WEB_TOKEN` environment variable instead of argv, so it never
+shows up in process listings:
 
 ```python
 ads.fetch(
@@ -177,6 +196,36 @@ info = client.version_info(
 data = client.object_bytes(info["manifest"]["entries"][0]["sha256"], profile="main")
 status = client.object_status(info["manifest"]["entries"][0]["sha256"], profile="main")
 client.import_thumbnail_info(thumbnail_record, profile="main")
+```
+
+Register a WIP micro-version on a served store. This is the remote
+counterpart of `ads wip add` for when `ads serve` holds the store's RocksDB
+lock: upload every manifest object first (`upload_object`), then post the
+manifest. `source_path` defaults server-side to
+`category/asset_code/department`. The server requires the canonical manifest
+form (entries strictly ascending by `relative_path`, no duplicates);
+`wip_import` sorts the entries for you, duplicates are rejected with a 400.
+
+```python
+wips = client.wips(
+    profile="main",
+    category="char",
+    asset_code="hero",
+    department="model",
+)
+
+outcome = client.wip_import(
+    {
+        "entries": [
+            {"relative_path": "hero.usd", "sha256": sha, "size": size, "mode": 33188},
+        ]
+    },
+    profile="main",
+    category="char",
+    asset_code="hero",
+    department="model",
+)
+# outcome: {"created": ..., "seq": ..., "manifest_hash": ..., "file_count": ..., "total_bytes": ...}
 ```
 
 ## USD Dependency Utility

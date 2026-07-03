@@ -8,7 +8,9 @@ Register the staged result from the ROP post-render script:
     commit_staged()
 """
 
-from ads.houdini_wip import WipStaging
+import os
+
+from ads.houdini_wip import WipStaging, process_run_id
 from husd.outputprocessor import OutputProcessor
 
 
@@ -24,6 +26,14 @@ class AdsWipStagingOutputProcessor(OutputProcessor):
     def __init__(self):
         super().__init__()
         self._staging = WipStaging.from_environment()
+        # husd builds a fresh processor per save, but one render saves the
+        # root layer and sublayers separately: every save joins the
+        # interpreter's shared run so the post-render commit_staged()
+        # registers them as a single micro-version. The run id deliberately
+        # stays out of os.environ — it leaks into child processes there and
+        # cross-links unrelated renders. An explicit ADS_WIP_RUN_ID pin wins.
+        if not os.environ.get("ADS_WIP_RUN_ID"):
+            self._staging.run_id = process_run_id()
 
     def processSavePath(self, asset_path, referencing_layer_path, asset_is_layer):
         return self._staging.redirect(asset_path)

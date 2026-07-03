@@ -1,6 +1,9 @@
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from ads.client import AdsCommandError
 from ads.usd_deps import (
@@ -67,6 +70,148 @@ def Xform "sub" (
             [
                 "ads://char/hero/model/hero.usd",
                 "ads://prop/crate/model/crate.usd?v=v003",
+            ],
+        )
+
+    def test_udim_style_tokens_stay_part_of_the_uri(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "root.usda"
+            root.write_text(
+                """
+#usda 1.0
+def Material "skin"
+{
+    asset inputs:file = @ads://tex/skin/lookdev/skin.<UDIM>.tx@
+    asset inputs:cache = "ads://fx/burn/sim/cache.<F4>.vdb"
+}
+""",
+                encoding="utf-8",
+            )
+
+            ads_dependencies = collect_ads_dependencies(root)
+
+        self.assertEqual(
+            ads_dependencies,
+            [
+                "ads://tex/skin/lookdev/skin.<UDIM>.tx",
+                "ads://fx/burn/sim/cache.<F4>.vdb",
+            ],
+        )
+
+    def test_triple_at_escaped_asset_paths_are_collected(self):
+        # USD escapes asset paths containing @ as @@@...@@@; a single @
+        # inside the triple form is literal.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "root.usda"
+            root.write_text(
+                """
+#usda 1.0
+def Xform "root" (
+    references = @@@D:/textures/tex@4k/hero.usd@@@
+)
+{
+}
+""",
+                encoding="utf-8",
+            )
+
+            all_dependencies = collect_usd_dependencies(root)
+
+        self.assertIn("D:/textures/tex@4k/hero.usd", all_dependencies)
+
+    def test_mixed_file_with_udim_escaped_and_plain_references(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "root.usda"
+            root.write_text(
+                """
+#usda 1.0
+def Xform "root" (
+    references = [
+        @ads://char/hero/model/hero.usd@,
+        @@@D:/textures/tex@4k/hero.usd@@@
+    ]
+)
+{
+    asset inputs:file = @ads://tex/skin/lookdev/skin.<UDIM>.tx@
+}
+""",
+                encoding="utf-8",
+            )
+
+            all_dependencies = collect_usd_dependencies(root)
+            ads_dependencies = collect_ads_dependencies(root)
+
+        self.assertIn("D:/textures/tex@4k/hero.usd", all_dependencies)
+        self.assertEqual(
+            ads_dependencies,
+            [
+                "ads://char/hero/model/hero.usd",
+                "ads://tex/skin/lookdev/skin.<UDIM>.tx",
+            ],
+        )
+
+    def test_missing_pxr_warns_before_text_fallback(self):
+        # The plain test environment has no pxr; downgrading to the text
+        # scanner must be loud, not silent.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "root.usda"
+            root.write_text("#usda 1.0\n", encoding="utf-8")
+
+            with self.assertWarns(RuntimeWarning):
+                collect_usd_dependencies(root)
+
+    def test_pxr_path_uses_dependency_metadata_without_serializing(self):
+        # Structural check with a stubbed pxr: ads:// dependencies come from
+        # ComputeAllDependencies results and per-layer composition metadata,
+        # never from ExportToString, and the text fallback stays off. The
+        # real-pxr behavior is covered by the hython smoke test.
+        class FakeLayer:
+            def __init__(self, identifier):
+                self.identifier = identifier
+                self.realPath = identifier
+
+            def GetCompositionAssetDependencies(self):
+                return ["ads://char/hero/model/hero.usd", "./local.usd"]
+
+            @property
+            def externalReferences(self):
+                return ["ads://tex/skin/lookdev/skin.<UDIM>.tx"]
+
+            def ExportToString(self):
+                raise AssertionError("pxr path must not serialize layers")
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "root.usda"
+            root.write_text(
+                """
+#usda 1.0
+def Xform "root" (
+    references = @ads://only/in/text/never.usd@
+)
+{
+}
+""",
+                encoding="utf-8",
+            )
+
+            layer = FakeLayer(str(root))
+            fake_pxr = types.ModuleType("pxr")
+            fake_pxr.UsdUtils = types.SimpleNamespace(
+                ComputeAllDependencies=lambda path: (
+                    [layer],
+                    ["D:/textures/wood.jpg"],
+                    ["ads://prop/crate/model/crate.usd?v=3"],
+                )
+            )
+            with patch.dict(sys.modules, {"pxr": fake_pxr}):
+                ads_dependencies = collect_ads_dependencies(root)
+
+        self.assertEqual(
+            ads_dependencies,
+            [
+                "ads://char/hero/model/hero.usd",
+                "ads://tex/skin/lookdev/skin.<UDIM>.tx",
+                "ads://prop/crate/model/crate.usd?v=3",
             ],
         )
 

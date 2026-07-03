@@ -65,6 +65,19 @@ class CatalogConfigTests(unittest.TestCase):
         self.assertEqual(config.token, "web-token")
         self.assertEqual(config.resolve_mode, "remote")
 
+    def test_parse_datasource_args_timeout_default_env_and_args(self):
+        base_env = {"ADS_CATALOG_SERVER": "http://catalog", "ADS_WEB_TOKEN": "t"}
+
+        # Interactive default: datasource calls block the Houdini UI thread.
+        self.assertEqual(parse_datasource_args(None, base_env).timeout, 5.0)
+
+        env = {**base_env, "ADS_CATALOG_TIMEOUT_SECONDS": "2.5"}
+        self.assertEqual(parse_datasource_args(None, env).timeout, 2.5)
+        self.assertEqual(parse_datasource_args("timeout=7", env).timeout, 7.0)
+
+        with self.assertRaises(ValueError):
+            parse_datasource_args(None, {**base_env, "ADS_CATALOG_TIMEOUT_SECONDS": "0"})
+
 
 class CatalogIndexTests(unittest.TestCase):
     def test_builds_nested_category_tree_and_leaf_ids(self):
@@ -188,6 +201,99 @@ class HoudiniDataSourcePluginTests(unittest.TestCase):
 
         blind_data = json.loads(datasource.blindData(item_id).decode("ascii"))
         self.assertEqual(blind_data["ads_uri"], "ads://show/char/hero/model/hero.usd")
+
+
+class _FlakyCatalogHandler(_CatalogHandler):
+    fail = False
+
+    def do_GET(self):  # noqa: N802
+        if self.__class__.fail and self.path.startswith("/api/resolve"):
+            self.__class__.resolve_requests += 1
+            # Drop the connection with no response bytes: the same
+            # client-visible failure mode as a crashed server.
+            raise ConnectionError("simulated dead server")
+        if self.__class__.fail and self.path == "/thumb.png":
+            self.__class__.thumb_requests += 1
+            raise ConnectionError("simulated dead server")
+        super().do_GET()
+
+
+class _QuietThreadingHTTPServer(ThreadingHTTPServer):
+    def handle_error(self, request, client_address):
+        # Simulated connection drops are expected; keep test output clean.
+        pass
+
+
+class HoudiniDataSourceCooldownTests(unittest.TestCase):
+    def setUp(self):
+        _FlakyCatalogHandler.thumb_requests = 0
+        _FlakyCatalogHandler.resolve_requests = 0
+        _FlakyCatalogHandler.fail = False
+        self.server = _QuietThreadingHTTPServer(("127.0.0.1", 0), _FlakyCatalogHandler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        host, port = self.server.server_address
+        self.base_url = f"http://{host}:{port}"
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+
+    def _make_datasource(self):
+        module = _load_ads_datasource_module()
+        with patch.dict("os.environ", {"ADS_TEST_TOKEN": "secret"}):
+            return module.AdsDataSource(
+                "ADS",
+                f"server={self.base_url};profile=main;token_env=ADS_TEST_TOKEN;timeout=2",
+            )
+
+    def test_thumbnail_failure_skips_network_during_cooldown(self):
+        datasource = self._make_datasource()
+        item_id = "ads:asset:show/char/hero/model"
+        self.assertTrue(datasource.isValid())
+
+        _FlakyCatalogHandler.fail = True
+        self.assertIsNone(datasource.thumbnail(item_id))
+        self.assertEqual(_FlakyCatalogHandler.thumb_requests, 1)
+        self.assertTrue(datasource._network_error)
+        # A transient transport failure must not invalidate a loaded,
+        # browsable catalog.
+        self.assertTrue(datasource.isValid())
+
+        # A second call inside the cooldown must not touch the network.
+        self.assertIsNone(datasource.thumbnail(item_id))
+        self.assertEqual(_FlakyCatalogHandler.thumb_requests, 1)
+
+        # The breaker covers resolve too: an immediate error, no request.
+        message = datasource.prepareItemForUse(item_id)
+        self.assertIn("unavailable", message)
+        self.assertEqual(_FlakyCatalogHandler.resolve_requests, 0)
+
+        # Once the server recovers and the cooldown elapses, success resets
+        # the error state.
+        _FlakyCatalogHandler.fail = False
+        with datasource._lock:
+            datasource._cooldown_until = 0.0
+        self.assertEqual(datasource.thumbnail(item_id), b"thumbnail-bytes")
+        self.assertEqual(_FlakyCatalogHandler.thumb_requests, 2)
+        self.assertEqual(datasource._network_error, "")
+        self.assertTrue(datasource.isValid())
+        self.assertEqual(datasource.prepareItemForUse(item_id), "")
+        self.assertEqual(_FlakyCatalogHandler.resolve_requests, 1)
+
+    def test_resolve_failure_skips_network_during_cooldown(self):
+        datasource = self._make_datasource()
+        item_id = "ads:asset:show/char/hero/model"
+
+        _FlakyCatalogHandler.fail = True
+        message = datasource.prepareItemForUse(item_id)
+        self.assertIn("ADS resolve failed", message)
+        self.assertEqual(_FlakyCatalogHandler.resolve_requests, 1)
+
+        message = datasource.prepareItemForUse(item_id)
+        self.assertIn("unavailable", message)
+        self.assertEqual(_FlakyCatalogHandler.resolve_requests, 1)
 
 
 def _load_ads_datasource_module():

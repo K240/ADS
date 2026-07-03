@@ -4,29 +4,40 @@ from __future__ import annotations
 
 import html
 import threading
+import time
 import urllib.error
 import urllib.request
 
 import hou
 import husd
 
-from ads.client import AdsHttpClient
+from ads.client import AdsHttpClient, AdsHttpError
 from ads.houdini_catalog import CatalogConfig, CatalogIndex, asset_uri, parse_datasource_args
 
 
 class AdsDataSource(husd.datasource.DataSource):
     _SOURCE_NAMES = ("ADS", "ads://catalog")
     _THUMBNAIL_CACHE_LIMIT = 256
+    # husd calls run on the UI thread; after a transport failure every item
+    # would otherwise block for a full timeout again, so network calls are
+    # skipped for this cooldown and placeholders are served instead.
+    _NETWORK_COOLDOWN_SECONDS = 30.0
 
     def __init__(self, source_identifier, args):
         super(AdsDataSource, self).__init__(source_identifier, args)
         self._config = None
         self._client = None
         self._index = CatalogIndex([])
-        # Houdini panels may query thumbnails from several threads.
+        # Houdini panels may query thumbnails from several threads; the lock
+        # also guards the failure-cooldown state.
         self._thumbnail_cache = {}
-        self._thumbnail_lock = threading.Lock()
+        self._lock = threading.Lock()
         self._last_error = ""
+        # Transient transport failures (thumbnail/resolve) are tracked apart
+        # from _last_error: one dropped request must not flip isValid() for a
+        # catalog that is loaded and browsable.
+        self._network_error = ""
+        self._cooldown_until = 0.0
         self._load(args)
 
     @staticmethod
@@ -59,6 +70,8 @@ class AdsDataSource(husd.datasource.DataSource):
                 detail += "<br/>Filters: {}".format(html.escape(", ".join(filters)))
             if self._last_error:
                 detail += "<br/>Error: {}".format(html.escape(self._last_error))
+            if self._network_error:
+                detail += "<br/>Network: {}".format(html.escape(self._network_error))
         return """
             <html>
                 <body>
@@ -99,16 +112,23 @@ class AdsDataSource(husd.datasource.DataSource):
         scheme = url.split(":", 1)[0].lower() if ":" in url else ""
         if scheme not in ("http", "https"):
             return None
-        with self._thumbnail_lock:
+        with self._lock:
             if url in self._thumbnail_cache:
                 return self._thumbnail_cache[url]
+        if not self._network_allowed():
+            return None
         try:
             request = urllib.request.Request(url, headers=self._thumbnail_headers(url))
             with urllib.request.urlopen(request, timeout=self._config.timeout) as response:
                 data = response.read()
-        except (OSError, urllib.error.URLError, urllib.error.HTTPError):
+        except urllib.error.HTTPError:
+            # The server answered; only transport failures trip the cooldown.
             return None
-        with self._thumbnail_lock:
+        except (urllib.error.URLError, OSError) as error:
+            self._record_network_failure("thumbnail request failed: {}".format(error))
+            return None
+        self._record_network_success()
+        with self._lock:
             if len(self._thumbnail_cache) >= self._THUMBNAIL_CACHE_LIMIT:
                 self._thumbnail_cache.pop(next(iter(self._thumbnail_cache)))
             self._thumbnail_cache[url] = data
@@ -150,6 +170,10 @@ class AdsDataSource(husd.datasource.DataSource):
             return ""
         if self._client is None or self._config is None:
             return self._last_error or "ADS catalog is not connected."
+        if not self._network_allowed():
+            return "ADS server unavailable, retrying later: {}".format(
+                self._network_error or "network failure"
+            )
         try:
             self._client.resolve(
                 asset_uri(asset),
@@ -157,7 +181,10 @@ class AdsDataSource(husd.datasource.DataSource):
                 mode=self._config.resolve_mode,
             )
         except Exception as error:
+            if _is_network_failure(error):
+                self._record_network_failure(error)
             return "ADS resolve failed: {}".format(error)
+        self._record_network_success()
         return ""
 
     def _load(self, args):
@@ -180,6 +207,22 @@ class AdsDataSource(husd.datasource.DataSource):
             self._client = None
             self._index = CatalogIndex([])
             self._last_error = str(error)
+            if _is_network_failure(error):
+                self._record_network_failure(error)
+
+    def _network_allowed(self):
+        with self._lock:
+            return time.monotonic() >= self._cooldown_until
+
+    def _record_network_failure(self, error):
+        with self._lock:
+            self._cooldown_until = time.monotonic() + self._NETWORK_COOLDOWN_SECONDS
+            self._network_error = str(error)
+
+    def _record_network_success(self):
+        with self._lock:
+            self._cooldown_until = 0.0
+            self._network_error = ""
 
     def _thumbnail_headers(self, url):
         if self._config is None:
@@ -195,6 +238,16 @@ class AdsDataSource(husd.datasource.DataSource):
             raise ValueError("ADS catalog server is not configured.")
         if not config.token:
             raise ValueError("ADS catalog API token is not configured.")
+
+
+def _is_network_failure(error):
+    # HTTP-level errors mean the server answered; only transport failures
+    # (refused, reset, timeout) justify skipping network calls for a while.
+    if isinstance(error, AdsHttpError):
+        return error.status == 0
+    if isinstance(error, urllib.error.HTTPError):
+        return False
+    return isinstance(error, (urllib.error.URLError, OSError))
 
 
 def registerDataSources(manager):
