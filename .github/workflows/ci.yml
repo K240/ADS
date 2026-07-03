@@ -16,14 +16,33 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
       - name: Install native build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y clang libclang-dev
+      - name: Rustfmt
+        run: cargo fmt --check
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        run: cargo test
+
+  rust-windows:
+    name: Rust (Windows)
+    runs-on: windows-latest
+    # librocksdb-sys builds RocksDB from source with MSVC; a cold cache can
+    # take far longer than the Linux job.
+    timeout-minutes: 90
+    env:
+      # bindgen (librocksdb-sys) needs libclang; the runner image ships LLVM
+      # here and there is no apt equivalent on Windows.
+      LIBCLANG_PATH: 'C:\Program Files\LLVM\bin'
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: Test
         run: cargo test
 
@@ -41,3 +60,52 @@ jobs:
         env:
           PYTHONPATH: src
         run: uv run python -m unittest discover -s tests -v
+
+  python-windows:
+    name: Python (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v5
+      - name: Unit tests
+        working-directory: python
+        env:
+          PYTHONPATH: src
+        run: uv run python -m unittest discover -s tests -v
+
+  resolver:
+    name: Resolver (POSIX compile check)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        # setup-micromamba only activates the environment in login shells.
+        shell: bash -el {0}
+    steps:
+      - uses: actions/checkout@v5
+      # There is no Houdini in CI, so the resolver is checked against stock
+      # OpenUSD headers from conda-forge instead (tbb-devel and python come
+      # along as pinned run deps of openusd). This exists because the POSIX
+      # branch is otherwise dead code that only Houdini/Windows builds see.
+      - uses: mamba-org/setup-micromamba@v3
+        with:
+          environment-name: usd
+          condarc: |
+            channels:
+              - conda-forge
+          create-args: >-
+            openusd=26.05
+          cache-environment: true
+      - name: Compile check
+        # -fsyntax-only still runs full semantic analysis, which is enough to
+        # catch rot in the non-Windows branch; linking a loadable plugin would
+        # need the whole USD link line for no extra signal.
+        run: |
+          PY_INCLUDE="$(python -c 'import sysconfig; print(sysconfig.get_paths()["include"])')"
+          g++ -std=c++17 -fsyntax-only \
+            -isystem "$CONDA_PREFIX/include" \
+            -isystem "$PY_INCLUDE" \
+            resolver/src/AdsResolver.cpp
