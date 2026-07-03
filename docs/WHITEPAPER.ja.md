@@ -621,6 +621,7 @@ PUT  /api/thumbnail
 GET  /api/thumbnail-url
 GET  /api/resolve
 GET  /api/wips
+POST /api/wip
 POST /api/promote
 POST /api/gc
 ```
@@ -629,11 +630,17 @@ POST /api/gc
 
 `/api/wips` は部門のWIPストリーム一覧、`/api/promote` はWIPのpublish昇格(CLIと同じ参照検証ゲートをデフォルト実行、`no_validate` で回避)、`/api/gc` は中央サーバのstoreに対するmark-and-sweep GC(CLIと同じ既定: retention 20 / 猶予24h)です。WebAppのインスペクタにはWIP Streamセクションがあり、ブラウザからの昇格と `?v=wip` URIコピーに対応します。
 
+`POST /api/wip` は `ads wip add` のremote版で、serveがstoreを開いたままWIP micro-versionを登録します。manifest(`entries` の `relative_path` / `sha256` / `size` / `mode`)をJSONで送り、参照するobjectは事前に `PUT /api/object` でアップロードしておく必要があります(欠けているhashは400で列挙されます)。manifestは正準形が必須です: `entries` は `relative_path` のバイト昇順で、重複パスは拒否されます(順序がhashに入るため、非正準を受理するとdedupが静かに壊れます)。`PUT /api/version` も同じ検証を通ります。`source_path` を省略するとlocal `wip add` と同じく `category/asset_code/department` が記録されます。Python APIでは `AdsHttpClient.wip_import()` が対応し、entriesはクライアント側で自動的に正準順へソートされます。
+
+`GET /api/object` はstreaming転送で、`Accept-Ranges: bytes` と単一range指定(`Range: bytes=a-b`、206/416応答)に対応します。`PUT /api/object` もbodyをstreamのままhash検証しながらtemp fileへ書き込むため、object sizeはサーバのメモリに制約されません。
+
 APIはBearer token必須です。
 
 ```text
 Authorization: Bearer <token>
 ```
+
+エラー応答はHTTP statusで区別します。参照先が存在しないlookup失敗(asset/version/wip/object等)は404、サーバ内部のI/O障害は500(bodyは汎用メッセージのみで詳細はサーバログへ)、それ以外の入力起因エラーはメッセージ付きの400です。
 
 ブラウザから任意のローカルパスを指定することはできません。起動時に許可されたprofileのみを扱います。
 
@@ -741,15 +748,15 @@ $env:PXR_PLUGINPATH_NAME = "D:\path\to\ads\resolver\build\houdini\resources"
 
 `ADS_RESOLVER_MODE` のdefaultは `local` です。解決時にstoreからmanifest viewが自動的に実体化されるため、事前のpull操作は不要です(local storeに対象objectが必要です)。
 
-remote modeでは、Resolverは `ads.exe` を呼び出さず、`ADS_RESOLVER_SERVER` で指定されたcentral ADS APIへ直接問い合わせます。`/api/resolve` が返すremote object URLをnative HTTP backendで取得し、USDへ `ArInMemoryAsset` として渡します。これはworkspaceにversion folderを生成しない読み取り経路です。
+remote modeでは、Resolverは `ads.exe` を呼び出さず、`ADS_RESOLVER_SERVER` で指定されたcentral ADS APIへ直接問い合わせます。`/api/resolve` が返すremote object URLはnative HTTP backendで一度だけ取得され、workspaceのflat blob cache(content-addressed、sha256検証つき)へ実体化された上で通常のファイルとして開かれます。葉ファイルはcacheファイルのパスへ解決され、合成形式(usd/usda/usdc/usdz/mtlx)は相対参照が `ads://` へ再anchorされるよう `ads://` URIのまま解決してbyteだけをcacheから読みます。cache directoryが使えない場合のみ `ArInMemoryAsset` へフォールバックします。これはworkspaceにversion folderを生成しない読み取り経路です。
 
 ```text
 USD / Houdini
   -> ArResolver receives ads://hero/model/hero.usd
   -> GET /api/resolve?profile=main&asset_path=ads://hero/model/hero.usd&mode=remote
   -> http://asset-server/objects/sha256/ab/abcd...
-  -> native HTTP download
-  -> ArInMemoryAsset opens the remote object bytes
+  -> native HTTP download into <workspace>/.ads-cache/sha256/ab/abcd....usd
+  -> ArFilesystemAsset opens the cached blob(cache不可時はArInMemoryAsset)
 ```
 
 remote modeに必要な環境変数:
@@ -792,7 +799,7 @@ buildはHoudini toolkitの `hcustom.exe -U` を使います。
 - `ads://...` referenceを含むUSD stage open
 - remote modeでのroot layer、payload、sublayer、texture objectの直接読み込み
 
-remote object URLは直接読めます。ただし現状は対象object全体をmemoryにbufferするMVPです。production向けには、range request、streaming、retry、cache policyを備えた専用 `ArAsset` 実装へ発展させます。
+remote object URLは直接読めます。取得したobjectはディスク上のflat blob cacheへ実体化され、再取得なしで再利用されます(memory bufferingはcache directoryが使えない場合のフォールバック)。production向けには、range request、streaming、retryを備えた専用 `ArAsset` 実装へ発展させます。
 
 ## Houdini USD ROP Publish
 
@@ -839,6 +846,7 @@ ADS WebAppはLAN内運用を想定しています。初期版のセキュリテ�
 - ブラウザから任意store/workspace pathは入力不可
 - thumbnail uploadはPNG、JPEG、WebPのみ許可
 - upload sizeは `--max-upload-mb` で制限
+- CORSは既定で無効(CORSヘッダを一切付与しない)。別オリジンのブラウザアプリからAPIを叩く場合のみ `ads serve --cors-allow-origin <origin>`(複数指定可)で対象オリジンを明示的に許可する
 
 一方で、初期版は組織認証、ユーザーごとの権限、監査ログ、ACL、署名URL発行などは実装しません。インターネット公開ではなく、信頼できるLANまたはVPN配下での運用を前提とします。
 
@@ -910,7 +918,7 @@ cargo test
 - schema migrationは未実装。開発中storeは再作成前提。
 - WebAppからのasset作成や登録は未実装。
 - multi-user lock、review、approval、publish gateは未実装。
-- C++ USD Resolverのremote direct readはin-memory MVP。range request / streaming / retry policyは未実装。
+- C++ USD Resolverのremote direct readはobjectをディスクのblob cacheへ一括取得して開く(cache不可時はin-memory fallback)。server側の `/api/object` はstreaming転送とRange request(単一範囲)に対応済みだが、Resolver側はこれを利用せず、range read / streaming / retry policyは未実装。
 - Windows Resolver remote modeはWinHTTP native backendを実装済み。macOS/Linux向けnative library backendは未実装で、今後libcurl等のlibrary backendを追加する方針。
 
 これらは意図的に初期スコープ外としています。まずはversion folder、dedup store、Resolver向けURI、Web browserを最小構成で成立させることを優先しています。

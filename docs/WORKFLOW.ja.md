@@ -109,6 +109,10 @@ from ads.houdini_wip import commit_staged; commit_staged()
 
 これで書き出し完了ごとにWIP micro-versionが登録され、stagingは消えます。同一内容の書き出しは新しいWIPを作りません(dedup)。
 
+- Output Processorはstaging run idを**同一Houdiniプロセス内**(ads.houdini_wipモジュール)に記録するため、`commit_staged()` は直前に書き出したrunを確実に登録します(手動設定は不要)。環境変数には公開しません — 子プロセス(ファーム投入等)に漏れて無関係なレンダのrunが混線するためです。別プロセスから特定のrunを登録したい場合のみ `ADS_WIP_RUN_ID` を明示的に設定します(**並行するタスク間で同じidを共有しないでください**)
+- 登録後のクリーンアップは自分のターゲットのstagingだけを削除します。走査で見つかった他のstaging runは**自動登録されません** — 並行セッションが書き込み中のrunを登録すると壊れたWIPになるためです。残骸は警告で報告され、`ads cache gc --staging-hours` が削除します
+- 何もstagingされていなければ、確認したパスを含む警告を出して終了します(例外は投げないため、post-renderフックがレンダを壊すことはありません)。`wip add` の失敗時はrun idが保持され、次回の `commit_staged()` が再試行します
+
 登録時のスキャンはstatベースのハッシュメモ(`<source>/.ads-cache/hash-index.json`)で高速化されており、(mtime, size)が変わっていないファイルは読み直しません(実測: 120ファイル/120MBで初回2.3秒→変更なし再登録0.05秒)。メモはstoreへの書き込みでは信用されない設計なので、stale化してもstoreは壊れません。無効化する場合は `ADS_HASH_CACHE=0`。
 
 Houdiniを使わない場合や手動で登録したい場合:
@@ -303,12 +307,12 @@ ads thumbnail set --server http://server:8787 --auth-token <token> --profile def
 | 症状 | 原因と対処 |
 |---|---|
 | `work folder exists and is not empty` | workフォルダに編集中データがある。意図的に置き換えるならForce(WebAppはチェックボックス、CLIは `--force`) |
-| `Failed to create lock file ... LOCK` | serveがstoreを開いている状態で直接storeを開く**書き込み系**コマンド。serve稼働中は `ads add --server ...` / `ads thumbnail set --server ...` などWeb API経由で実行(読み取り系はread-only openで共存可能) |
-| `unsupported store schema version` | 旧schemaのstore。開発中storeは再作成が前提(`ads init` し直し) |
+| `Failed to create lock file ... LOCK` | serveがstoreを開いている状態で直接storeを開く**書き込み系**コマンド。serve稼働中は `ads add --server ...` / `ads thumbnail set --server ...` などWeb API経由で実行(読み取り系はread-only openで共存可能)。WIP登録も `POST /api/wip` で可能(objectは `PUT /api/object` で事前アップロード、Pythonは `AdsHttpClient.wip_import`) |
+| `unsupported store schema version` | 旧schemaのstore。schema migrationは無く、既存storeへの `ads init` も再スタンプせずこのerrorで拒否する(schema markerが無いDBも同様に拒否)。storeフォルダを削除してから `ads init` で再作成 |
 | `wip versions are local-only` | `?v=wip` をremote modeで解決しようとした。wipは自分のlocal storeでのみ有効 |
 | `department has no wip versions` | そのdepartmentにWIPが未登録。書き出し(またはwip add)が先 |
 | 書き出したのにviewerが古い | 開いているstageは自動では再解決されない。`import ads.usd_refresh; ads.usd_refresh.refresh()` で即時再解決(またはreload)。放置でもcurrent/latestの切替は最大30秒(Resolver TTL)で反映 |
-| Resolverの動きを調べたい | `ADS_RESOLVER_DEBUG=1` と `ADS_RESOLVER_LOG_FILE=%TEMP%\ads_resolver.log` を設定 |
+| Resolverの動きを調べたい | 失敗系(HTTP error、download上限超過、resolve空応答、CLI fallbackなど)は設定なしでもUSD警告(TF_WARN)として種類ごとに初回1回表示される。per-assetの全トレースが必要なら `ADS_RESOLVER_DEBUG=1` と `ADS_RESOLVER_LOG_FILE=%TEMP%\ads_resolver.log` を設定 |
 | `version must be the next version` | `add --version` の明示番号が飛んでいる。`--version` を省略すれば自動採番 |
 
 ## 8. コマンド早見表
@@ -320,7 +324,8 @@ ads thumbnail set --server http://server:8787 --auth-token <token> --profile def
 | アセット作成 | `ads asset create --store --workspace --category --asset-code` |
 | workフォルダ種まき | `ads materialize --store --workspace --category --asset-code --department [--version N\|--latest] [--force]` |
 | WIP登録 | `ads wip add --store --category --asset-code --department --source <dir>` |
-| WIP一覧 | `ads wip list --store --category --asset-code --department` |
+| WIP登録(serve稼働中) | `POST /api/wip` body `{"profile","category","asset_code","department","manifest",["source_path"]}`(objectは `PUT /api/object` で事前アップロード) |
+| WIP一覧 | `ads wip list --store --category --asset-code --department` / serve稼働中は `GET /api/wips` |
 | 公開(昇格) | `ads publish promote --store --category --asset-code --department [--wip-seq N]` |
 | 直接登録 | `ads add --store --category --asset-code --department --source <dir> [--version N]` / serve稼働中は `ads add --server <url> --auth-token <t> --profile <p> ...` |
 | current操作 | `ads current set/get/reset/status ...` |
