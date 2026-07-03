@@ -1,4 +1,5 @@
 #include "pxr/pxr.h"
+#include "pxr/base/tf/diagnostic.h"
 #include "pxr/usd/ar/defineResolver.h"
 #include "pxr/usd/ar/filesystemAsset.h"
 #include "pxr/usd/ar/filesystemWritableAsset.h"
@@ -9,10 +10,14 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <chrono>
+#include <condition_variable>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -20,7 +25,9 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <system_error>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #if defined(_WIN32)
@@ -30,17 +37,35 @@
 #include <windows.h>
 #include <winhttp.h>
 #pragma comment(lib, "winhttp.lib")
+#else
+#include <unistd.h>
 #endif
 
 PXR_NAMESPACE_OPEN_SCOPE
 
 namespace {
 
-constexpr const char* kAdsScheme = "ads:";
-
+// Scheme matching policy: URI schemes are case-insensitive (RFC 3986), so
+// `ADS://x` must route to this resolver just like `ads://x`. Ownership of a
+// path is claimed case-insensitively on the `ads:` prefix (this predicate);
+// actually resolving additionally requires the well-formed authority form
+// `ads://` — malformed forms like `ads:foo` are rejected with a WarnOnce in
+// ResolveAssetPath, the single chokepoint both _Resolve and _OpenAsset funnel
+// through, so the two code paths always agree.
 bool StartsWithAdsScheme(const std::string& value)
 {
-    return value.rfind(kAdsScheme, 0) == 0;
+    if (value.size() < 4) {
+        return false;
+    }
+    return (value[0] == 'a' || value[0] == 'A')
+        && (value[1] == 'd' || value[1] == 'D')
+        && (value[2] == 's' || value[2] == 'S')
+        && value[3] == ':';
+}
+
+bool IsWellFormedAdsUri(const std::string& value)
+{
+    return StartsWithAdsScheme(value) && value.compare(4, 2, "//") == 0;
 }
 
 bool StartsWithHttpScheme(const std::string& value)
@@ -76,12 +101,117 @@ std::string ExtractQuery(const std::string& value)
     return value.substr(queryPos);
 }
 
+#if defined(_WIN32)
+std::wstring Utf8ToWide(const std::string& value)
+{
+    if (value.empty()) {
+        return {};
+    }
+    const int size = MultiByteToWideChar(
+        CP_UTF8,
+        0,
+        value.data(),
+        static_cast<int>(value.size()),
+        nullptr,
+        0);
+    if (size <= 0) {
+        return {};
+    }
+    std::wstring wide(static_cast<size_t>(size), L'\0');
+    MultiByteToWideChar(
+        CP_UTF8,
+        0,
+        value.data(),
+        static_cast<int>(value.size()),
+        wide.data(),
+        size);
+    return wide;
+}
+
+std::string WideToUtf8(const std::wstring& value)
+{
+    if (value.empty()) {
+        return {};
+    }
+    const int size = WideCharToMultiByte(
+        CP_UTF8,
+        0,
+        value.data(),
+        static_cast<int>(value.size()),
+        nullptr,
+        0,
+        nullptr,
+        nullptr);
+    if (size <= 0) {
+        return {};
+    }
+    std::string utf8(static_cast<size_t>(size), '\0');
+    WideCharToMultiByte(
+        CP_UTF8,
+        0,
+        value.data(),
+        static_cast<int>(value.size()),
+        utf8.data(),
+        size,
+        nullptr,
+        nullptr);
+    return utf8;
+}
+#endif
+
+// This resolver's internal string convention is UTF-8 — that is what USD
+// expects of ArResolvedPath on Windows (ArchWindowsUtf8ToUtf16) and what the
+// CLI prints on stdout. MSVC's std::filesystem narrow-path constructor
+// decodes bytes with the ANSI code page instead, so every filesystem call
+// routes through these helpers; otherwise a non-ASCII cache root (e.g. a
+// Japanese user-profile path) would be written under one spelling and opened
+// by USD under another.
+std::filesystem::path ToFsPath(const std::string& utf8)
+{
+#if defined(_WIN32)
+    return std::filesystem::path(Utf8ToWide(utf8));
+#else
+    return std::filesystem::path(utf8);
+#endif
+}
+
+std::string FsPathToUtf8(const std::filesystem::path& path)
+{
+#if defined(_WIN32)
+    return WideToUtf8(path.wstring());
+#else
+    return path.string();
+#endif
+}
+
 std::string GetEnv(const char* name, const std::string& fallback = "")
 {
+#if defined(_WIN32)
+    // CRT getenv returns ANSI-code-page bytes, which would poison the UTF-8
+    // convention above for non-ASCII values (LOCALAPPDATA under a non-ASCII
+    // user name, ADS_RESOLVER_WORKSPACE, ...). Read the wide environment and
+    // convert.
+    const std::wstring wideName = Utf8ToWide(name);
+    if (wideName.empty()) {
+        return fallback;
+    }
+    const DWORD size = GetEnvironmentVariableW(wideName.c_str(), nullptr, 0);
+    if (size == 0) {
+        return fallback;
+    }
+    std::wstring wide(static_cast<size_t>(size), L'\0');
+    const DWORD written = GetEnvironmentVariableW(wideName.c_str(), wide.data(), size);
+    if (written >= size) {
+        return fallback;
+    }
+    wide.resize(written);
+    return WideToUtf8(wide);
+#else
     if (const char* value = std::getenv(name)) {
         return value;
     }
     return fallback;
+#endif
 }
 
 bool DebugEnabled()
@@ -119,10 +249,45 @@ void LogResolverMessage(const std::string& message, bool always = false)
 
     static std::mutex logMutex;
     std::lock_guard<std::mutex> lock(logMutex);
-    std::ofstream stream(logFile, std::ios::app);
+    std::ofstream stream(ToFsPath(logFile), std::ios::app);
     if (stream) {
         stream << message << "\n";
     }
+}
+
+// Origin (scheme://host[:port]) of a URL, used as a dedupe key: one dead
+// object server fails for every layer URL on a stage, and the per-URL part
+// would defeat deduplication.
+std::string UrlOrigin(const std::string& url)
+{
+    const size_t schemeEnd = url.find("://");
+    if (schemeEnd == std::string::npos) {
+        return url;
+    }
+    const size_t pathStart = url.find('/', schemeEnd + 3);
+    return pathStart == std::string::npos ? url : url.substr(0, pathStart);
+}
+
+// A stage with hundreds of ads:// layers hits the same dead server or bad
+// token once per layer; emitting a TF_WARN for each would bury the one useful
+// diagnostic in the host's console. Each distinct failure (kind + primary
+// detail baked into dedupeKey) warns once per process; repeats still go
+// through LogResolverMessage so ADS_RESOLVER_DEBUG / ADS_RESOLVER_LOG_FILE
+// keep the full trace.
+void WarnOnce(const std::string& dedupeKey, const std::string& message)
+{
+    static std::mutex warnMutex;
+    static std::unordered_set<std::string> warnedKeys;
+
+    bool firstOccurrence = false;
+    {
+        std::lock_guard<std::mutex> lock(warnMutex);
+        firstOccurrence = warnedKeys.insert(dedupeKey).second;
+    }
+    if (firstOccurrence) {
+        TF_WARN("%s", message.c_str());
+    }
+    LogResolverMessage(message, true);
 }
 
 std::string Trim(std::string value)
@@ -142,8 +307,18 @@ std::string NormalizeSlashes(std::string value)
 std::string NormalizeAdsUri(std::string uri)
 {
     uri = NormalizeSlashes(std::move(uri));
+    if (!StartsWithAdsScheme(uri)) {
+        return uri;
+    }
+    // Lowercase the scheme so ADS://x and ads://x share one cache key and one
+    // resolved identity.
+    uri[0] = 'a';
+    uri[1] = 'd';
+    uri[2] = 's';
     const std::string prefix = "ads://";
     if (uri.rfind(prefix, 0) != 0) {
+        // Malformed (no authority slashes, e.g. ads:foo); left untouched here
+        // and rejected in ResolveAssetPath.
         return uri;
     }
 
@@ -263,62 +438,6 @@ std::string JoinShellCommand(const std::vector<std::string>& args)
 }
 
 #if defined(_WIN32)
-std::wstring Utf8ToWide(const std::string& value)
-{
-    if (value.empty()) {
-        return {};
-    }
-    const int size = MultiByteToWideChar(
-        CP_UTF8,
-        0,
-        value.data(),
-        static_cast<int>(value.size()),
-        nullptr,
-        0);
-    if (size <= 0) {
-        return {};
-    }
-    std::wstring wide(static_cast<size_t>(size), L'\0');
-    MultiByteToWideChar(
-        CP_UTF8,
-        0,
-        value.data(),
-        static_cast<int>(value.size()),
-        wide.data(),
-        size);
-    return wide;
-}
-
-std::string WideToUtf8(const std::wstring& value)
-{
-    if (value.empty()) {
-        return {};
-    }
-    const int size = WideCharToMultiByte(
-        CP_UTF8,
-        0,
-        value.data(),
-        static_cast<int>(value.size()),
-        nullptr,
-        0,
-        nullptr,
-        nullptr);
-    if (size <= 0) {
-        return {};
-    }
-    std::string utf8(static_cast<size_t>(size), '\0');
-    WideCharToMultiByte(
-        CP_UTF8,
-        0,
-        value.data(),
-        static_cast<int>(value.size()),
-        utf8.data(),
-        size,
-        nullptr,
-        nullptr);
-    return utf8;
-}
-
 struct ScopedHandle
 {
     HANDLE handle { nullptr };
@@ -377,6 +496,22 @@ struct ScopedWinHttpHandle
         return handle;
     }
 };
+
+// Whole-lifetime deadline for one CLI child process (spawn -> stdout EOF ->
+// exit), so a hung ads.exe cannot hang a USD composition thread forever
+// (ADS_RESOLVER_CLI_TIMEOUT_SECONDS, default 60).
+DWORD CliTimeoutMilliseconds()
+{
+    const std::string value = GetEnv("ADS_RESOLVER_CLI_TIMEOUT_SECONDS", "60");
+    try {
+        const long seconds = std::stol(value);
+        if (seconds > 0) {
+            return static_cast<DWORD>(std::min(seconds, 86400L)) * 1000;
+        }
+    } catch (...) {
+    }
+    return 60 * 1000;
+}
 #endif
 
 bool ReadCommandBytes(const std::vector<std::string>& args, std::vector<char>* output)
@@ -384,36 +519,65 @@ bool ReadCommandBytes(const std::vector<std::string>& args, std::vector<char>* o
     std::array<char, 64 * 1024> buffer {};
 
 #if defined(_WIN32)
-    SECURITY_ATTRIBUTES securityAttributes {};
-    securityAttributes.nLength = sizeof(securityAttributes);
-    securityAttributes.bInheritHandle = TRUE;
+    // Anonymous pipes cannot do overlapped I/O, so the read end is a
+    // single-use named-pipe server with a process-unique name. Overlapped
+    // reads let the wait below be bounded by a deadline instead of blocking
+    // in ReadFile until an arbitrary child exits.
+    static std::atomic<unsigned long> pipeSerial { 0 };
+    std::wostringstream pipeNameStream;
+    pipeNameStream << L"\\\\.\\pipe\\ads-resolver-" << GetCurrentProcessId() << L"-"
+                   << pipeSerial.fetch_add(1);
+    const std::wstring pipeName = pipeNameStream.str();
 
-    HANDLE readPipeRaw = nullptr;
-    HANDLE writePipeRaw = nullptr;
-    if (!CreatePipe(&readPipeRaw, &writePipeRaw, &securityAttributes, 0)) {
+    ScopedHandle readPipe(CreateNamedPipeW(
+        pipeName.c_str(),
+        PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
+        PIPE_TYPE_BYTE | PIPE_WAIT,
+        1,
+        static_cast<DWORD>(buffer.size()),
+        static_cast<DWORD>(buffer.size()),
+        0,
+        nullptr));
+    if (readPipe.get() == INVALID_HANDLE_VALUE) {
         return false;
     }
-    ScopedHandle readPipe(readPipeRaw);
-    ScopedHandle writePipe(writePipeRaw);
-    SetHandleInformation(readPipe.get(), HANDLE_FLAG_INHERIT, 0);
 
-    ScopedHandle nul(CreateFileW(
+    SECURITY_ATTRIBUTES inheritable {};
+    inheritable.nLength = sizeof(inheritable);
+    inheritable.bInheritHandle = TRUE;
+
+    ScopedHandle writePipe(CreateFileW(
+        pipeName.c_str(),
+        GENERIC_WRITE,
+        0,
+        &inheritable,
+        OPEN_EXISTING,
+        0,
+        nullptr));
+    if (writePipe.get() == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+
+    // The child gets NUL for stdin/stderr rather than the parent's handles:
+    // ads resolve reads nothing, and the parent's std handles may not be
+    // inheritable (or may not exist in a GUI host like Houdini).
+    ScopedHandle nulInput(CreateFileW(
+        L"NUL",
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        &inheritable,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr));
+    ScopedHandle nulError(CreateFileW(
         L"NUL",
         GENERIC_WRITE,
         FILE_SHARE_READ | FILE_SHARE_WRITE,
-        &securityAttributes,
+        &inheritable,
         OPEN_EXISTING,
         FILE_ATTRIBUTE_NORMAL,
         nullptr));
 
-    STARTUPINFOW startupInfo {};
-    startupInfo.cb = sizeof(startupInfo);
-    startupInfo.dwFlags = STARTF_USESTDHANDLES;
-    startupInfo.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
-    startupInfo.hStdOutput = writePipe.get();
-    startupInfo.hStdError = nul.get() == INVALID_HANDLE_VALUE ? writePipe.get() : nul.get();
-
-    PROCESS_INFORMATION processInfo {};
     std::wstring commandLine = Utf8ToWide(JoinProcessCommandLine(args));
     if (commandLine.empty()) {
         return false;
@@ -421,20 +585,71 @@ bool ReadCommandBytes(const std::vector<std::string>& args, std::vector<char>* o
     std::vector<wchar_t> mutableCommandLine(commandLine.begin(), commandLine.end());
     mutableCommandLine.push_back(L'\0');
 
+    // PROC_THREAD_ATTRIBUTE_HANDLE_LIST restricts inheritance to exactly the
+    // handles this child needs. Without it, concurrent USD threads spawning
+    // ads.exe leak each other's pipe write-ends into unrelated children, and
+    // ReadFile never sees EOF until the unrelated child exits too.
+    std::vector<HANDLE> inheritHandles;
+    inheritHandles.push_back(writePipe.get());
+    if (nulInput.get() != INVALID_HANDLE_VALUE) {
+        inheritHandles.push_back(nulInput.get());
+    }
+    if (nulError.get() != INVALID_HANDLE_VALUE) {
+        inheritHandles.push_back(nulError.get());
+    }
+
+    SIZE_T attributeListSize = 0;
+    InitializeProcThreadAttributeList(nullptr, 1, 0, &attributeListSize);
+    if (attributeListSize == 0) {
+        return false;
+    }
+    std::vector<unsigned char> attributeListStorage(attributeListSize);
+    auto* attributeList =
+        reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attributeListStorage.data());
+    if (!InitializeProcThreadAttributeList(attributeList, 1, 0, &attributeListSize)) {
+        return false;
+    }
+    if (!UpdateProcThreadAttribute(
+            attributeList,
+            0,
+            PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+            inheritHandles.data(),
+            inheritHandles.size() * sizeof(HANDLE),
+            nullptr,
+            nullptr)) {
+        DeleteProcThreadAttributeList(attributeList);
+        return false;
+    }
+
+    STARTUPINFOEXW startupInfo {};
+    startupInfo.StartupInfo.cb = sizeof(startupInfo);
+    startupInfo.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    startupInfo.StartupInfo.hStdInput =
+        nulInput.get() == INVALID_HANDLE_VALUE ? nullptr : nulInput.get();
+    startupInfo.StartupInfo.hStdOutput = writePipe.get();
+    startupInfo.StartupInfo.hStdError =
+        nulError.get() == INVALID_HANDLE_VALUE ? writePipe.get() : nulError.get();
+    startupInfo.lpAttributeList = attributeList;
+
+    PROCESS_INFORMATION processInfo {};
     const BOOL created = CreateProcessW(
         nullptr,
         mutableCommandLine.data(),
         nullptr,
         nullptr,
         TRUE,
-        CREATE_NO_WINDOW,
+        CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT,
         nullptr,
         nullptr,
-        &startupInfo,
+        &startupInfo.StartupInfo,
         &processInfo);
+    DeleteProcThreadAttributeList(attributeList);
 
+    // Close the parent's copies so the child holds the only write end; its
+    // exit then breaks the pipe and the read loop sees EOF.
     writePipe.reset();
-    nul.reset();
+    nulInput.reset();
+    nulError.reset();
 
     if (!created) {
         return false;
@@ -443,22 +658,94 @@ bool ReadCommandBytes(const std::vector<std::string>& args, std::vector<char>* o
     ScopedHandle process(processInfo.hProcess);
     ScopedHandle thread(processInfo.hThread);
 
-    output->clear();
-    while (true) {
-        DWORD bytesRead = 0;
-        const BOOL read = ReadFile(
-            readPipe.get(),
-            buffer.data(),
-            static_cast<DWORD>(buffer.size()),
-            &bytesRead,
-            nullptr);
-        if (!read || bytesRead == 0) {
-            break;
-        }
-        output->insert(output->end(), buffer.data(), buffer.data() + bytesRead);
+    ScopedHandle readEvent(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+    if (!readEvent.get()) {
+        TerminateProcess(process.get(), 1);
+        return false;
     }
 
-    WaitForSingleObject(process.get(), INFINITE);
+    const ULONGLONG deadline = GetTickCount64() + CliTimeoutMilliseconds();
+    const auto remainingMs = [deadline]() -> DWORD {
+        const ULONGLONG now = GetTickCount64();
+        return now >= deadline ? 0 : static_cast<DWORD>(deadline - now);
+    };
+
+    output->clear();
+    bool timedOut = false;
+    bool readFailed = false;
+    while (true) {
+        OVERLAPPED overlapped {};
+        overlapped.hEvent = readEvent.get();
+        BOOL pending = FALSE;
+        if (!ReadFile(
+                readPipe.get(),
+                buffer.data(),
+                static_cast<DWORD>(buffer.size()),
+                nullptr,
+                &overlapped)) {
+            const DWORD readError = GetLastError();
+            if (readError == ERROR_BROKEN_PIPE) {
+                break;
+            }
+            if (readError != ERROR_IO_PENDING) {
+                readFailed = true;
+                break;
+            }
+            pending = TRUE;
+        }
+        if (pending) {
+            HANDLE waitHandles[2] = { readEvent.get(), process.get() };
+            DWORD waitResult =
+                WaitForMultipleObjects(2, waitHandles, FALSE, remainingMs());
+            if (waitResult == WAIT_OBJECT_0 + 1) {
+                // Child exited: the kernel closed its write end, so the pending
+                // read now drains buffered bytes and then breaks the pipe. Keep
+                // waiting on the read alone, still under the deadline (covers a
+                // grandchild that inherited the write end from the child).
+                waitResult = WaitForSingleObject(readEvent.get(), remainingMs());
+            }
+            if (waitResult != WAIT_OBJECT_0) {
+                timedOut = true;
+                // The pending read still targets the stack buffer; cancel and
+                // drain the completion before the buffer goes out of scope.
+                CancelIo(readPipe.get());
+                DWORD ignored = 0;
+                GetOverlappedResult(readPipe.get(), &overlapped, &ignored, TRUE);
+                break;
+            }
+        }
+        DWORD bytesRead = 0;
+        if (!GetOverlappedResult(readPipe.get(), &overlapped, &bytesRead, FALSE)) {
+            if (GetLastError() == ERROR_BROKEN_PIPE) {
+                break;
+            }
+            readFailed = true;
+            break;
+        }
+        if (bytesRead > 0) {
+            output->insert(output->end(), buffer.data(), buffer.data() + bytesRead);
+        }
+    }
+
+    if (!timedOut && !readFailed) {
+        if (WaitForSingleObject(process.get(), remainingMs()) != WAIT_OBJECT_0) {
+            timedOut = true;
+        }
+    }
+
+    if (timedOut || readFailed) {
+        TerminateProcess(process.get(), 1);
+        if (timedOut) {
+            WarnOnce(
+                "cli-timeout\n" + args[0],
+                "ADS Resolver: command `" + JoinProcessCommandLine(args)
+                    + "` did not finish within ADS_RESOLVER_CLI_TIMEOUT_SECONDS; "
+                      "terminated and treated as a failed resolution");
+        }
+        output->clear();
+        return false;
+    }
+
     DWORD exitCode = 1;
     GetExitCodeProcess(process.get(), &exitCode);
     if (exitCode != 0) {
@@ -484,22 +771,14 @@ bool ReadCommandBytes(const std::vector<std::string>& args, std::vector<char>* o
                 break;
             }
             if (std::ferror(pipe)) {
-#if defined(_WIN32)
-                _pclose(pipe);
-#else
                 pclose(pipe);
-#endif
                 output->clear();
                 return false;
             }
         }
     }
 
-#if defined(_WIN32)
-    const int status = _pclose(pipe);
-#else
     const int status = pclose(pipe);
-#endif
     if (status != 0) {
         output->clear();
         return false;
@@ -617,6 +896,12 @@ bool HttpGetBytesNative(
             0,
             0)
         || !WinHttpReceiveResponse(request.get(), nullptr)) {
+        const DWORD lastError = GetLastError();
+        WarnOnce(
+            "http-request\n" + UrlOrigin(url),
+            "ADS Resolver: HTTP request to `" + url + "` failed (WinHTTP error "
+                + std::to_string(lastError)
+                + "); check that the server is reachable and ADS_RESOLVER_SERVER is correct");
         return false;
     }
 
@@ -632,6 +917,13 @@ bool HttpGetBytesNative(
         return false;
     }
     if (statusCode < 200 || statusCode >= 300) {
+        WarnOnce(
+            "http-status\n" + std::to_string(statusCode) + "\n" + UrlOrigin(url),
+            "ADS Resolver: HTTP GET `" + url + "` returned status "
+                + std::to_string(statusCode)
+                + (statusCode == 401 || statusCode == 403
+                       ? "; check ADS_RESOLVER_API_TOKEN / bearer token"
+                       : ""));
         return false;
     }
 
@@ -652,10 +944,11 @@ bool HttpGetBytesNative(
                 WINHTTP_NO_HEADER_INDEX)) {
             const unsigned long long announced = std::wcstoull(contentLength, nullptr, 10);
             if (announced > maxBytes) {
-                LogResolverMessage(
-                    "ADS Resolver refused remote object: Content-Length "
-                        + std::to_string(announced) + " exceeds ADS_RESOLVER_MAX_DOWNLOAD_MB",
-                    true);
+                WarnOnce(
+                    "download-cap\n" + url,
+                    "ADS Resolver: refused remote object `" + url + "`: Content-Length "
+                        + std::to_string(announced) + " exceeds ADS_RESOLVER_MAX_DOWNLOAD_MB ("
+                        + std::to_string(maxBytes) + " bytes)");
                 return false;
             }
         }
@@ -673,10 +966,11 @@ bool HttpGetBytesNative(
         }
         if (maxBytes != 0
             && static_cast<unsigned long long>(output->size()) + available > maxBytes) {
-            LogResolverMessage(
-                "ADS Resolver aborted remote object download: size exceeds "
-                "ADS_RESOLVER_MAX_DOWNLOAD_MB",
-                true);
+            WarnOnce(
+                "download-cap\n" + url,
+                "ADS Resolver: aborted remote object download `" + url
+                    + "`: size exceeds ADS_RESOLVER_MAX_DOWNLOAD_MB ("
+                    + std::to_string(maxBytes) + " bytes)");
             output->clear();
             return false;
         }
@@ -718,6 +1012,15 @@ bool HttpGetBytes(
     if (!timeoutSeconds.empty()) {
         args.push_back("--max-time");
         args.push_back(timeoutSeconds);
+    }
+    // curl only honors --max-filesize when the server announces Content-Length;
+    // chunked/streamed responses pass through unchecked. Cumulative enforcement
+    // (as in the WinHTTP path) would require replacing the popen capture with a
+    // native HTTP backend, so this stays best-effort until then.
+    const unsigned long long maxBytes = MaxDownloadBytes();
+    if (maxBytes != 0) {
+        args.push_back("--max-filesize");
+        args.push_back(std::to_string(maxBytes));
     }
     if (!bearerToken.empty()) {
         args.push_back("--header");
@@ -997,10 +1300,13 @@ std::string ResolveWithAdsServer(const std::string& assetPath)
         LogResolverMessage("ADS Resolver API resolved `" + normalizedAssetPath + "` -> `" + location + "`");
     }
     if (location.empty()) {
-        LogResolverMessage(
-            "ADS Resolver API failed to resolve `" + normalizedAssetPath + "` from server `" + server
-                + "` profile `" + profile + "`",
-            true);
+        WarnOnce(
+            "server-resolve\n" + server,
+            "ADS Resolver: failed to resolve `" + normalizedAssetPath + "` from server `" + server
+                + "` profile `" + profile + "`: "
+                + (response.empty()
+                       ? "no response (server down, connection refused, timeout, or HTTP error)"
+                       : "response has no `location` field (malformed JSON or server-side error)"));
     }
     if (!location.empty() && !wip) {
         StoreResolveCache(
@@ -1013,27 +1319,414 @@ std::string ResolveWithAdsServer(const std::string& assetPath)
     return location;
 }
 
-std::shared_ptr<ArAsset> OpenRemoteAsset(const std::string& url)
+std::string ObjectBearerToken()
 {
-    const std::string bearerToken = GetEnv(
+    return GetEnv(
         "ADS_RESOLVER_OBJECT_BEARER_TOKEN",
         GetEnv(
             "ADS_RESOLVER_HTTP_BEARER_TOKEN",
             GetEnv("ADS_RESOLVER_API_TOKEN", GetEnv("ADS_WEB_TOKEN"))));
+}
+
+std::shared_ptr<ArAsset> OpenRemoteAsset(const std::string& url)
+{
     const std::string timeoutSeconds = GetEnv("ADS_RESOLVER_HTTP_TIMEOUT_SECONDS", "30");
     if (DebugEnabled()) {
         LogResolverMessage("ADS Resolver remote asset download `" + url + "`");
     }
 
     std::vector<char> bytes;
-    if (!HttpGetBytes(url, bearerToken, timeoutSeconds, &bytes)) {
-        LogResolverMessage("ADS Resolver failed to download remote asset `" + url + "`", true);
+    if (!HttpGetBytes(url, ObjectBearerToken(), timeoutSeconds, &bytes)) {
+        WarnOnce(
+            "download\n" + UrlOrigin(url),
+            "ADS Resolver: failed to download remote asset `" + url
+                + "`; the layer will fail to open");
         return {};
     }
 
     auto storage = std::make_shared<std::vector<char>>(std::move(bytes));
     std::shared_ptr<const char> buffer(storage, storage->empty() ? nullptr : storage->data());
     return ArInMemoryAsset::FromBuffer(std::move(buffer), storage->size());
+}
+
+// FIPS 180-4 SHA-256, compact and standalone so downloaded blobs can be
+// verified against the content hash in the object URL without adding a link
+// dependency. Single-shot over an in-memory buffer; downloads dominate the
+// cost. Returns lowercase hex.
+std::string Sha256Hex(const unsigned char* data, size_t size)
+{
+    static constexpr uint32_t kRoundConstants[64] = {
+        0x428a2f98u, 0x71374491u, 0xb5c0fbcfu, 0xe9b5dba5u,
+        0x3956c25bu, 0x59f111f1u, 0x923f82a4u, 0xab1c5ed5u,
+        0xd807aa98u, 0x12835b01u, 0x243185beu, 0x550c7dc3u,
+        0x72be5d74u, 0x80deb1feu, 0x9bdc06a7u, 0xc19bf174u,
+        0xe49b69c1u, 0xefbe4786u, 0x0fc19dc6u, 0x240ca1ccu,
+        0x2de92c6fu, 0x4a7484aau, 0x5cb0a9dcu, 0x76f988dau,
+        0x983e5152u, 0xa831c66du, 0xb00327c8u, 0xbf597fc7u,
+        0xc6e00bf3u, 0xd5a79147u, 0x06ca6351u, 0x14292967u,
+        0x27b70a85u, 0x2e1b2138u, 0x4d2c6dfcu, 0x53380d13u,
+        0x650a7354u, 0x766a0abbu, 0x81c2c92eu, 0x92722c85u,
+        0xa2bfe8a1u, 0xa81a664bu, 0xc24b8b70u, 0xc76c51a3u,
+        0xd192e819u, 0xd6990624u, 0xf40e3585u, 0x106aa070u,
+        0x19a4c116u, 0x1e376c08u, 0x2748774cu, 0x34b0bcb5u,
+        0x391c0cb3u, 0x4ed8aa4au, 0x5b9cca4fu, 0x682e6ff3u,
+        0x748f82eeu, 0x78a5636fu, 0x84c87814u, 0x8cc70208u,
+        0x90befffau, 0xa4506cebu, 0xbef9a3f7u, 0xc67178f2u,
+    };
+
+    uint32_t state[8] = {
+        0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u, 0xa54ff53au,
+        0x510e527fu, 0x9b05688cu, 0x1f83d9abu, 0x5be0cd19u,
+    };
+
+    const auto rotr = [](uint32_t value, int bits) -> uint32_t {
+        return (value >> bits) | (value << (32 - bits));
+    };
+    const auto processBlock = [&](const unsigned char* block) {
+        uint32_t w[64];
+        for (int i = 0; i < 16; ++i) {
+            w[i] = (uint32_t(block[i * 4]) << 24) | (uint32_t(block[i * 4 + 1]) << 16)
+                | (uint32_t(block[i * 4 + 2]) << 8) | uint32_t(block[i * 4 + 3]);
+        }
+        for (int i = 16; i < 64; ++i) {
+            const uint32_t s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
+            const uint32_t s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+        }
+        uint32_t a = state[0], b = state[1], c = state[2], d = state[3];
+        uint32_t e = state[4], f = state[5], g = state[6], h = state[7];
+        for (int i = 0; i < 64; ++i) {
+            const uint32_t sum1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+            const uint32_t choose = (e & f) ^ (~e & g);
+            const uint32_t temp1 = h + sum1 + choose + kRoundConstants[i] + w[i];
+            const uint32_t sum0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+            const uint32_t majority = (a & b) ^ (a & c) ^ (b & c);
+            const uint32_t temp2 = sum0 + majority;
+            h = g;
+            g = f;
+            f = e;
+            e = d + temp1;
+            d = c;
+            c = b;
+            b = a;
+            a = temp1 + temp2;
+        }
+        state[0] += a;
+        state[1] += b;
+        state[2] += c;
+        state[3] += d;
+        state[4] += e;
+        state[5] += f;
+        state[6] += g;
+        state[7] += h;
+    };
+
+    size_t offset = 0;
+    for (; offset + 64 <= size; offset += 64) {
+        processBlock(data + offset);
+    }
+
+    // Final block(s): remaining bytes, 0x80, zero pad, 64-bit big-endian bit
+    // count. remaining < 56 fits one block, otherwise two.
+    unsigned char tail[128] = {};
+    const size_t remaining = size - offset;
+    if (remaining > 0) {
+        std::memcpy(tail, data + offset, remaining);
+    }
+    tail[remaining] = 0x80;
+    const size_t tailLength = remaining < 56 ? 64 : 128;
+    const uint64_t bitCount = static_cast<uint64_t>(size) * 8;
+    for (int i = 0; i < 8; ++i) {
+        tail[tailLength - 8 + i] = static_cast<unsigned char>(bitCount >> (56 - 8 * i));
+    }
+    processBlock(tail);
+    if (tailLength == 128) {
+        processBlock(tail + 64);
+    }
+
+    static const char* kHexDigits = "0123456789abcdef";
+    std::string digest;
+    digest.reserve(64);
+    for (const uint32_t word : state) {
+        for (int shift = 28; shift >= 0; shift -= 4) {
+            digest.push_back(kHexDigits[(word >> shift) & 0xf]);
+        }
+    }
+    return digest;
+}
+
+bool IsHexDigit(char ch)
+{
+    return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F');
+}
+
+// The object URL path embeds the content hash:
+// .../objects/sha256/<2-hex-prefix>/<64-hex>[.<ext>]. Exactly 64 hex chars
+// are required; anything else means the URL is not a content-addressed object
+// endpoint and the caller falls back to the in-memory download.
+std::string ParseSha256FromObjectUrl(const std::string& url)
+{
+    const std::string path = StripQuery(url);
+    const std::string marker = "objects/sha256/";
+    const size_t markerPos = path.find(marker);
+    if (markerPos == std::string::npos) {
+        return {};
+    }
+    size_t pos = markerPos + marker.size();
+    if (pos + 3 > path.size() || !IsHexDigit(path[pos]) || !IsHexDigit(path[pos + 1])
+        || path[pos + 2] != '/') {
+        return {};
+    }
+    pos += 3;
+    size_t end = pos;
+    while (end < path.size() && IsHexDigit(path[end])) {
+        ++end;
+    }
+    if (end - pos != 64) {
+        return {};
+    }
+    std::string hash = path.substr(pos, 64);
+    std::transform(hash.begin(), hash.end(), hash.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return hash;
+}
+
+// Blob cache root: ADS_RESOLVER_CACHE_DIR, else the CLI workspace blob cache
+// (<workspace>/.ads-cache) so `ads cache gc` manages both, else a per-user
+// location. The sha256/ leaf is appended so every layout matches the CLI's
+// flat blob cache: sha256/<2-hex-prefix>/<hash>.<ext>.
+std::string BlobCacheRoot()
+{
+    std::string base = GetEnv("ADS_RESOLVER_CACHE_DIR");
+    if (base.empty()) {
+        const std::string workspace = GetEnv("ADS_RESOLVER_WORKSPACE");
+        if (!workspace.empty()) {
+            base = workspace + "/.ads-cache";
+        }
+    }
+    if (base.empty()) {
+#if defined(_WIN32)
+        const std::string localAppData = GetEnv("LOCALAPPDATA");
+        if (!localAppData.empty()) {
+            base = localAppData + "/ads/resolver-cache";
+        }
+#else
+        const std::string xdgCacheHome = GetEnv("XDG_CACHE_HOME");
+        if (!xdgCacheHome.empty()) {
+            base = xdgCacheHome + "/ads/resolver-cache";
+        } else {
+            const std::string home = GetEnv("HOME");
+            if (!home.empty()) {
+                base = home + "/.cache/ads/resolver-cache";
+            }
+        }
+#endif
+    }
+    if (base.empty()) {
+        return {};
+    }
+    return NormalizeSlashes(base) + "/sha256";
+}
+
+std::string AssetPathExtension(const std::string& assetPath)
+{
+    const std::string normalized = StripQuery(StripSdfFormatArgs(NormalizeSlashes(assetPath)));
+    const size_t slashPos = normalized.find_last_of('/');
+    const size_t dotPos = normalized.find_last_of('.');
+    if (dotPos == std::string::npos || (slashPos != std::string::npos && dotPos < slashPos)) {
+        return {};
+    }
+    return normalized.substr(dotPos + 1);
+}
+
+// Mirrors the CLI's VIEW_EXTENSIONS (src/lib.rs): formats that may hold
+// relative references to sibling files. The publish policy only forces
+// ads:// for cross-asset references, so intra-version relative refs are a
+// supported shape — these formats must keep resolving to their ads:// URI
+// (see _Resolve), because USD anchors relative refs against the layer's
+// resolved path and only an ads:// anchor re-anchors them to ads://
+// identifiers instead of nonexistent flat-blob-cache siblings.
+bool IsComposingAssetPath(const std::string& assetPath)
+{
+    std::string extension = AssetPathExtension(assetPath);
+    std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return extension == "usd" || extension == "usda" || extension == "usdc"
+        || extension == "usdz" || extension == "mtlx";
+}
+
+unsigned long CurrentProcessId()
+{
+#if defined(_WIN32)
+    return GetCurrentProcessId();
+#else
+    return static_cast<unsigned long>(getpid());
+#endif
+}
+
+// In-flight blob download deduplication: N composition threads asking for the
+// same object should trigger one download; the rest wait, then take the cache
+// hit. The mutex only guards the in-flight set — it is never held across
+// network or file I/O, so this cannot deadlock against the download itself.
+struct BlobDownloadGate
+{
+    std::mutex mutex;
+    std::condition_variable condition;
+    std::unordered_set<std::string> inFlight;
+};
+
+BlobDownloadGate& TheBlobDownloadGate()
+{
+    static BlobDownloadGate gate;
+    return gate;
+}
+
+// Materializes a remote object URL into the content-addressed blob cache and
+// returns the cached file path (empty means: keep the in-memory fallback).
+// Blobs are immutable — they are addressed by their sha256 — so this cache is
+// permanent for every version selector including wip; the resolve cache
+// policy governs URI -> location staleness, not blob content. The extension
+// comes from the ads:// URI leaf, matching the CLI blob cache layout.
+std::string FetchRemoteObjectToCache(
+    const std::string& url,
+    const std::string& adsUri,
+    bool downloadOnMiss)
+{
+    const std::string hash = ParseSha256FromObjectUrl(url);
+    if (hash.empty()) {
+        if (downloadOnMiss) {
+            WarnOnce(
+                "blob-cache-hash\n" + UrlOrigin(url),
+                "ADS Resolver: object URL `" + url
+                    + "` has no parseable sha256; falling back to in-memory download");
+        }
+        return {};
+    }
+
+    const std::string root = BlobCacheRoot();
+    if (root.empty()) {
+        if (downloadOnMiss) {
+            WarnOnce(
+                "blob-cache-root",
+                "ADS Resolver: no blob cache directory available (set "
+                "ADS_RESOLVER_CACHE_DIR or ADS_RESOLVER_WORKSPACE); falling back to "
+                "in-memory download");
+        }
+        return {};
+    }
+
+    const std::string extension = AssetPathExtension(adsUri);
+    const std::string fileName = extension.empty() ? hash : hash + "." + extension;
+    const std::string finalPath = root + "/" + hash.substr(0, 2) + "/" + fileName;
+
+    std::error_code fsError;
+    if (std::filesystem::exists(ToFsPath(finalPath), fsError)) {
+        return finalPath;
+    }
+    if (!downloadOnMiss) {
+        return {};
+    }
+
+    BlobDownloadGate& gate = TheBlobDownloadGate();
+    {
+        std::unique_lock<std::mutex> lock(gate.mutex);
+        while (gate.inFlight.count(hash) > 0) {
+            gate.condition.wait(lock);
+        }
+        gate.inFlight.insert(hash);
+    }
+    struct GateRelease
+    {
+        BlobDownloadGate& gate;
+        const std::string& hash;
+        ~GateRelease()
+        {
+            {
+                std::lock_guard<std::mutex> lock(gate.mutex);
+                gate.inFlight.erase(hash);
+            }
+            gate.condition.notify_all();
+        }
+    } gateRelease { gate, hash };
+
+    // Another thread may have finished this download while we waited.
+    if (std::filesystem::exists(ToFsPath(finalPath), fsError)) {
+        return finalPath;
+    }
+
+    const std::string timeoutSeconds = GetEnv("ADS_RESOLVER_HTTP_TIMEOUT_SECONDS", "30");
+    if (DebugEnabled()) {
+        LogResolverMessage(
+            "ADS Resolver blob cache download `" + url + "` -> `" + finalPath + "`");
+    }
+    std::vector<char> bytes;
+    if (!HttpGetBytes(url, ObjectBearerToken(), timeoutSeconds, &bytes)) {
+        WarnOnce(
+            "download\n" + UrlOrigin(url),
+            "ADS Resolver: failed to download remote asset `" + url
+                + "`; the layer will fail to open");
+        return {};
+    }
+
+    // Verify content before anything lands at the final path: a truncated or
+    // tampered download must never become a cache hit.
+    const std::string actualHash = Sha256Hex(
+        reinterpret_cast<const unsigned char*>(bytes.data()), bytes.size());
+    if (actualHash != hash) {
+        WarnOnce(
+            "blob-cache-verify\n" + url,
+            "ADS Resolver: downloaded object `" + url + "` hashed to " + actualHash
+                + " but the URL names " + hash
+                + "; not caching (falling back to in-memory download)");
+        return {};
+    }
+
+    std::filesystem::create_directories(ToFsPath(finalPath).parent_path(), fsError);
+
+    static std::atomic<unsigned long> tempSerial { 0 };
+    std::ostringstream tempName;
+    tempName << finalPath << ".tmp." << CurrentProcessId() << "." << tempSerial.fetch_add(1);
+    const std::string tempPath = tempName.str();
+
+    bool written = false;
+    {
+        std::ofstream stream(ToFsPath(tempPath), std::ios::binary | std::ios::trunc);
+        if (stream) {
+            if (!bytes.empty()) {
+                stream.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+            }
+            stream.close();
+            written = !stream.fail();
+        }
+    }
+    if (!written) {
+        WarnOnce(
+            "blob-cache-write\n" + root,
+            "ADS Resolver: cannot write blob cache files under `" + root
+                + "`; falling back to in-memory download");
+        std::filesystem::remove(ToFsPath(tempPath), fsError);
+        return {};
+    }
+
+    std::filesystem::rename(ToFsPath(tempPath), ToFsPath(finalPath), fsError);
+    if (fsError) {
+        // Rename onto an existing file fails on Windows: a concurrent writer
+        // (another process; in-process racers are deduplicated above) won, and
+        // its file has identical content — use it.
+        std::filesystem::remove(ToFsPath(tempPath), fsError);
+        std::error_code raceError;
+        if (std::filesystem::exists(ToFsPath(finalPath), raceError)) {
+            return finalPath;
+        }
+        WarnOnce(
+            "blob-cache-write\n" + root,
+            "ADS Resolver: cannot finalize blob cache files under `" + root
+                + "`; falling back to in-memory download");
+        return {};
+    }
+    return finalPath;
 }
 
 std::string ResolveWithAdsCli(const std::string& assetPath)
@@ -1046,7 +1739,10 @@ std::string ResolveWithAdsCli(const std::string& assetPath)
     const std::string cliAssetPath = NormalizeAdsUri(StripSdfFormatArgs(assetPath));
 
     if (store.empty()) {
-        LogResolverMessage("ADS Resolver: ADS_RESOLVER_STORE is not set", true);
+        WarnOnce(
+            "cli-config",
+            "ADS Resolver: ADS_RESOLVER_STORE is not set; cannot resolve `" + cliAssetPath
+                + "` with the `" + executable + "` CLI");
         return {};
     }
 
@@ -1085,6 +1781,12 @@ std::string ResolveWithAdsCli(const std::string& assetPath)
     if (DebugEnabled()) {
         LogResolverMessage("ADS Resolver resolved `" + assetPath + "` -> `" + resolved + "`");
     }
+    if (resolved.empty()) {
+        WarnOnce(
+            "cli-resolve\n" + executable + "\n" + store,
+            "ADS Resolver: CLI failed to resolve `" + cliAssetPath + "` (command: "
+                + JoinProcessCommandLine(args) + ")");
+    }
     if (!resolved.empty() && !wip) {
         StoreResolveCache(
             cache.mutex,
@@ -1098,9 +1800,30 @@ std::string ResolveWithAdsCli(const std::string& assetPath)
 
 std::string ResolveAssetPath(const std::string& assetPath)
 {
+    // Single chokepoint for the scheme policy (see StartsWithAdsScheme): both
+    // _Resolve and _OpenAsset funnel through here, so malformed ads URIs like
+    // `ads:foo` (no authority slashes) are rejected consistently instead of
+    // being passed to the server or CLI as a guess.
+    if (!IsWellFormedAdsUri(NormalizeSlashes(assetPath))) {
+        WarnOnce(
+            "malformed-uri\n" + assetPath,
+            "ADS Resolver: malformed ads URI `" + assetPath
+                + "` (expected ads://<path>); refusing to resolve");
+        return {};
+    }
+
     const std::string serverResolved = ResolveWithAdsServer(assetPath);
     if (!serverResolved.empty()) {
         return serverResolved;
+    }
+    // Only a degraded fallback when a server was configured; with no server
+    // the CLI is the primary resolution path and nothing is stale.
+    const std::string server = TrimTrailingSlashes(GetEnv("ADS_RESOLVER_SERVER"));
+    if (!server.empty()) {
+        WarnOnce(
+            "cli-fallback\n" + server,
+            "ADS Resolver: server resolve via `" + server + "` failed for `" + assetPath
+                + "`; falling back to local CLI resolution, results may be stale local content");
     }
     return ResolveWithAdsCli(assetPath);
 }
@@ -1121,15 +1844,16 @@ protected:
         if (StartsWithAdsScheme(assetPath)) {
             return NormalizeSlashes(assetPath);
         }
-        if (!anchorAssetPath.empty() && !std::filesystem::path(assetPath).is_absolute()) {
+        if (!anchorAssetPath.empty() && !ToFsPath(assetPath).is_absolute()) {
             const std::string adsIdentifier = CreateAdsRelativeIdentifier(assetPath, anchorAssetPath);
             if (!adsIdentifier.empty()) {
                 return adsIdentifier;
             }
-            const std::filesystem::path anchor(anchorAssetPath.GetPathString());
-            return NormalizeSlashes((anchor.parent_path() / assetPath).lexically_normal().string());
+            const std::filesystem::path anchor = ToFsPath(anchorAssetPath.GetPathString());
+            return NormalizeSlashes(
+                FsPathToUtf8((anchor.parent_path() / ToFsPath(assetPath)).lexically_normal()));
         }
-        return NormalizeSlashes(std::filesystem::path(assetPath).lexically_normal().string());
+        return NormalizeSlashes(FsPathToUtf8(ToFsPath(assetPath).lexically_normal()));
     }
 
     std::string _CreateIdentifierForNewAsset(
@@ -1149,6 +1873,22 @@ protected:
             return {};
         }
         if (StartsWithHttpScheme(resolved)) {
+            // Remote objects are materialized into the content-addressed blob
+            // cache so opens read from disk and unchanged content is never
+            // re-downloaded. Only leaf content resolves to the cache file
+            // itself; composing formats keep their ads:// identity so
+            // relative references anchored against the resolved path
+            // re-anchor to ads:// URIs (a flat cache path would send them to
+            // nonexistent cache-file siblings), while their bytes still open
+            // from the cache warmed here.
+            const std::string cached =
+                FetchRemoteObjectToCache(resolved, assetPath, /*downloadOnMiss=*/true);
+            if (!cached.empty() && !IsComposingAssetPath(assetPath)) {
+                return ArResolvedPath(cached);
+            }
+            // Composing formats and cache-less fallbacks route back through
+            // _OpenAsset: blob cache hit when available, otherwise the
+            // pre-cache behavior of streaming into an ArInMemoryAsset.
             return ArResolvedPath(NormalizeSlashes(assetPath));
         }
         return ArResolvedPath(resolved);
@@ -1183,13 +1923,7 @@ protected:
 
     std::string _GetExtension(const std::string& assetPath) const override
     {
-        const std::string normalized = StripQuery(StripSdfFormatArgs(NormalizeSlashes(assetPath)));
-        const size_t slashPos = normalized.find_last_of('/');
-        const size_t dotPos = normalized.find_last_of('.');
-        if (dotPos == std::string::npos || (slashPos != std::string::npos && dotPos < slashPos)) {
-            return {};
-        }
-        return normalized.substr(dotPos + 1);
+        return AssetPathExtension(assetPath);
     }
 
     ArTimestamp _GetModificationTimestamp(
@@ -1204,8 +1938,25 @@ protected:
                 "ADS Resolver timestamp `" + assetPath + "` resolved `"
                 + resolvedPath.GetPathString() + "`");
         }
-        if (StartsWithAdsScheme(resolvedPath.GetPathString())
-            || StartsWithHttpScheme(resolvedPath.GetPathString())) {
+        if (StartsWithAdsScheme(resolvedPath.GetPathString())) {
+            // Composing remote layers keep their ads:// identity (see
+            // _Resolve) but their bytes live in the immutable blob cache.
+            // The cache file changes exactly when the URI resolves to
+            // different content, so its timestamp is a faithful modification
+            // stamp and keeps SdfLayer::Reload from refetching unchanged
+            // layers.
+            const std::string resolved =
+                NormalizeSlashes(ResolveAssetPath(resolvedPath.GetPathString()));
+            if (StartsWithHttpScheme(resolved)) {
+                const std::string cached = FetchRemoteObjectToCache(
+                    resolved, resolvedPath.GetPathString(), /*downloadOnMiss=*/false);
+                if (!cached.empty()) {
+                    return ArFilesystemAsset::GetModificationTimestamp(ArResolvedPath(cached));
+                }
+            }
+            return {};
+        }
+        if (StartsWithHttpScheme(resolvedPath.GetPathString())) {
             return {};
         }
         return ArFilesystemAsset::GetModificationTimestamp(resolvedPath);
@@ -1222,6 +1973,16 @@ protected:
         if (StartsWithAdsScheme(resolvedPath.GetPathString())) {
             const std::string resolved = NormalizeSlashes(ResolveAssetPath(resolvedPath.GetPathString()));
             if (StartsWithHttpScheme(resolved)) {
+                // Composing formats resolve to their ads:// URI but _Resolve
+                // already warmed the blob cache, so this probe (cheap) is
+                // normally a hit; a miss means _Resolve could not use the
+                // cache at all, so do not retry the download machinery per
+                // open.
+                const std::string cached = FetchRemoteObjectToCache(
+                    resolved, resolvedPath.GetPathString(), /*downloadOnMiss=*/false);
+                if (!cached.empty()) {
+                    return ArFilesystemAsset::Open(ArResolvedPath(cached));
+                }
                 return OpenRemoteAsset(resolved);
             }
             if (!resolved.empty()) {
