@@ -1,12 +1,61 @@
 use std::fs;
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output};
+use std::thread;
+use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 fn ads() -> Command {
     Command::new(env!("CARGO_BIN_EXE_ads"))
+}
+
+struct ServeGuard {
+    child: Child,
+}
+
+impl ServeGuard {
+    fn spawn(addr: &str, store: &Path, workspace: &Path) -> Self {
+        let child = ads()
+            .arg("serve")
+            .arg("--bind")
+            .arg(addr)
+            .arg("--auth-token")
+            .arg("secret")
+            .arg("--store")
+            .arg(store)
+            .arg("--workspace")
+            .arg(workspace)
+            .spawn()
+            .unwrap();
+        Self { child }
+    }
+}
+
+impl Drop for ServeGuard {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn free_loopback_addr() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap().to_string()
+}
+
+fn retry_command_success(mut run: impl FnMut() -> Output) -> Output {
+    let mut last = run();
+    for _ in 0..49 {
+        if last.status.success() {
+            return last;
+        }
+        thread::sleep(Duration::from_millis(100));
+        last = run();
+    }
+    last
 }
 
 #[test]
@@ -134,6 +183,66 @@ fn add_uses_version_folders_and_protects_registered_versions() {
     let output = stdout(&list);
     assert!(output.contains("v001"));
     assert!(output.contains("v002"));
+}
+
+#[test]
+fn sync_uses_resolver_environment_defaults() {
+    let temp = TempDir::new().unwrap();
+    let server_store = temp.path().join("server-store");
+    let server_workspace = temp.path().join("server-workspace");
+    let local_store = temp.path().join("local-store");
+
+    assert!(
+        ads()
+            .arg("init")
+            .arg(&server_store)
+            .status()
+            .unwrap()
+            .success()
+    );
+    new_version(&server_store, &server_workspace, "prop", "crate");
+    fs::write(
+        version_folder(&server_workspace, "prop", "crate", "v001").join("crate.usd"),
+        "server v1",
+    )
+    .unwrap();
+    let add = add_asset(&server_store, &server_workspace, "prop", "crate", "v001");
+    assert!(add.contains("created v001"));
+
+    let addr = free_loopback_addr();
+    let _server = ServeGuard::spawn(&addr, &server_store, &server_workspace);
+    let server_url = format!("http://{addr}");
+
+    let sync = retry_command_success(|| {
+        let mut command = ads();
+        command
+            .arg("sync")
+            .env("ADS_RESOLVER_SERVER", &server_url)
+            .env("ADS_RESOLVER_API_TOKEN", "secret")
+            .env("ADS_RESOLVER_PROFILE", "default")
+            .env("ADS_RESOLVER_STORE", &local_store)
+            .env_remove("ADS_WEB_TOKEN");
+        command.output().unwrap()
+    });
+    assert!(sync.status.success(), "{}", stderr(&sync));
+    assert!(stdout(&sync).contains("synced assets=1 versions=1"));
+
+    let info = ads()
+        .arg("info")
+        .arg("--store")
+        .arg(&local_store)
+        .arg("--category")
+        .arg("prop")
+        .arg("--asset-code")
+        .arg("crate")
+        .arg("--department")
+        .arg("model")
+        .arg("--version")
+        .arg("v001")
+        .output()
+        .unwrap();
+    assert!(info.status.success(), "{}", stderr(&info));
+    assert!(stdout(&info).contains("crate.usd"));
 }
 
 #[test]

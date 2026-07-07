@@ -309,18 +309,20 @@ enum Commands {
 #[derive(Args, Debug)]
 struct FetchArgs {
     /// Remote ADS server base URL, for example http://ads-server:8787.
+    /// Falls back to ADS_RESOLVER_SERVER or ADS_CATALOG_SERVER.
     #[arg(long)]
-    server: String,
-    /// Bearer token for the remote ADS server. Can also be ADS_WEB_TOKEN.
-    #[arg(long = "auth-token", env = "ADS_WEB_TOKEN")]
-    auth_token: String,
-    /// Remote profile name.
-    #[arg(long, default_value = "main")]
-    profile: String,
-    /// Local store root. It is initialized if missing.
+    server: Option<String>,
+    /// Bearer token for the remote ADS server. Can also be ADS_WEB_TOKEN,
+    /// ADS_RESOLVER_API_TOKEN, or ADS_CATALOG_API_TOKEN.
+    #[arg(long = "auth-token")]
+    auth_token: Option<String>,
+    /// Remote profile name. Falls back to ADS_RESOLVER_PROFILE or ADS_CATALOG_PROFILE.
     #[arg(long)]
-    store: PathBuf,
-    /// Workspace root for optional materialization.
+    profile: Option<String>,
+    /// Local store root. It is initialized if missing. Falls back to ADS_RESOLVER_STORE.
+    #[arg(long)]
+    store: Option<PathBuf>,
+    /// Workspace root for optional materialization. Falls back to ADS_RESOLVER_WORKSPACE.
     #[arg(long)]
     workspace: Option<PathBuf>,
     /// Asset category.
@@ -349,18 +351,20 @@ struct FetchArgs {
 #[derive(Args, Debug)]
 struct SyncArgs {
     /// Remote ADS server base URL, for example http://ads-server:8787.
+    /// Falls back to ADS_RESOLVER_SERVER or ADS_CATALOG_SERVER.
     #[arg(long)]
-    server: String,
-    /// Bearer token for the remote ADS server. Can also be ADS_WEB_TOKEN.
-    #[arg(long = "auth-token", env = "ADS_WEB_TOKEN")]
-    auth_token: String,
-    /// Remote profile name.
-    #[arg(long, default_value = "main")]
-    profile: String,
-    /// Local store root. It is initialized if missing.
+    server: Option<String>,
+    /// Bearer token for the remote ADS server. Can also be ADS_WEB_TOKEN,
+    /// ADS_RESOLVER_API_TOKEN, or ADS_CATALOG_API_TOKEN.
+    #[arg(long = "auth-token")]
+    auth_token: Option<String>,
+    /// Remote profile name. Falls back to ADS_RESOLVER_PROFILE or ADS_CATALOG_PROFILE.
     #[arg(long)]
-    store: PathBuf,
-    /// Workspace root for optional materialization.
+    profile: Option<String>,
+    /// Local store root. It is initialized if missing. Falls back to ADS_RESOLVER_STORE.
+    #[arg(long)]
+    store: Option<PathBuf>,
+    /// Workspace root for optional materialization. Falls back to ADS_RESOLVER_WORKSPACE.
     #[arg(long)]
     workspace: Option<PathBuf>,
     /// Optional category filter.
@@ -389,17 +393,19 @@ struct SyncArgs {
 #[derive(Args, Debug)]
 struct PushArgs {
     /// Remote ADS server base URL, for example http://ads-server:8787.
+    /// Falls back to ADS_RESOLVER_SERVER or ADS_CATALOG_SERVER.
     #[arg(long)]
-    server: String,
-    /// Bearer token for the remote ADS server. Can also be ADS_WEB_TOKEN.
-    #[arg(long = "auth-token", env = "ADS_WEB_TOKEN")]
-    auth_token: String,
-    /// Remote profile name.
-    #[arg(long, default_value = "main")]
-    profile: String,
-    /// Local store root.
+    server: Option<String>,
+    /// Bearer token for the remote ADS server. Can also be ADS_WEB_TOKEN,
+    /// ADS_RESOLVER_API_TOKEN, or ADS_CATALOG_API_TOKEN.
+    #[arg(long = "auth-token")]
+    auth_token: Option<String>,
+    /// Remote profile name. Falls back to ADS_RESOLVER_PROFILE or ADS_CATALOG_PROFILE.
     #[arg(long)]
-    store: PathBuf,
+    profile: Option<String>,
+    /// Local store root. Falls back to ADS_RESOLVER_STORE.
+    #[arg(long)]
+    store: Option<PathBuf>,
     /// Asset category.
     #[arg(long)]
     category: String,
@@ -808,22 +814,22 @@ where
         } => {
             let asset_key = AssetKey::new(category, asset_code)?;
             let department_key = DepartmentKey::new(asset_key, department)?;
-            let outcome = if let Some(server) = server {
+            let outcome = if let Some(server) =
+                optional_remote_server(server.as_deref(), store.is_some())
+            {
                 let auth_token = resolve_remote_auth_token(auth_token.as_deref())?;
                 let remote = RemoteClient::new(&server, &auth_token)?;
-                let profile = profile.as_deref().unwrap_or("default");
+                let profile = resolve_remote_profile(profile.as_deref(), "default");
                 add_remote_source(
                     &remote,
-                    profile,
+                    &profile,
                     source.as_deref(),
                     &department_key,
                     version,
                 )?
             } else {
-                let store = store
-                    .as_deref()
-                    .ok_or_else(|| anyhow!("--store is required unless --server is used"))?;
-                let store = Store::open(store)?;
+                let store = resolve_cli_store(store.as_deref())?;
+                let store = Store::open(&store)?;
                 match source {
                     Some(source) => {
                         let version = match version {
@@ -1066,16 +1072,16 @@ where
             } => {
                 let asset_key = AssetKey::new(category, asset_code)?;
                 let department_key = DepartmentKey::new(asset_key, department)?;
-                let record = if let Some(server) = server {
+                let record = if let Some(server) =
+                    optional_remote_server(server.as_deref(), store.is_some())
+                {
                     let auth_token = resolve_remote_auth_token(auth_token.as_deref())?;
                     let remote = RemoteClient::new(&server, &auth_token)?;
-                    let profile = profile.as_deref().unwrap_or("default");
-                    set_remote_thumbnail(&remote, profile, &department_key, version, &image)?
+                    let profile = resolve_remote_profile(profile.as_deref(), "default");
+                    set_remote_thumbnail(&remote, &profile, &department_key, version, &image)?
                 } else {
-                    let store = store
-                        .as_deref()
-                        .ok_or_else(|| anyhow!("--store is required unless --server is used"))?;
-                    let store = Store::open(store)?;
+                    let store = resolve_cli_store(store.as_deref())?;
+                    let store = Store::open(&store)?;
                     store.set_thumbnail(&department_key, version, &image)?
                 };
                 println!(
@@ -1307,11 +1313,16 @@ where
             if args.latest && args.version.is_some() {
                 bail!("--latest and --version cannot be used together");
             }
-            if args.materialize && args.workspace.is_none() {
-                bail!("--workspace is required with --materialize");
+            let workspace_arg = resolve_cli_workspace(args.workspace.as_deref());
+            if args.materialize && workspace_arg.is_none() {
+                bail!("--workspace or ADS_RESOLVER_WORKSPACE is required with --materialize");
             }
-            let store = Store::open_or_init(&args.store)?;
-            let remote = RemoteClient::new(&args.server, &args.auth_token)?;
+            let server = resolve_remote_server(args.server.as_deref())?;
+            let auth_token = resolve_remote_auth_token(args.auth_token.as_deref())?;
+            let profile = resolve_remote_profile(args.profile.as_deref(), "main");
+            let store_path = resolve_cli_store(args.store.as_deref())?;
+            let store = Store::open_or_init(&store_path)?;
+            let remote = RemoteClient::new(&server, &auth_token)?;
             let selector = if args.latest {
                 VersionSelector::Latest
             } else {
@@ -1321,14 +1332,14 @@ where
             let (version_info, stats) = fetch_remote_version(
                 &store,
                 &remote,
-                &args.profile,
+                &profile,
                 &args.category,
                 &args.asset_code,
                 &args.department,
                 selector,
             )?;
             let materialized = if args.materialize {
-                let workspace = workspace_root(args.workspace)?;
+                let workspace = workspace_root(workspace_arg)?;
                 Some(store.materialize(
                     &workspace,
                     &version_info.version.department_key,
@@ -1340,7 +1351,7 @@ where
             };
             if selector == VersionSelector::Current {
                 let status = remote.fetch_current_status(
-                    &args.profile,
+                    &profile,
                     &args.category,
                     &args.asset_code,
                     &args.department,
@@ -1372,8 +1383,9 @@ where
             if args.materialize && args.all_versions {
                 bail!("--materialize cannot be combined with --all-versions");
             }
-            if args.materialize && args.workspace.is_none() {
-                bail!("--workspace is required with --materialize");
+            let workspace_arg = resolve_cli_workspace(args.workspace.as_deref());
+            if args.materialize && workspace_arg.is_none() {
+                bail!("--workspace or ADS_RESOLVER_WORKSPACE is required with --materialize");
             }
             if let Some(category) = &args.category {
                 validate_category(category)?;
@@ -1385,16 +1397,20 @@ where
                 validate_department(department)?;
             }
 
-            let store = Store::open_or_init(&args.store)?;
-            let remote = RemoteClient::new(&args.server, &args.auth_token)?;
+            let server = resolve_remote_server(args.server.as_deref())?;
+            let auth_token = resolve_remote_auth_token(args.auth_token.as_deref())?;
+            let profile = resolve_remote_profile(args.profile.as_deref(), "main");
+            let store_path = resolve_cli_store(args.store.as_deref())?;
+            let store = Store::open_or_init(&store_path)?;
+            let remote = RemoteClient::new(&server, &auth_token)?;
             let assets = remote.fetch_assets(
-                &args.profile,
+                &profile,
                 args.category.as_deref(),
                 args.asset_code.as_deref(),
                 args.department.as_deref(),
             )?;
             let workspace = if args.materialize {
-                Some(workspace_root(args.workspace.clone())?)
+                Some(workspace_root(workspace_arg)?)
             } else {
                 None
             };
@@ -1405,7 +1421,7 @@ where
             for asset in assets.assets {
                 if args.all_versions {
                     let versions = remote.fetch_versions(
-                        &args.profile,
+                        &profile,
                         &asset.category,
                         &asset.asset_code,
                         &asset.department,
@@ -1415,7 +1431,7 @@ where
                         let (_info, fetched) = fetch_remote_version(
                             &store,
                             &remote,
-                            &args.profile,
+                            &profile,
                             &asset.category,
                             &asset.asset_code,
                             &asset.department,
@@ -1439,7 +1455,7 @@ where
                 let (info, fetched) = fetch_remote_version(
                     &store,
                     &remote,
-                    &args.profile,
+                    &profile,
                     &asset.category,
                     &asset.asset_code,
                     &asset.department,
@@ -1488,19 +1504,23 @@ where
                 args.version
                     .map_or(VersionSelector::Current, VersionSelector::Version)
             };
-            let store = Store::open_read_only(&args.store)?;
-            let remote = RemoteClient::new(&args.server, &args.auth_token)?;
+            let server = resolve_remote_server(args.server.as_deref())?;
+            let auth_token = resolve_remote_auth_token(args.auth_token.as_deref())?;
+            let profile = resolve_remote_profile(args.profile.as_deref(), "main");
+            let store_path = resolve_cli_store(args.store.as_deref())?;
+            let store = Store::open_read_only(&store_path)?;
+            let remote = RemoteClient::new(&server, &auth_token)?;
             let (version_info, stats) =
-                push_remote_version(&store, &remote, &args.profile, &department_key, selector)?;
+                push_remote_version(&store, &remote, &profile, &department_key, selector)?;
             if args.set_current {
                 remote.set_current_version(
-                    &args.profile,
+                    &profile,
                     &version_info.version.department_key,
                     version_info.version.version,
                 )?;
             } else if selector == VersionSelector::Current {
                 let status = store.current_status_for_department(&department_key)?;
-                remote.apply_current_status(&args.profile, &status)?;
+                remote.apply_current_status(&profile, &status)?;
             }
             println!(
                 "pushed {} {}/{}/{} objects_uploaded={} objects_reused={} bytes_uploaded={} thumbnails_pushed={}",
@@ -1772,18 +1792,86 @@ fn print_publish_validate_report(report: &PublishValidateReport, context: &str) 
     Ok(())
 }
 
-fn resolve_remote_auth_token(cli_token: Option<&str>) -> Result<String> {
-    cli_token
+fn non_empty_env(names: &[&str]) -> Option<String> {
+    names.iter().find_map(|name| {
+        std::env::var(name)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    })
+}
+
+fn cli_or_env_value(cli_value: Option<&str>, env_names: &[&str]) -> Option<String> {
+    cli_value
         .map(str::trim)
-        .filter(|token| !token.is_empty())
+        .filter(|value| !value.is_empty())
         .map(str::to_string)
-        .or_else(|| {
-            std::env::var("ADS_WEB_TOKEN")
-                .ok()
-                .map(|token| token.trim().to_string())
-                .filter(|token| !token.is_empty())
-        })
-        .ok_or_else(|| anyhow!("--auth-token or ADS_WEB_TOKEN is required with --server"))
+        .or_else(|| non_empty_env(env_names))
+}
+
+fn cli_or_env_path(cli_value: Option<&Path>, env_names: &[&str]) -> Option<PathBuf> {
+    cli_value
+        .map(Path::to_path_buf)
+        .or_else(|| non_empty_env(env_names).map(PathBuf::from))
+}
+
+fn resolve_remote_server(cli_server: Option<&str>) -> Result<String> {
+    cli_or_env_value(
+        cli_server,
+        &["ADS_RESOLVER_SERVER", "ADS_CATALOG_SERVER", "ADS_SERVER"],
+    )
+    .ok_or_else(|| anyhow!("--server, ADS_RESOLVER_SERVER, or ADS_CATALOG_SERVER is required"))
+}
+
+fn optional_remote_server(cli_server: Option<&str>, explicit_local_store: bool) -> Option<String> {
+    if cli_server.is_some() {
+        return cli_or_env_value(cli_server, &[]);
+    }
+    if explicit_local_store {
+        return None;
+    }
+    cli_or_env_value(
+        None,
+        &["ADS_RESOLVER_SERVER", "ADS_CATALOG_SERVER", "ADS_SERVER"],
+    )
+}
+
+fn resolve_remote_profile(cli_profile: Option<&str>, default_profile: &str) -> String {
+    cli_or_env_value(
+        cli_profile,
+        &[
+            "ADS_RESOLVER_PROFILE",
+            "ADS_CATALOG_PROFILE",
+            "ADS_REMOTE_PROFILE",
+        ],
+    )
+    .unwrap_or_else(|| default_profile.to_string())
+}
+
+fn resolve_remote_auth_token(cli_token: Option<&str>) -> Result<String> {
+    cli_or_env_value(
+        cli_token,
+        &[
+            "ADS_WEB_TOKEN",
+            "ADS_RESOLVER_API_TOKEN",
+            "ADS_CATALOG_API_TOKEN",
+            "ADS_RESOLVER_HTTP_BEARER_TOKEN",
+        ],
+    )
+    .ok_or_else(|| {
+        anyhow!(
+            "--auth-token, ADS_WEB_TOKEN, ADS_RESOLVER_API_TOKEN, or ADS_CATALOG_API_TOKEN is required with --server"
+        )
+    })
+}
+
+fn resolve_cli_store(cli_store: Option<&Path>) -> Result<PathBuf> {
+    cli_or_env_path(cli_store, &["ADS_RESOLVER_STORE", "ADS_STORE"])
+        .ok_or_else(|| anyhow!("--store or ADS_RESOLVER_STORE is required"))
+}
+
+fn resolve_cli_workspace(cli_workspace: Option<&Path>) -> Option<PathBuf> {
+    cli_or_env_path(cli_workspace, &["ADS_RESOLVER_WORKSPACE", "ADS_WORKSPACE"])
 }
 
 /// Validates the publish reference policy (schema v8) over a manifest stored
