@@ -2939,6 +2939,7 @@ struct ResolveQuery {
     profile: String,
     asset_path: String,
     mode: Option<String>,
+    remote_base_url: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]

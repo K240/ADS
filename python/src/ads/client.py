@@ -560,8 +560,8 @@ class AdsCli:
         asset_code: str,
         department: str,
         version: int | str,
-    ) -> JsonObject:
-        return self.run_json(
+    ) -> str:
+        return self.run_text(
             [
                 "thumbnail",
                 "set",

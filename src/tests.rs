@@ -901,6 +901,44 @@ async fn web_api_object_get_streams_full_and_ranged_reads() {
     assert_eq!(full.headers()["x-ads-sha256"], hash.as_str());
     assert_eq!(response_bytes(full).await, payload);
 
+    let prefix = &hash[0..2];
+    let object_url = format!("/objects/sha256/{prefix}/{hash}");
+    let object_by_path = app
+        .clone()
+        .oneshot(api_request("GET", &object_url, "secret", Body::empty()))
+        .await
+        .unwrap();
+    assert_eq!(object_by_path.status(), StatusCode::OK);
+    assert_eq!(object_by_path.headers()["x-ads-sha256"], hash.as_str());
+    assert_eq!(response_bytes(object_by_path).await, payload);
+
+    let profile_object_url = format!("/objects/main/sha256/{prefix}/{hash}");
+    let profile_object_by_path = app
+        .clone()
+        .oneshot(api_request(
+            "GET",
+            &profile_object_url,
+            "secret",
+            Body::empty(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(profile_object_by_path.status(), StatusCode::OK);
+    assert_eq!(response_bytes(profile_object_by_path).await, payload);
+
+    let wrong_prefix = if prefix == "00" { "01" } else { "00" };
+    let wrong_prefix = app
+        .clone()
+        .oneshot(api_request(
+            "GET",
+            &format!("/objects/sha256/{wrong_prefix}/{hash}"),
+            "secret",
+            Body::empty(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(wrong_prefix.status(), StatusCode::NOT_FOUND);
+
     let bounded = app
         .clone()
         .oneshot(ranged_request(&uri, "bytes=2-5"))
@@ -1220,6 +1258,53 @@ async fn web_api_lists_wips_promotes_and_runs_gc() {
     let remaining = response_json(remaining).await;
     assert_eq!(remaining["wips"].as_array().unwrap().len(), 1);
     assert_eq!(remaining["wips"][0]["seq"], 2);
+}
+
+#[tokio::test]
+async fn web_api_remote_resolve_defaults_to_served_object_urls() {
+    let temp = TempDir::new().unwrap();
+    let store_path = temp.path().join("store");
+    let workspace = temp.path().join("workspace");
+    let store = Store::init(&store_path).unwrap();
+    let department_key = DepartmentKey::new(
+        AssetKey::new("prop".to_string(), "crate".to_string()).unwrap(),
+        "model".to_string(),
+    )
+    .unwrap();
+    fs::create_dir_all(version_folder(&workspace, &department_key, VersionId(1))).unwrap();
+    fs::write(
+        version_folder(&workspace, &department_key, VersionId(1)).join("crate.usd"),
+        "v1",
+    )
+    .unwrap();
+    store
+        .add_version_folder(&workspace, &department_key, VersionId(1))
+        .unwrap();
+    drop(store);
+    let app = web_app(test_web_state(&store_path, &workspace));
+
+    let resolved = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/resolve?profile=main&asset_path=ads%3A%2F%2Fprop%2Fcrate%2Fmodel%2Fcrate.usd&mode=remote")
+                .header(header::AUTHORIZATION, "Bearer secret")
+                .header(header::HOST, "ads.test:8787")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resolved.status(), StatusCode::OK);
+    let resolved = response_json(resolved).await;
+    assert_eq!(resolved["source"], "remote");
+    assert_eq!(resolved["version"], 1);
+    assert!(
+        resolved["location"]
+            .as_str()
+            .unwrap()
+            .starts_with("http://ads.test:8787/objects/sha256/")
+    );
 }
 
 #[tokio::test]

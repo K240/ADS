@@ -1263,6 +1263,9 @@ void StoreResolveCache(
     cache[key] = std::move(entry);
 }
 
+bool IsSha256Hex(const std::string& value);
+std::string LowerHex(std::string value);
+
 std::string ResolveWithAdsServer(const std::string& assetPath)
 {
     const std::string server = TrimTrailingSlashes(GetEnv("ADS_RESOLVER_SERVER"));
@@ -1315,8 +1318,37 @@ std::string ResolveWithAdsServer(const std::string& assetPath)
             cacheKey,
             location,
             HasExplicitVersionPin(normalizedAssetPath));
+        return location;
     }
-    return location;
+    if (location.empty() && mode == "remote" && !wip) {
+        const std::string localUrl = server + "/api/resolve?profile=" + PercentEncode(profile)
+            + "&asset_path=" + PercentEncode(normalizedAssetPath) + "&mode=local";
+        if (DebugEnabled()) {
+            LogResolverMessage(
+                "ADS Resolver API remote resolve failed; probing object sha via `" + localUrl
+                + "`");
+        }
+        const std::string localResponse = HttpGetText(localUrl, token, timeoutSeconds);
+        std::string sha256 = JsonStringField(localResponse, "sha256");
+        if (IsSha256Hex(sha256)) {
+            sha256 = LowerHex(std::move(sha256));
+            const std::string objectUrl = server + "/api/object?profile=" + PercentEncode(profile)
+                + "&sha256=" + sha256;
+            if (DebugEnabled()) {
+                LogResolverMessage(
+                    "ADS Resolver API object fallback `" + normalizedAssetPath + "` -> `"
+                    + objectUrl + "`");
+            }
+            StoreResolveCache(
+                cache.mutex,
+                cache.entries,
+                cacheKey,
+                objectUrl,
+                HasExplicitVersionPin(normalizedAssetPath));
+            return objectUrl;
+        }
+    }
+    return {};
 }
 
 std::string ObjectBearerToken()
@@ -1460,12 +1492,63 @@ bool IsHexDigit(char ch)
     return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F');
 }
 
+bool IsSha256Hex(const std::string& value)
+{
+    if (value.size() != 64) {
+        return false;
+    }
+    for (const char ch : value) {
+        if (!IsHexDigit(ch)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::string LowerHex(std::string value)
+{
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return value;
+}
+
+std::string Sha256QueryValue(const std::string& url)
+{
+    const std::size_t query = url.find('?');
+    if (query == std::string::npos) {
+        return {};
+    }
+    std::size_t position = query + 1;
+    while (position < url.size()) {
+        std::size_t end = url.find('&', position);
+        if (end == std::string::npos) {
+            end = url.size();
+        }
+        const std::string pair = url.substr(position, end - position);
+        if (pair.rfind("sha256=", 0) == 0) {
+            std::string hash = pair.substr(7);
+            if (IsSha256Hex(hash)) {
+                return LowerHex(std::move(hash));
+            }
+            return {};
+        }
+        position = end + 1;
+    }
+    return {};
+}
+
 // The object URL path embeds the content hash:
 // .../objects/sha256/<2-hex-prefix>/<64-hex>[.<ext>]. Exactly 64 hex chars
-// are required; anything else means the URL is not a content-addressed object
-// endpoint and the caller falls back to the in-memory download.
+// are required. ADS API object URLs can also carry `?sha256=<64-hex>`.
+// Anything else means the URL is not a content-addressed object endpoint and
+// the caller falls back to the in-memory download.
 std::string ParseSha256FromObjectUrl(const std::string& url)
 {
+    const std::string queryHash = Sha256QueryValue(url);
+    if (!queryHash.empty()) {
+        return queryHash;
+    }
     const std::string path = StripQuery(url);
     const std::string marker = "objects/sha256/";
     const size_t markerPos = path.find(marker);
@@ -1485,11 +1568,7 @@ std::string ParseSha256FromObjectUrl(const std::string& url)
     if (end - pos != 64) {
         return {};
     }
-    std::string hash = path.substr(pos, 64);
-    std::transform(hash.begin(), hash.end(), hash.begin(), [](unsigned char ch) {
-        return static_cast<char>(std::tolower(ch));
-    });
-    return hash;
+    return LowerHex(path.substr(pos, 64));
 }
 
 // Blob cache root: ADS_RESOLVER_CACHE_DIR, else the CLI workspace blob cache

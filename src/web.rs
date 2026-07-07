@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result, anyhow, bail};
 use axum::body::Body;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{DefaultBodyLimit, Multipart, Query, Request, State};
+use axum::extract::{DefaultBodyLimit, Multipart, Path as AxumPath, Query, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
@@ -203,6 +203,19 @@ pub(crate) fn web_app(state: Arc<WebState>) -> Router {
         .route("/app.js", get(app_js))
         .route("/style.css", get(style_css))
         .nest("/api", api)
+        .nest(
+            "/objects",
+            Router::new()
+                .route("/sha256/{prefix}/{sha256}", get(object_by_path_default))
+                .route(
+                    "/{profile}/sha256/{prefix}/{sha256}",
+                    get(object_by_path_profile),
+                )
+                .route_layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    api_auth_middleware,
+                )),
+        )
         .with_state(state.clone());
     // CORS is opt-in per origin (`serve --cors-allow-origin`): the bundled
     // WebApp is served same-origin, and the CLI and resolver are not
@@ -430,15 +443,42 @@ pub(crate) async fn api_object(
     headers: HeaderMap,
 ) -> std::result::Result<Response, ApiError> {
     let profile = profile_for(&state, &query.profile)?;
-    validate_sha256(&query.sha256).map_err(|error| ApiError::bad_request(format!("{error:#}")))?;
-    let path = object_path(&profile.store, &query.sha256);
+    object_response(profile, query.sha256, None, headers).await
+}
+
+pub(crate) async fn object_by_path_default(
+    State(state): State<Arc<WebState>>,
+    AxumPath((prefix, sha256)): AxumPath<(String, String)>,
+    headers: HeaderMap,
+) -> std::result::Result<Response, ApiError> {
+    let profile = profile_for_object_path(&state, None)?;
+    object_response(profile, sha256, Some(prefix), headers).await
+}
+
+pub(crate) async fn object_by_path_profile(
+    State(state): State<Arc<WebState>>,
+    AxumPath((profile_name, prefix, sha256)): AxumPath<(String, String, String)>,
+    headers: HeaderMap,
+) -> std::result::Result<Response, ApiError> {
+    let profile = profile_for_object_path(&state, Some(&profile_name))?;
+    object_response(profile, sha256, Some(prefix), headers).await
+}
+
+async fn object_response(
+    profile: WebProfile,
+    sha256: String,
+    prefix: Option<String>,
+    headers: HeaderMap,
+) -> std::result::Result<Response, ApiError> {
+    validate_sha256(&sha256).map_err(|error| ApiError::bad_request(format!("{error:#}")))?;
+    if let Some(prefix) = prefix {
+        validate_object_url_prefix(&prefix, &sha256)?;
+    }
+    let path = object_path(&profile.store, &sha256);
     let mut file = match tokio::fs::File::open(&path).await {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(ApiError::not_found(format!(
-                "object not found: {}",
-                query.sha256
-            )));
+            return Err(ApiError::not_found(format!("object not found: {}", sha256)));
         }
         Err(error) => {
             return Err(internal_error(format!(
@@ -483,10 +523,7 @@ pub(crate) async fn api_object(
         .header(header::CONTENT_TYPE, "application/octet-stream")
         .header(header::ACCEPT_RANGES, "bytes")
         .header(header::CONTENT_LENGTH, content_length)
-        .header(
-            HeaderName::from_static("x-ads-sha256"),
-            query.sha256.as_str(),
-        );
+        .header(HeaderName::from_static("x-ads-sha256"), sha256.as_str());
     if status == StatusCode::PARTIAL_CONTENT {
         builder = builder.header(
             header::CONTENT_RANGE,
@@ -496,6 +533,23 @@ pub(crate) async fn api_object(
     builder
         .body(body)
         .map_err(|error| ApiError::internal(error.to_string()))
+}
+
+fn validate_object_url_prefix(prefix: &str, sha256: &str) -> std::result::Result<(), ApiError> {
+    if prefix.len() != 2 || !prefix.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err(ApiError::bad_request(format!(
+            "invalid sha256 prefix in object URL: {prefix}"
+        )));
+    }
+    let expected = sha256
+        .get(0..2)
+        .ok_or_else(|| ApiError::bad_request("sha256 is too short"))?;
+    if !prefix.eq_ignore_ascii_case(expected) {
+        return Err(ApiError::not_found(format!(
+            "object prefix {prefix} does not match sha256 {sha256}"
+        )));
+    }
+    Ok(())
 }
 
 /// Outcome of parsing a Range header against an object of known length.
@@ -851,13 +905,31 @@ pub(crate) async fn api_thumbnail_url(
 pub(crate) async fn api_resolve(
     State(state): State<Arc<WebState>>,
     Query(query): Query<ResolveQuery>,
+    headers: HeaderMap,
 ) -> std::result::Result<Json<ResolveOutcome>, ApiError> {
     let profile = profile_for(&state, &query.profile)?;
+    let profile_count = state.profiles.len();
     run_store_read(move || {
         let mode = parse_resolve_mode(query.mode.as_deref().unwrap_or("auto"))?;
         let asset_path = AssetPath::parse(&query.asset_path)?;
         let store = profile.store_handle.clone();
-        store.resolve_asset_path(&profile.workspace, &asset_path, mode, None)
+        let mut remote_base_url = query.remote_base_url.clone();
+        if remote_base_url.is_none()
+            && mode != ResolveMode::Local
+            && store.remote_base_url()?.is_none()
+        {
+            remote_base_url = Some(served_object_base_url(
+                &headers,
+                &profile.name,
+                profile_count,
+            )?);
+        }
+        store.resolve_asset_path(
+            &profile.workspace,
+            &asset_path,
+            mode,
+            remote_base_url.as_deref(),
+        )
     })
     .await
     .map(Json)
@@ -1263,6 +1335,52 @@ pub(crate) fn profile_for(
         .get(name)
         .cloned()
         .ok_or_else(|| ApiError::not_found(format!("profile not found: {name}")))
+}
+
+fn profile_for_object_path(
+    state: &WebState,
+    name: Option<&str>,
+) -> std::result::Result<WebProfile, ApiError> {
+    if let Some(name) = name {
+        return profile_for(state, name);
+    }
+    let mut profiles = state.profiles.values();
+    let Some(profile) = profiles.next().cloned() else {
+        return Err(ApiError::not_found("profile not found"));
+    };
+    if profiles.next().is_some() {
+        return Err(ApiError::bad_request(
+            "object URL is ambiguous for multiple profiles; use /objects/<profile>/sha256/<prefix>/<sha256>",
+        ));
+    }
+    Ok(profile)
+}
+
+fn served_object_base_url(
+    headers: &HeaderMap,
+    profile_name: &str,
+    profile_count: usize,
+) -> Result<String> {
+    let host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| anyhow!("Host header is required to infer remote object base URL"))?;
+    let proto = headers
+        .get(HeaderName::from_static("x-forwarded-proto"))
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("http");
+    if proto != "http" && proto != "https" {
+        bail!("invalid X-Forwarded-Proto header: {proto}");
+    }
+    let origin = format!("{proto}://{host}");
+    if profile_count == 1 {
+        Ok(format!("{origin}/objects/sha256"))
+    } else {
+        Ok(format!("{origin}/objects/{profile_name}/sha256"))
+    }
 }
 
 pub(crate) fn parse_resolve_mode(value: &str) -> Result<ResolveMode> {

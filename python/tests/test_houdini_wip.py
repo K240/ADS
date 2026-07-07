@@ -168,21 +168,23 @@ class CommitStagedTests(unittest.TestCase):
             with patch.dict("os.environ", self._env(workspace)):
                 os.environ.pop("ADS_WIP_RUN_ID", None)
 
-                processor = module.usdOutputProcessor()
-                run_id = processor._staging.run_id
+                processor_cls = module.usdOutputProcessor()
+                processor = processor_cls()
+                self.assertIsNone(processor._staging)
                 # Regression: the run id must not leak into the environment,
                 # where child processes (farm tasks) would inherit it.
                 self.assertNotIn("ADS_WIP_RUN_ID", os.environ)
 
                 save_path = f"{workspace}/char/hero/model/hero.usd"
                 redirected = processor.processSavePath(save_path, None, True)
+                run_id = processor._staging.run_id
                 self.assertEqual(
                     redirected,
                     f"{workspace}/.ads-staging/{run_id}/char/hero/model/hero.usd",
                 )
                 # husd builds a fresh processor per save; it must join the run.
                 self.assertEqual(
-                    module.usdOutputProcessor().processSavePath(save_path, None, True),
+                    processor_cls().processSavePath(save_path, None, True),
                     redirected,
                 )
 
@@ -205,7 +207,17 @@ class CommitStagedTests(unittest.TestCase):
                 # The commit ends the run: the next render must stage into a
                 # fresh id instead of merging into a committed one.
                 self.assertIsNone(houdini_wip._process_run_id)
-                self.assertNotEqual(module.usdOutputProcessor()._staging.run_id, run_id)
+                self.assertNotEqual(
+                    processor_cls().processSavePath(save_path, None, True),
+                    redirected,
+                )
+
+    def test_output_processor_menu_construction_does_not_require_wip_env(self):
+        module = _load_wip_output_processor_module()
+        with patch.dict("os.environ", {}, clear=True):
+            processor_cls = module.usdOutputProcessor()
+            processor = processor_cls()
+            self.assertIsNone(processor._staging)
 
     def test_orphan_runs_are_reported_but_never_committed(self):
         # Discovered runs may belong to a live concurrent session; committing

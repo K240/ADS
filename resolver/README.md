@@ -42,12 +42,17 @@ $env:PXR_PLUGINPATH_NAME = "D:\work\apps\ads\resolver\build\houdini\resources"
 
 In this mode the resolver calls `/api/resolve` through native HTTP and opens returned object URLs through native HTTP. On Windows the backend is WinHTTP. The HTTP backend is isolated so macOS/Linux can use a native library backend such as libcurl without shelling out to the `curl` command.
 
-The served store must carry a remote object base URL (`ads set-remote
---remote-base-url https://assets.example.com/objects/sha256`), otherwise
-`/api/resolve?mode=remote` fails with `remote base URL is not configured`.
-`ads serve` does not serve raw object bytes itself: the base URL must point
-at a static endpoint (object storage, CDN, or any web server) exposing the
-store's `objects/sha256/<prefix>/<sha256>` layout.
+When the served store carries a remote object base URL (`ads set-remote
+--remote-base-url https://assets.example.com/objects/sha256`),
+`/api/resolve?mode=remote` returns URLs under that base. If the store has no
+remote base URL, `ads serve` falls back to its own request host and returns
+URLs under its built-in object endpoint. `ads serve` can serve authenticated
+raw object bytes at
+`/objects/sha256/<prefix>/<sha256>` for single-profile servers and
+`/objects/<profile>/sha256/<prefix>/<sha256>` for multi-profile servers, so a
+single-profile ADS server can use its own URL as the base, for example
+`http://ads-server:8787/objects/sha256`. Dedicated object storage or a CDN
+still takes precedence when configured.
 
 Resolution shape follows one rule. Composing formats that can carry relative
 sibling references (`.usd`, `.usda`, `.usdc`, `.usdz`, `.mtlx`) resolve into
