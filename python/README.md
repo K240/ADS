@@ -264,6 +264,28 @@ uv run ads-deps D:\shots\shot010\shot.usda `
 
 Inside Houdini, run it with `hython -m ads.usd_deps` and set `PYTHONPATH` to `python/src` so the utility can use OpenUSD's dependency APIs for binary `.usd/.usdc` files.
 
+## Desktop Asset Browser (PySide6 / QML)
+
+Optional WebApp-equivalent UI for browsing a remote `ads serve`. Install the
+`browser` extra, then launch with env credentials (preferred over argv):
+
+```powershell
+$env:ADS_WEB_URL = "http://td-ln10:8787"
+$env:ADS_WEB_TOKEN = "<token>"
+uv run --extra browser ads-browser
+```
+
+Right-click an asset for context-menu actions. DCC hosts inject addons:
+
+```python
+from ads_browser import create_ads_browser
+from ads_browser.addons.hou_addon import HoudiniContextMenuAddon
+
+create_ads_browser(server=..., token=..., addons=[HoudiniContextMenuAddon()])
+```
+
+See `src/ads_browser/README.md` for the feature list, addon contract, and Houdini Qt notes.
+
 ## Houdini WIP Staging
 
 `ads.houdini_wip.WipStaging` is the pure Python layer used by the Houdini

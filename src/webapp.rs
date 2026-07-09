@@ -290,16 +290,12 @@ body {
 }
 
 .led.on {
+  /* Static fill only — an infinite box-shadow pulse kept the compositor
+     busy while the tab sat idle and contended with other media tabs. */
   background: var(--green);
-  animation: pulse 2.4s ease-in-out infinite;
 }
 
-.led.err { background: var(--red); animation: none; }
-
-@keyframes pulse {
-  0%, 100% { box-shadow: 0 0 0 0 rgba(140, 217, 124, .35); }
-  50% { box-shadow: 0 0 7px 2px rgba(140, 217, 124, .25); }
-}
+.led.err { background: var(--red); }
 
 /* ---------- controls ---------- */
 
@@ -502,37 +498,16 @@ button { font-family: var(--sans); cursor: pointer; }
   border-radius: var(--radius);
   overflow: hidden;
   cursor: pointer;
-  animation: rise .4s ease backwards;
-  transition: transform .15s ease, border-color .15s ease, box-shadow .15s ease;
+  transition: border-color .15s ease;
 }
 
 .card:hover {
-  transform: translateY(-2px);
   border-color: var(--line-strong);
-  box-shadow: 0 8px 20px rgba(0, 0, 0, .45);
 }
 
 .card.active {
   border-color: var(--amber);
-  box-shadow: 0 0 0 1px var(--amber), 0 10px 24px rgba(0, 0, 0, .5);
-}
-
-.card:nth-child(1) { animation-delay: .02s; }
-.card:nth-child(2) { animation-delay: .05s; }
-.card:nth-child(3) { animation-delay: .08s; }
-.card:nth-child(4) { animation-delay: .11s; }
-.card:nth-child(5) { animation-delay: .14s; }
-.card:nth-child(6) { animation-delay: .17s; }
-.card:nth-child(7) { animation-delay: .2s; }
-.card:nth-child(8) { animation-delay: .23s; }
-.card:nth-child(9) { animation-delay: .26s; }
-.card:nth-child(10) { animation-delay: .29s; }
-.card:nth-child(11) { animation-delay: .32s; }
-.card:nth-child(12) { animation-delay: .35s; }
-
-@keyframes rise {
-  from { opacity: 0; transform: translateY(8px); }
-  to { opacity: 1; transform: none; }
+  box-shadow: 0 0 0 1px var(--amber);
 }
 
 .thumb {
@@ -640,7 +615,6 @@ button { font-family: var(--sans); cursor: pointer; }
   flex-direction: column;
   gap: 18px;
   padding: 18px 16px 24px;
-  animation: rise .3s ease backwards;
 }
 
 .inspector-head {
@@ -929,7 +903,6 @@ button { font-family: var(--sans); cursor: pointer; }
   border-top: 2px solid var(--amber);
   border-radius: 6px;
   box-shadow: 0 24px 60px rgba(0, 0, 0, .6);
-  animation: rise .35s ease backwards;
 }
 
 .auth-mark {
@@ -1219,6 +1192,10 @@ function renderDetail(asset, data) {
 }
 
 const thumbObjectUrls = new Map();
+const THUMB_FETCH_CONCURRENCY = 4;
+let thumbFetchActive = 0;
+const thumbFetchQueue = [];
+let thumbObserver = null;
 
 function setThumbObjectUrl(cacheKey, promise) {
   // Blob URLs pin their blobs in memory until revoked, so an entry never
@@ -1229,8 +1206,34 @@ function setThumbObjectUrl(cacheKey, promise) {
 }
 
 function clearThumbObjectUrls() {
+  thumbFetchQueue.length = 0;
+  if (thumbObserver) {
+    thumbObserver.disconnect();
+    thumbObserver = null;
+  }
   thumbObjectUrls.forEach(promise => promise.then(url => URL.revokeObjectURL(url)).catch(() => {}));
   thumbObjectUrls.clear();
+}
+
+function pumpThumbFetchQueue() {
+  while (thumbFetchActive < THUMB_FETCH_CONCURRENCY && thumbFetchQueue.length) {
+    const job = thumbFetchQueue.shift();
+    thumbFetchActive += 1;
+    Promise.resolve()
+      .then(job)
+      .catch(() => {})
+      .finally(() => {
+        thumbFetchActive -= 1;
+        pumpThumbFetchQueue();
+      });
+  }
+}
+
+function enqueueThumbFetch(job) {
+  return new Promise((resolve, reject) => {
+    thumbFetchQueue.push(() => Promise.resolve().then(job).then(resolve, reject));
+    pumpThumbFetchQueue();
+  });
 }
 
 async function thumbnailObjectUrl(asset) {
@@ -1239,19 +1242,47 @@ async function thumbnailObjectUrl(asset) {
   const cacheKey = `${state.profile}:${asset.thumbnail_sha256}:${asset.thumbnail_mime_type || ''}`;
   if (!thumbObjectUrls.has(cacheKey)) {
     const path = `/api/object?${qs({profile: state.profile, sha256: asset.thumbnail_sha256})}`;
-    setThumbObjectUrl(cacheKey, apiBlob(path, asset.thumbnail_mime_type).then(blob => URL.createObjectURL(blob)));
+    // Cap concurrent blob downloads so an idle grid does not saturate the
+    // browser's network/decoder pool shared with other tabs (e.g. YouTube).
+    setThumbObjectUrl(
+      cacheKey,
+      enqueueThumbFetch(() => apiBlob(path, asset.thumbnail_mime_type).then(blob => URL.createObjectURL(blob)))
+    );
   }
   return thumbObjectUrls.get(cacheKey);
 }
 
 async function loadThumbnailImage(img, asset) {
+  if (img.dataset.thumbLoaded === '1') return;
   const url = await thumbnailObjectUrl(asset);
   if (!url || !img.isConnected) return;
   img.src = url;
+  img.dataset.thumbLoaded = '1';
+}
+
+function ensureThumbObserver() {
+  if (thumbObserver || typeof IntersectionObserver !== 'function') return thumbObserver;
+  thumbObserver = new IntersectionObserver((entries) => {
+    entries.forEach(entry => {
+      if (!entry.isIntersecting) return;
+      const img = entry.target;
+      thumbObserver.unobserve(img);
+      const asset = state.assets.find(item => assetKey(item) === img.dataset.thumbKey);
+      if (asset) loadThumbnailImage(img, asset).catch(() => img.remove());
+    });
+  }, { root: $('assetGrid'), rootMargin: '120px 0px', threshold: 0.01 });
+  return thumbObserver;
 }
 
 function hydrateGridThumbnails() {
+  const observer = ensureThumbObserver();
   $('assetGrid').querySelectorAll('img[data-thumb-key]').forEach(img => {
+    if (img.dataset.thumbLoaded === '1') return;
+    if (observer) {
+      observer.observe(img);
+      return;
+    }
+    // Fallback when IntersectionObserver is unavailable.
     const asset = state.assets.find(item => assetKey(item) === img.dataset.thumbKey);
     if (asset) loadThumbnailImage(img, asset).catch(() => img.remove());
   });
