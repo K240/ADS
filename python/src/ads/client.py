@@ -771,6 +771,43 @@ class AdsHttpClient:
             },
         )
 
+    def promote(
+        self,
+        *,
+        profile: str = "main",
+        category: str,
+        asset_code: str,
+        department: str,
+        wip_seq: int | None = None,
+        no_validate: bool = False,
+    ) -> JsonObject:
+        payload: JsonObject = {
+            "profile": profile,
+            "category": category,
+            "asset_code": asset_code,
+            "department": department,
+        }
+        if wip_seq is not None:
+            payload["wip_seq"] = wip_seq
+        if no_validate:
+            payload["no_validate"] = True
+        return self.post_json("/api/promote", payload)
+
+    def gc(
+        self,
+        *,
+        profile: str = "main",
+        retention: int | None = None,
+        grace_hours: int | None = None,
+        dry_run: bool = False,
+    ) -> JsonObject:
+        payload: JsonObject = {"profile": profile, "dry_run": dry_run}
+        if retention is not None:
+            payload["retention"] = retention
+        if grace_hours is not None:
+            payload["grace_hours"] = grace_hours
+        return self.post_json("/api/gc", payload)
+
     def wip_import(
         self,
         manifest: Mapping[str, Any],

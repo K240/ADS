@@ -439,6 +439,30 @@ class _Handler(BaseHTTPRequestHandler):
                     ),
                 }
             )
+        elif self.path == "/api/promote":
+            payload = json.loads(body.decode("utf-8"))
+            self._json(
+                {
+                    "outcome": {
+                        "version": 3,
+                        "created": True,
+                        "manifest_hash": "c" * 64,
+                        "file_count": 2,
+                        "total_bytes": 10,
+                    },
+                    "validation": {"ok": True, "errors": [], "warnings": []},
+                    "wip_seq": payload.get("wip_seq"),
+                }
+            )
+        elif self.path == "/api/gc":
+            payload = json.loads(body.decode("utf-8"))
+            self._json(
+                {
+                    "dry_run": bool(payload.get("dry_run")),
+                    "wip_removed": 0,
+                    "objects_removed": 0,
+                }
+            )
         else:
             self.send_error(404)
 
@@ -663,6 +687,34 @@ class AdsHttpClientTests(unittest.TestCase):
         )
         # The caller's manifest is not mutated in place.
         self.assertEqual(manifest["entries"][0]["relative_path"], "a.usd")
+
+    def test_promote_posts_wip_seq(self):
+        response = self.client.promote(
+            profile="main",
+            category="char",
+            asset_code="hero",
+            department="model",
+            wip_seq=7,
+        )
+
+        self.assertEqual(response["outcome"]["version"], 3)
+        self.assertEqual(response["wip_seq"], 7)
+        request = _Handler.requests[-1]
+        self.assertEqual(request["authorization"], "Bearer secret")
+        self.assertEqual(request["content_type"], "application/json")
+        payload = json.loads(request["body"].decode("utf-8"))
+        self.assertEqual(payload["wip_seq"], 7)
+        self.assertNotIn("no_validate", payload)
+
+    def test_gc_posts_dry_run(self):
+        response = self.client.gc(profile="main", retention=10, dry_run=True)
+
+        self.assertTrue(response["dry_run"])
+        request = _Handler.requests[-1]
+        payload = json.loads(request["body"].decode("utf-8"))
+        self.assertEqual(payload["profile"], "main")
+        self.assertEqual(payload["retention"], 10)
+        self.assertTrue(payload["dry_run"])
 
     def test_wip_import_omits_default_source_path(self):
         response = self.client.wip_import(

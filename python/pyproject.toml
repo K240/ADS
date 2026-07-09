@@ -6,11 +6,18 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = []
 
+[project.optional-dependencies]
+browser = ["PySide6>=6.6"]
+
 [project.scripts]
 ads-deps = "ads.usd_deps:main"
+ads-browser = "ads_browser.app:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+ads_browser = ["qml/*.qml"]
 
 [build-system]
 requires = ["setuptools>=68"]
